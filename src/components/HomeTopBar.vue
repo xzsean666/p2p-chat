@@ -70,9 +70,9 @@ const statusClass = computed(() => {
   gap: 14px;
   padding: 16px 18px;
   border-radius: 24px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(210, 220, 232, 0.9);
-  box-shadow: 0 20px 50px rgba(24, 46, 84, 0.08);
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border);
+  box-shadow: var(--shell-shadow-soft);
 }
 
 .avatar-button,
@@ -93,8 +93,8 @@ const statusClass = computed(() => {
 .user-avatar {
   width: 40px;
   height: 40px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
+  background: var(--shell-avatar-bg);
+  color: var(--shell-avatar-text);
   font-weight: 700;
 }
 
@@ -108,7 +108,7 @@ const statusClass = computed(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: #18253d;
+  color: var(--shell-text-strong);
 }
 
 .title-line strong {
@@ -116,7 +116,7 @@ const statusClass = computed(() => {
 }
 
 .subtitle {
-  color: #6c7f98;
+  color: var(--shell-text-muted);
   font-size: 0.88rem;
 }
 
@@ -124,7 +124,7 @@ const statusClass = computed(() => {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: #c6d2de;
+  background: var(--shell-border);
 }
 
 .status-open {

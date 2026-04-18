@@ -15,6 +15,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: "close"): void;
   (event: "open-member", contactId: string): void;
+  (event: "open-members", sessionId: string): void;
+  (event: "edit-name", sessionId: string): void;
+  (event: "add-members", sessionId: string): void;
+  (event: "remove-members", sessionId: string): void;
   (event: "toggle-mute", sessionId: string): void;
   (event: "leave-group", sessionId: string): void;
 }>();
@@ -53,7 +57,16 @@ function memberRole(contactId: string) {
       </section>
 
       <section class="section-card">
-        <div class="section-title">Group Name</div>
+        <div class="section-head">
+          <div class="section-title">Group Name</div>
+          <Button
+            v-if="session"
+            label="Edit"
+            text
+            severity="contrast"
+            @click="emit('edit-name', session.id)"
+          />
+        </div>
         <div class="info-row">
           <strong>{{ group.name }}</strong>
           <span>{{ group.muted ? "Muted" : "Active" }}</span>
@@ -63,13 +76,36 @@ function memberRole(contactId: string) {
       <section class="section-card">
         <div class="section-head">
           <div class="section-title">Members</div>
-          <Button
-            v-if="hasMoreMembers"
-            :label="showAllMembers ? 'Show Less' : 'See All'"
-            text
-            severity="contrast"
-            @click="showAllMembers = !showAllMembers"
-          />
+          <div class="section-actions">
+            <Button
+              v-if="session"
+              label="See All"
+              text
+              severity="contrast"
+              @click="emit('open-members', session.id)"
+            />
+            <Button
+              v-if="session"
+              label="Add"
+              text
+              severity="contrast"
+              @click="emit('add-members', session.id)"
+            />
+            <Button
+              v-if="session && memberContacts.length > 1"
+              label="Remove"
+              text
+              severity="contrast"
+              @click="emit('remove-members', session.id)"
+            />
+            <Button
+              v-if="hasMoreMembers"
+              :label="showAllMembers ? 'Show Less' : 'Preview More'"
+              text
+              severity="contrast"
+              @click="showAllMembers = !showAllMembers"
+            />
+          </div>
         </div>
 
         <div class="member-list">
@@ -170,6 +206,7 @@ function memberRole(contactId: string) {
 }
 
 .section-head,
+.section-actions,
 .group-actions,
 .info-row,
 .member-row {
@@ -180,6 +217,12 @@ function memberRole(contactId: string) {
 .section-head {
   justify-content: space-between;
   gap: 12px;
+}
+
+.section-actions {
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: end;
 }
 
 .section-title {

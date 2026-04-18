@@ -1,9 +1,12 @@
 import type {
   AdvancedPreferences,
   AppPreferences,
+  ChatShellSnapshot,
   ChatDomainSeed,
   NotificationPreferences,
   PersistedShellState,
+  ShellStateSnapshot,
+  UserProfile,
 } from "../types/chat";
 
 function cloneState<T>(value: T): T {
@@ -31,9 +34,18 @@ export const defaultAdvancedPreferences: AdvancedPreferences = {
   experimentalTransport: false,
 };
 
+export const defaultUserProfile: UserProfile = {
+  name: "Sean Chen",
+  handle: "@seanchen",
+  initials: "SC",
+  status: "Circle owner",
+};
+
 export function createEmptyShellState(): PersistedShellState {
   return cloneState({
     isAuthenticated: false,
+    authSession: null,
+    userProfile: defaultUserProfile,
     circles: [],
     appPreferences: defaultAppPreferences,
     notificationPreferences: defaultNotificationPreferences,
@@ -56,5 +68,65 @@ export function createShellStateFromDomainSeed(seed: ChatDomainSeed): PersistedS
     contacts: seed.contacts,
     groups: seed.groups,
     messageStore: seed.messageStore,
+  });
+}
+
+export function shellStateSnapshotFromPersistedState(
+  state: PersistedShellState,
+): ShellStateSnapshot {
+  return cloneState({
+    isAuthenticated: state.isAuthenticated,
+    authSession: state.authSession,
+    userProfile: state.userProfile,
+    appPreferences: state.appPreferences,
+    notificationPreferences: state.notificationPreferences,
+    advancedPreferences: state.advancedPreferences,
+    activeCircleId: state.activeCircleId,
+    selectedSessionId: state.selectedSessionId,
+  });
+}
+
+export function createChatShellSnapshotFromPersistedState(
+  state: PersistedShellState,
+): ChatShellSnapshot {
+  return cloneState({
+    domain: {
+      circles: state.circles,
+      contacts: state.contacts,
+      sessions: state.sessions,
+      groups: state.groups,
+      messageStore: state.messageStore,
+    },
+    shell: shellStateSnapshotFromPersistedState(state),
+  });
+}
+
+export function createPersistedShellStateFromChatShellSnapshot(
+  snapshot: ChatShellSnapshot,
+): PersistedShellState {
+  return cloneState({
+    ...createShellStateFromDomainSeed(snapshot.domain),
+    isAuthenticated: snapshot.shell.isAuthenticated,
+    authSession: snapshot.shell.authSession,
+    userProfile: snapshot.shell.userProfile,
+    appPreferences: snapshot.shell.appPreferences,
+    notificationPreferences: snapshot.shell.notificationPreferences,
+    advancedPreferences: snapshot.shell.advancedPreferences,
+    activeCircleId: snapshot.shell.activeCircleId,
+    selectedSessionId: snapshot.shell.selectedSessionId,
+  });
+}
+
+export function createLoggedOutShellState(
+  state: Pick<
+    PersistedShellState,
+    "appPreferences" | "notificationPreferences" | "advancedPreferences"
+  >,
+): PersistedShellState {
+  return cloneState({
+    ...createEmptyShellState(),
+    appPreferences: state.appPreferences,
+    notificationPreferences: state.notificationPreferences,
+    advancedPreferences: state.advancedPreferences,
   });
 }

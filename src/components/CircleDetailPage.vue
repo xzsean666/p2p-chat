@@ -6,6 +6,7 @@ import InputText from "primevue/inputtext";
 import Tag from "primevue/tag";
 import Textarea from "primevue/textarea";
 import OverlayPageShell from "./OverlayPageShell.vue";
+import { deriveCircleRuntimeRetryAction } from "../services/transportDiagnostics";
 import type {
   CircleItem,
   CircleTransportDiagnostic,
@@ -14,6 +15,7 @@ import type {
   TransportActivityItem,
   TransportCircleAction,
   TransportEngineKind,
+  TransportRuntimeSession,
 } from "../types/chat";
 
 const props = defineProps<{
@@ -24,6 +26,7 @@ const props = defineProps<{
   discoveredPeers: DiscoveredPeer[];
   sessionSyncItems: SessionSyncItem[];
   transportActivities: TransportActivityItem[];
+  runtimeSessions: TransportRuntimeSession[];
   transportEngine: TransportEngineKind | null;
   transportBusy: boolean;
   sessionCount: number;
@@ -58,6 +61,14 @@ const isDirty = computed(() => {
     draftName.value.trim() !== (props.circle?.name ?? "") ||
     draftDescription.value.trim() !== (props.circle?.description ?? "")
   );
+});
+
+const retryRuntimeAction = computed<TransportCircleAction | null>(() => {
+  if (!props.circle) {
+    return null;
+  }
+
+  return deriveCircleRuntimeRetryAction(props.circle, props.runtimeSessions);
 });
 
 function typeTone(type: CircleItem["type"]) {
@@ -142,6 +153,74 @@ function syncTone(state: SessionSyncItem["state"]) {
   }
 
   return "secondary";
+}
+
+function runtimeTone(state: TransportRuntimeSession["state"]) {
+  if (state === "active") {
+    return "success";
+  }
+
+  if (state === "starting") {
+    return "warn";
+  }
+
+  return "secondary";
+}
+
+function runtimeQueueTone(state: TransportRuntimeSession["queueState"]) {
+  if (state === "backoff") {
+    return "warn";
+  }
+
+  if (state === "queued") {
+    return "info";
+  }
+
+  return "secondary";
+}
+
+function runtimeFailureCopy(session: TransportRuntimeSession) {
+  if (!session.lastFailureReason) {
+    return "";
+  }
+
+  return session.lastFailureAt
+    ? `${session.lastFailureReason} · ${session.lastFailureAt}`
+    : session.lastFailureReason;
+}
+
+function runtimeAdapterTone(kind: TransportRuntimeSession["adapterKind"]) {
+  return kind === "localCommand" ? "info" : "secondary";
+}
+
+function runtimeLaunchTone(status: TransportRuntimeSession["launchStatus"]) {
+  if (status === "ready" || status === "embedded") {
+    return "success";
+  }
+
+  if (status === "missing") {
+    return "danger";
+  }
+
+  return "warn";
+}
+
+function runtimeLaunchCopy(session: TransportRuntimeSession) {
+  if (!session.launchCommand) {
+    return "";
+  }
+
+  return [session.launchCommand, ...session.launchArguments].join(" ");
+}
+
+function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
+  if (!session.lastLaunchResult) {
+    return "";
+  }
+
+  const pidCopy = session.lastLaunchPid ? ` pid ${session.lastLaunchPid}` : "";
+  const timeCopy = session.lastLaunchAt ? ` · ${session.lastLaunchAt}` : "";
+  return `${session.lastLaunchResult}${pidCopy}${timeCopy}`;
 }
 
 async function copyRelay() {
@@ -277,6 +356,56 @@ function runTransportAction(action: TransportCircleAction) {
         <div v-if="transportDiagnostic" class="info-row">
           <strong>Last Sync</strong>
           <p>{{ transportDiagnostic.lastSync }}</p>
+        </div>
+      </section>
+
+      <section class="section-card">
+        <div class="section-head">
+          <div class="section-title">Runtime Session</div>
+          <Button
+            v-if="retryRuntimeAction"
+            icon="pi pi-refresh"
+            label="Retry Runtime"
+            text
+            severity="secondary"
+            :loading="transportBusy"
+            :disabled="transportBusy"
+            @click="runTransportAction(retryRuntimeAction)"
+          />
+        </div>
+        <div v-if="runtimeSessions.length" class="list-card">
+          <div v-for="item in runtimeSessions" :key="item.sessionLabel" class="list-row">
+            <div class="list-copy">
+              <strong>{{ item.driver }} · boot #{{ item.generation }}</strong>
+              <p>{{ item.sessionLabel }} · {{ item.endpoint }}</p>
+              <p v-if="runtimeLaunchCopy(item)">{{ item.adapterKind }} adapter · {{ runtimeLaunchCopy(item) }}</p>
+              <p v-else>{{ item.adapterKind }} adapter</p>
+              <p v-if="item.resolvedLaunchCommand">resolved {{ item.resolvedLaunchCommand }}</p>
+              <p v-if="item.launchError" class="failure-copy">{{ item.launchError }}</p>
+              <p v-if="runtimeLastLaunchCopy(item)">last launch {{ runtimeLastLaunchCopy(item) }}</p>
+              <p>{{ item.desiredState }} · {{ item.recoveryPolicy }} recovery · state {{ item.stateSince }}</p>
+              <p>
+                {{ item.queueState }} queue ·
+                {{ item.restartAttempts }} recovery attempts{{ item.nextRetryIn ? ` · next ${item.nextRetryIn}` : "" }}
+              </p>
+              <p v-if="item.lastFailureReason" class="failure-copy">{{ runtimeFailureCopy(item) }}</p>
+              <p>{{ item.lastEvent }} · {{ item.lastEventAt }}</p>
+            </div>
+            <div class="list-tags">
+              <Tag :value="item.adapterKind" :severity="runtimeAdapterTone(item.adapterKind)" rounded />
+              <Tag :value="item.launchStatus" :severity="runtimeLaunchTone(item.launchStatus)" rounded />
+              <Tag :value="item.desiredState" :severity="item.desiredState === 'running' ? 'success' : 'secondary'" rounded />
+              <Tag :value="item.recoveryPolicy" :severity="item.recoveryPolicy === 'auto' ? 'info' : 'secondary'" rounded />
+              <Tag :value="item.queueState" :severity="runtimeQueueTone(item.queueState)" rounded />
+              <Tag v-if="item.lastFailureReason" value="failure recorded" severity="danger" rounded />
+              <Tag :value="`Boot ${item.generation}`" severity="contrast" rounded />
+              <Tag :value="item.state" :severity="runtimeTone(item.state)" rounded />
+            </div>
+          </div>
+        </div>
+        <div v-else class="info-row">
+          <strong>Runtime</strong>
+          <p>No runtime session mounted for this relay.</p>
         </div>
       </section>
 
@@ -452,6 +581,14 @@ function runTransportAction(action: TransportCircleAction) {
   gap: 8px;
 }
 
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .hero-copy h3,
 .hero-copy p,
 .section-title,
@@ -459,6 +596,10 @@ function runTransportAction(action: TransportCircleAction) {
 .copy-feedback,
 .missing-state p {
   margin: 0;
+}
+
+.failure-copy {
+  color: #ad5c2d;
 }
 
 .hero-copy p {

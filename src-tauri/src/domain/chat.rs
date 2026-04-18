@@ -31,6 +31,22 @@ pub enum MessageAuthor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum MessageDeliveryStatus {
+    Sending,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageSyncSource {
+    Local,
+    Relay,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CircleType {
     Default,
     Paid,
@@ -65,6 +81,34 @@ pub enum CircleCreateMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginMethod {
+    QuickStart,
+    ExistingAccount,
+    Signer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginCircleSelectionMode {
+    Existing,
+    Invite,
+    Custom,
+    Restore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginAccessKind {
+    LocalProfile,
+    Nsec,
+    Npub,
+    HexKey,
+    Bunker,
+    NostrConnect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupRole {
     Admin,
@@ -95,6 +139,31 @@ pub enum TextSizePreference {
     Compact,
     Default,
     Large,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProfile {
+    pub name: String,
+    pub handle: String,
+    pub initials: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginAccessSummary {
+    pub kind: LoginAccessKind,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthSessionSummary {
+    pub login_method: LoginMethod,
+    pub access: LoginAccessSummary,
+    pub circle_selection_mode: LoginCircleSelectionMode,
+    pub logged_in_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +232,14 @@ pub struct MessageItem {
     pub time: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<MessageDeliveryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_source: Option<MessageSyncSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +261,7 @@ pub struct GroupProfile {
     pub muted: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatDomainSeed {
     pub circles: Vec<CircleItem>,
@@ -196,9 +273,65 @@ pub struct ChatDomainSeed {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChatDomainOverview {
+    pub circles: Vec<CircleItem>,
+    pub contacts: Vec<ContactItem>,
+    pub sessions: Vec<SessionItem>,
+    pub groups: Vec<GroupProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SendMessageInput {
     pub session_id: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSessionDraftInput {
+    pub session_id: String,
+    pub draft: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMessageDeliveryStatusInput {
+    pub session_id: String,
+    pub message_id: String,
+    pub delivery_status: MessageDeliveryStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryMessageDeliveryInput {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRemoteMessagesInput {
+    pub session_id: String,
+    pub messages: Vec<MessageItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeliveryReceipt {
+    pub remote_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub delivery_status: MessageDeliveryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRemoteDeliveryReceiptsInput {
+    pub session_id: String,
+    pub receipts: Vec<RemoteDeliveryReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,9 +343,30 @@ pub struct StartConversationInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StartSelfConversationInput {
+    pub circle_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartConversationResult {
     pub seed: ChatDomainSeed,
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGroupConversationInput {
+    pub circle_id: String,
+    pub name: String,
+    pub member_contact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartLookupConversationInput {
+    pub circle_id: String,
+    pub query: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +404,20 @@ pub struct UpdateCircleInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateGroupNameInput {
+    pub session_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGroupMembersInput {
+    pub session_id: String,
+    pub member_contact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppPreferences {
     pub theme: ThemePreference,
     pub language: LanguagePreference,
@@ -277,8 +445,82 @@ pub struct AdvancedPreferences {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShellStateSnapshot {
+    pub is_authenticated: bool,
+    #[serde(default)]
+    pub auth_session: Option<AuthSessionSummary>,
+    #[serde(default = "default_user_profile")]
+    pub user_profile: UserProfile,
+    pub app_preferences: AppPreferences,
+    pub notification_preferences: NotificationPreferences,
+    pub advanced_preferences: AdvancedPreferences,
+    pub active_circle_id: String,
+    pub selected_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatShellSnapshot {
+    pub domain: ChatDomainSeed,
+    pub shell: ShellStateSnapshot,
+}
+
+pub fn default_message_page_size() -> u32 {
+    30
+}
+
+pub fn default_message_update_limit() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadSessionMessagesInput {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_message_id: Option<String>,
+    #[serde(default = "default_message_page_size")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSessionMessagesPage {
+    pub session_id: String,
+    pub messages: Vec<MessageItem>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadSessionMessageUpdatesInput {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_message_id: Option<String>,
+    #[serde(default = "default_message_update_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSessionMessageUpdates {
+    pub session_id: String,
+    pub messages: Vec<MessageItem>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PersistedShellState {
     pub is_authenticated: bool,
+    #[serde(default)]
+    pub auth_session: Option<AuthSessionSummary>,
+    #[serde(default = "default_user_profile")]
+    pub user_profile: UserProfile,
     pub circles: Vec<CircleItem>,
     pub app_preferences: AppPreferences,
     pub notification_preferences: NotificationPreferences,
@@ -289,6 +531,103 @@ pub struct PersistedShellState {
     pub contacts: Vec<ContactItem>,
     pub groups: Vec<GroupProfile>,
     pub message_store: HashMap<String, Vec<MessageItem>>,
+}
+
+pub fn default_app_preferences() -> AppPreferences {
+    AppPreferences {
+        theme: ThemePreference::System,
+        language: LanguagePreference::En,
+        text_size: TextSizePreference::Default,
+    }
+}
+
+pub fn default_notification_preferences() -> NotificationPreferences {
+    NotificationPreferences {
+        allow_send: true,
+        allow_receive: false,
+        show_badge: true,
+        archive_summary: true,
+        mentions_only: false,
+    }
+}
+
+pub fn default_advanced_preferences() -> AdvancedPreferences {
+    AdvancedPreferences {
+        show_message_info: false,
+        use_tor_network: false,
+        relay_diagnostics: true,
+        experimental_transport: false,
+    }
+}
+
+pub fn default_user_profile() -> UserProfile {
+    UserProfile {
+        name: "Sean Chen".into(),
+        handle: "@seanchen".into(),
+        initials: "SC".into(),
+        status: "Circle owner".into(),
+    }
+}
+
+impl From<ChatDomainSeed> for PersistedShellState {
+    fn from(seed: ChatDomainSeed) -> Self {
+        let active_circle_id = seed
+            .circles
+            .first()
+            .map(|circle| circle.id.clone())
+            .unwrap_or_default();
+        let selected_session_id = seed
+            .sessions
+            .first()
+            .map(|session| session.id.clone())
+            .unwrap_or_default();
+
+        Self {
+            is_authenticated: false,
+            auth_session: None,
+            user_profile: default_user_profile(),
+            circles: seed.circles,
+            app_preferences: default_app_preferences(),
+            notification_preferences: default_notification_preferences(),
+            advanced_preferences: default_advanced_preferences(),
+            active_circle_id,
+            selected_session_id,
+            sessions: seed.sessions,
+            contacts: seed.contacts,
+            groups: seed.groups,
+            message_store: seed.message_store,
+        }
+    }
+}
+
+impl From<PersistedShellState> for ShellStateSnapshot {
+    fn from(state: PersistedShellState) -> Self {
+        Self {
+            is_authenticated: state.is_authenticated,
+            auth_session: state.auth_session,
+            user_profile: state.user_profile,
+            app_preferences: state.app_preferences,
+            notification_preferences: state.notification_preferences,
+            advanced_preferences: state.advanced_preferences,
+            active_circle_id: state.active_circle_id,
+            selected_session_id: state.selected_session_id,
+        }
+    }
+}
+
+impl From<ChatDomainSeed> for ShellStateSnapshot {
+    fn from(seed: ChatDomainSeed) -> Self {
+        PersistedShellState::from(seed).into()
+    }
+}
+
+impl From<PersistedShellState> for ChatShellSnapshot {
+    fn from(state: PersistedShellState) -> Self {
+        Self {
+            domain: state.clone().into(),
+            shell: state.into(),
+        }
+    }
 }
 
 impl From<PersistedShellState> for ChatDomainSeed {

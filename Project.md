@@ -50,6 +50,7 @@ src/
 
 src-tauri/
   src/
+    bin/
     commands/
     app/
     domain/
@@ -64,6 +65,7 @@ src-tauri/
 - `features/` 按业务模块拆分功能，例如会话、消息、联系人、设置。
 - `mock/` 放初始化阶段的演示数据和结构样例。
 - `services/` 放前端适配层，例如 Tauri 调用封装、格式转换和数据访问入口。
+- `src-tauri/src/bin/` 放 companion native binaries，例如桌面预览 transport runtime。
 - `domain/` 放 Rust 侧的领域对象与业务规则。
 - `infra/` 放存储、网络、平台适配等实现细节。
 
@@ -103,13 +105,23 @@ src-tauri/
 
 ```bash
 pnpm install
+pnpm check
+pnpm version:check
+pnpm version:set 0.1.1
+pnpm native:check
+pnpm native:test
+pnpm verify
+pnpm desktop:build
+pnpm desktop:build:full
+pnpm release:linux
+pnpm release:prepare 0.1.1
 pnpm tauri:dev
 pnpm build
-cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
 ## 当前约束
 
 1. 初始化阶段先保证结构清晰与命令可运行，不急于补齐全部业务能力。
 2. 正式文档、源码和构建流程只围绕当前仓库展开，不引入临时目录路径依赖。
-3. 每次完成阶段性工作后，都要同步更新 `BuildProgress.md`。
+3. 本地 preview runtime 必须可在仓库内直接构建和解析，不能只依赖全局安装命令。
+4. 每次完成阶段性工作后，都要同步更新 `BuildProgress.md`。

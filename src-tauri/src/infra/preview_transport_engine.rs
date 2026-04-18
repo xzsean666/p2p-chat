@@ -35,14 +35,10 @@ impl TransportEngine for PreviewTransportEngine {
     ) -> Result<TransportEngineState, String> {
         apply_transport_circle_action_to_seed(seed, input)?;
         apply_preview_seed_adjustments(seed, input);
-        let mut state = build_transport_engine_state_after_action(
-            self.kind(),
-            seed,
-            previous_cache,
-            &input.circle_id,
-            &input.action,
-        )?;
+        let mut state =
+            build_transport_engine_state_after_action(self.kind(), seed, previous_cache, input)?;
         apply_preview_state_adjustments(&mut state, Some(&input.action));
+        rewrite_preview_sync_effects(&mut state, input.use_tor_network);
         Ok(state)
     }
 }
@@ -104,10 +100,6 @@ fn apply_preview_seed_adjustments(seed: &mut ChatDomainSeed, input: &TransportCi
             }
             TransportCircleAction::Disconnect => {}
         }
-    }
-
-    if matches!(input.action, TransportCircleAction::SyncSessions) {
-        rewrite_preview_sync_message(seed, &input.circle_id, input.use_tor_network);
     }
 }
 
@@ -290,36 +282,20 @@ fn preview_latency_ms(
     base_latency + circle_penalty + tor_penalty + experimental_adjustment
 }
 
-fn rewrite_preview_sync_message(seed: &mut ChatDomainSeed, circle_id: &str, use_tor_network: bool) {
+fn rewrite_preview_sync_effects(state: &mut TransportEngineState, use_tor_network: bool) {
     let body = if use_tor_network {
         "Native preview transport synced this circle through the privacy path."
     } else {
         "Native preview transport synced this circle through the local runtime."
     };
 
-    let Some(primary_session_id) = seed
-        .sessions
-        .iter()
-        .find(|session| session.circle_id == circle_id && !session.archived.unwrap_or(false))
-        .map(|session| session.id.clone())
-    else {
-        return;
-    };
-
-    if let Some(messages) = seed.message_store.get_mut(&primary_session_id) {
-        if let Some(message) = messages.iter_mut().rev().find(|message| {
+    for merge in &mut state.chat_effects.remote_message_merges {
+        if let Some(message) = merge.messages.iter_mut().rev().find(|message| {
             matches!(message.kind, MessageKind::System) && message.id.contains("-sync-")
         }) {
             message.body = body.into();
+            break;
         }
-    }
-
-    if let Some(session) = seed
-        .sessions
-        .iter_mut()
-        .find(|session| session.id == primary_session_id)
-    {
-        session.subtitle = body.into();
     }
 }
 
@@ -343,7 +319,8 @@ fn preview_merge_label(current: &str, next: &str) -> String {
 mod tests {
     use super::*;
     use crate::domain::chat::{
-        CircleItem, CircleStatus, CircleType, ContactItem, GroupProfile, SessionItem, SessionKind,
+        CircleItem, CircleStatus, CircleType, ContactItem, GroupProfile, MessageSyncSource,
+        SessionItem, SessionKind,
     };
     use crate::domain::transport::TransportActivityKind;
     use std::collections::HashMap;
@@ -471,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_engine_sync_sessions_rewrites_system_message() {
+    fn preview_engine_sync_sessions_rewrites_system_message_in_chat_effects() {
         let engine = PreviewTransportEngine;
         let mut seed = ChatDomainSeed {
             circles: vec![CircleItem {
@@ -515,7 +492,7 @@ mod tests {
             message_store: HashMap::from([(String::from("session-1"), Vec::new())]),
         };
 
-        let _state = engine
+        let state = engine
             .apply_circle_action(
                 &mut seed,
                 &TransportCache::default(),
@@ -529,13 +506,23 @@ mod tests {
             )
             .expect("preview sync should succeed");
 
-        assert_eq!(
-            seed.message_store["session-1"][0].body,
-            "Native preview transport synced this circle through the local runtime."
-        );
-        assert_eq!(
-            seed.sessions[0].subtitle,
-            "Native preview transport synced this circle through the local runtime."
-        );
+        assert!(seed.message_store["session-1"].is_empty());
+        assert_eq!(seed.sessions[0].subtitle, "hello");
+        assert_eq!(state.chat_effects.remote_message_merges.len(), 1);
+        let message_merge = &state.chat_effects.remote_message_merges[0];
+        assert_eq!(message_merge.session_id, "session-1");
+        assert!(message_merge.messages.iter().any(|message| {
+            matches!(message.kind, MessageKind::Text)
+                && message.body == "Alex sent a fresh relay update."
+                && matches!(message.sync_source, Some(MessageSyncSource::Relay))
+                && message.remote_id.is_some()
+        }));
+        assert!(message_merge.messages.iter().any(|message| {
+            matches!(message.kind, MessageKind::System)
+                && message.id.contains("-sync-")
+                && message.body
+                    == "Native preview transport synced this circle through the local runtime."
+                && matches!(message.sync_source, Some(MessageSyncSource::System))
+        }));
     }
 }

@@ -4,7 +4,7 @@ use crate::domain::transport::{
 use crate::infra::local_transport_service::LocalTransportService;
 
 pub fn apply_transport_circle_action(
-    app_handle: &tauri::AppHandle,
+    app_handle: &tauri::AppHandle<impl tauri::Runtime>,
     input: TransportCircleActionInput,
 ) -> Result<TransportMutationResult, String> {
     let service = LocalTransportService::new(app_handle);

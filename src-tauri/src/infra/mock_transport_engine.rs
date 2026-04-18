@@ -33,13 +33,7 @@ impl TransportEngine for MockTransportEngine {
         input: &TransportCircleActionInput,
     ) -> Result<TransportEngineState, String> {
         apply_transport_circle_action_to_seed(seed, input)?;
-        build_transport_engine_state_after_action(
-            self.kind(),
-            seed,
-            previous_cache,
-            &input.circle_id,
-            &input.action,
-        )
+        build_transport_engine_state_after_action(self.kind(), seed, previous_cache, input)
     }
 }
 
@@ -47,7 +41,8 @@ impl TransportEngine for MockTransportEngine {
 mod tests {
     use super::*;
     use crate::domain::chat::{
-        CircleItem, CircleStatus, CircleType, ContactItem, GroupProfile, SessionItem, SessionKind,
+        CircleItem, CircleStatus, CircleType, ContactItem, GroupProfile, MessageKind,
+        MessageSyncSource, SessionItem, SessionKind,
     };
     use crate::domain::transport::{TransportActivityKind, TransportCircleAction};
     use std::collections::HashMap;
@@ -100,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_sessions_updates_seed_and_cache() {
+    fn sync_sessions_produces_chat_effects_and_updates_cache() {
         let engine = MockTransportEngine;
         let mut seed = build_seed();
         let previous_cache = TransportCache::default();
@@ -119,9 +114,29 @@ mod tests {
             .expect("sync sessions should succeed");
 
         assert!(matches!(seed.circles[0].status, CircleStatus::Open));
-        assert_eq!(seed.sessions[0].time, "synced");
-        assert_eq!(seed.sessions[0].unread_count, None);
-        assert_eq!(seed.message_store["session-1"].len(), 1);
+        assert_eq!(seed.sessions[0].time, "yesterday");
+        assert_eq!(seed.sessions[0].unread_count, Some(3));
+        assert_eq!(seed.sessions[0].subtitle, "hello");
+        assert!(seed.message_store["session-1"].is_empty());
+        assert_eq!(
+            result.chat_effects.clear_unread_session_ids,
+            vec!["session-1"]
+        );
+        assert_eq!(result.chat_effects.remote_message_merges.len(), 1);
+        let message_merge = &result.chat_effects.remote_message_merges[0];
+        assert_eq!(message_merge.session_id, "session-1");
+        assert_eq!(message_merge.messages.len(), 2);
+        assert!(message_merge.messages.iter().any(|message| {
+            matches!(message.kind, MessageKind::Text)
+                && message.body == "Alex sent a fresh relay update."
+                && matches!(message.sync_source, Some(MessageSyncSource::Relay))
+                && message.remote_id.is_some()
+        }));
+        assert!(message_merge.messages.iter().any(|message| {
+            matches!(message.kind, MessageKind::System)
+                && message.body == "Session sync completed across discovered relay peers."
+                && matches!(message.sync_source, Some(MessageSyncSource::System))
+        }));
         assert!(matches!(result.kind, TransportEngineKind::Mock));
         assert_eq!(result.cache.session_sync.len(), 1);
         assert_eq!(result.cache.peers.len(), 1);

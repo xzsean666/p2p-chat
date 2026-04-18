@@ -21,13 +21,15 @@
 - `src/services/`: Tauri 命令封装、数据访问适配、前端服务层。
 - `src/types/`: 共享类型定义。
 - `src-tauri/src/`: Rust 原生入口、命令注册、应用服务与基础设施实现。
+- `src-tauri/src/bin/`: companion native binaries，例如预览模式使用的 `p2p-chat-runtime`。
 
 ## 编码要求
 
 1. Vue 组件保持展示层与业务层分离，复杂状态优先拆到组合式函数或服务层。
 2. Rust 命令只暴露稳定接口，不在命令层堆积业务细节。
 3. 命名以清晰可读为先，避免上下文不明的缩写。
-4. 初始化阶段至少持续保证 `pnpm build` 与 `cargo check --manifest-path src-tauri/Cargo.toml` 可验证。
+4. 常用开发、校验和打包入口统一走 `pnpm`，至少持续保证 `pnpm version:check`、`pnpm build`、`pnpm native:test`、`pnpm verify`、默认稳定打包入口 `pnpm desktop:build`、Linux 发布整理入口 `pnpm release:linux` 以及一键发布准备入口 `pnpm release:prepare <version>` 可用。
+5. 本地 preview runtime 相关改动要同时维护 companion binary、launch arguments 与本地命令解析回退，不允许只假设命令已经在全局 `PATH` 中存在。
 
 ## 完成定义
 

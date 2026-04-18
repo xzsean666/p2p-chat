@@ -1,6 +1,7 @@
 use crate::domain::chat::ChatDomainSeed;
 use crate::domain::transport::{
-    CircleTransportDiagnostic, TransportCircleActionInput, TransportEngineKind, TransportHealth,
+    CircleTransportDiagnostic, TransportChatEffects, TransportCircleActionInput,
+    TransportEngineKind, TransportHealth,
 };
 use crate::domain::transport_repository::TransportCache;
 
@@ -9,6 +10,7 @@ pub struct TransportEngineState {
     pub kind: TransportEngineKind,
     pub diagnostics: Vec<CircleTransportDiagnostic>,
     pub cache: TransportCache,
+    pub chat_effects: TransportChatEffects,
 }
 
 pub trait TransportEngine {

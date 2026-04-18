@@ -12,6 +12,7 @@ import type {
   NotificationPreferences,
   SettingPageId,
   TransportActivityItem,
+  TransportRuntimeSession,
   TransportSnapshot,
 } from "../types/chat";
 
@@ -32,6 +33,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: "close"): void;
   (event: "open-circle-directory"): void;
+  (event: "open-join-circle"): void;
   (event: "update-preferences", patch: Partial<AppPreferences>): void;
   (event: "update-notifications", patch: Partial<NotificationPreferences>): void;
   (event: "update-advanced", patch: Partial<AdvancedPreferences>): void;
@@ -53,11 +55,85 @@ const transportMetrics = computed(() => {
     pendingSyncCount,
     conflictSyncCount,
     activityCount: props.transportSnapshot.activities.length,
+    runtimeSessionCount: props.transportSnapshot.runtimeSessions.length,
   };
 });
 
 const recentTransportActivities = computed(() => {
   return props.transportSnapshot?.activities.slice(0, 4) ?? [];
+});
+
+const runtimeSessions = computed(() => {
+  return props.transportSnapshot?.runtimeSessions ?? [];
+});
+
+const runtimeSummary = computed(() => {
+  if (!runtimeSessions.value.length) {
+    return null;
+  }
+
+  const drivers = new Map<string, number>();
+  let activeCount = 0;
+  let startingCount = 0;
+  let inactiveCount = 0;
+  let desiredRunningCount = 0;
+  let autoRecoveryCount = 0;
+  let queuedCount = 0;
+  let backoffCount = 0;
+  let failureCount = 0;
+
+  for (const session of runtimeSessions.value) {
+    drivers.set(session.driver, (drivers.get(session.driver) ?? 0) + 1);
+    if (session.desiredState === "running") {
+      desiredRunningCount += 1;
+    }
+    if (session.recoveryPolicy === "auto") {
+      autoRecoveryCount += 1;
+    }
+    if (session.queueState === "queued") {
+      queuedCount += 1;
+    } else if (session.queueState === "backoff") {
+      backoffCount += 1;
+    }
+    if (session.lastFailureReason) {
+      failureCount += 1;
+    }
+
+    if (session.state === "active") {
+      activeCount += 1;
+    } else if (session.state === "starting") {
+      startingCount += 1;
+    } else {
+      inactiveCount += 1;
+    }
+  }
+
+  return {
+    activeCount,
+    startingCount,
+    inactiveCount,
+    desiredRunningCount,
+    autoRecoveryCount,
+    queuedCount,
+    backoffCount,
+    failureCount,
+    drivers: [...drivers.entries()]
+      .map(([driver, count]) => ({ driver, count }))
+      .sort((left, right) => right.count - left.count),
+  };
+});
+
+const visibleRuntimeSessions = computed(() => {
+  return runtimeSessions.value.slice(0, 4);
+});
+
+const activeRuntimeSession = computed(() => {
+  const focusCircleId = props.activeCircle?.id ?? props.transportSnapshot?.activeCircleId;
+  return (
+    runtimeSessions.value.find((session) => session.circleId === focusCircleId) ??
+    runtimeSessions.value[0] ??
+    null
+  );
 });
 
 const latestTransportActivity = computed(() => {
@@ -83,8 +159,8 @@ const metadata = computed(() => {
       };
     case "restore":
       return {
-        title: "Restore Purchases",
-        subtitle: "Reconnect private relay access and paid-circle onboarding state.",
+        title: "Restore Circle Access",
+        subtitle: "Reconnect private relay access and saved circle entry state.",
       };
     default:
       return {
@@ -129,6 +205,74 @@ function activityTone(level: TransportActivityItem["level"]) {
   }
 
   return "info";
+}
+
+function runtimeTone(state: TransportRuntimeSession["state"]) {
+  if (state === "active") {
+    return "success";
+  }
+
+  if (state === "starting") {
+    return "info";
+  }
+
+  return "secondary";
+}
+
+function runtimeQueueTone(state: TransportRuntimeSession["queueState"]) {
+  if (state === "backoff") {
+    return "warn";
+  }
+
+  if (state === "queued") {
+    return "info";
+  }
+
+  return "secondary";
+}
+
+function runtimeFailureCopy(session: TransportRuntimeSession) {
+  if (!session.lastFailureReason) {
+    return "";
+  }
+
+  return session.lastFailureAt
+    ? `${session.lastFailureReason} · ${session.lastFailureAt}`
+    : session.lastFailureReason;
+}
+
+function runtimeAdapterTone(kind: TransportRuntimeSession["adapterKind"]) {
+  return kind === "localCommand" ? "info" : "secondary";
+}
+
+function runtimeLaunchTone(status: TransportRuntimeSession["launchStatus"]) {
+  if (status === "ready" || status === "embedded") {
+    return "success";
+  }
+
+  if (status === "missing") {
+    return "danger";
+  }
+
+  return "warn";
+}
+
+function runtimeLaunchCopy(session: TransportRuntimeSession) {
+  if (!session.launchCommand) {
+    return "";
+  }
+
+  return [session.launchCommand, ...session.launchArguments].join(" ");
+}
+
+function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
+  if (!session.lastLaunchResult) {
+    return "";
+  }
+
+  const pidCopy = session.lastLaunchPid ? ` pid ${session.lastLaunchPid}` : "";
+  const timeCopy = session.lastLaunchAt ? ` · ${session.lastLaunchAt}` : "";
+  return `${session.lastLaunchResult}${pidCopy}${timeCopy}`;
 }
 </script>
 
@@ -366,6 +510,10 @@ function activityTone(level: TransportActivityItem["level"]) {
             <strong>Activity Entries</strong>
             <p>{{ transportMetrics.activityCount }}</p>
           </div>
+          <div v-if="transportMetrics" class="info-row">
+            <strong>Runtime Sessions</strong>
+            <p>{{ transportMetrics.runtimeSessionCount }}</p>
+          </div>
           <div class="tag-row">
             <Tag
               v-if="transportSnapshot.capabilities.supportsMesh"
@@ -407,15 +555,82 @@ function activityTone(level: TransportActivityItem["level"]) {
             </div>
           </div>
         </section>
+
+        <section v-if="transportSnapshot" class="section-card">
+          <div class="section-title">Local Runtime</div>
+          <template v-if="runtimeSummary">
+            <div class="info-row">
+              <strong>Driver Mix</strong>
+              <p>{{ runtimeSummary.drivers.map((item) => `${item.driver} x${item.count}`).join(" · ") }}</p>
+            </div>
+            <div class="info-row">
+              <strong>Session States</strong>
+              <p>
+                {{ runtimeSummary.activeCount }} active ·
+                {{ runtimeSummary.startingCount }} starting ·
+                {{ runtimeSummary.inactiveCount }} inactive
+              </p>
+            </div>
+            <div class="info-row">
+              <strong>Desired Runtime</strong>
+              <p>
+                {{ runtimeSummary.desiredRunningCount }} running desired ·
+                {{ runtimeSummary.autoRecoveryCount }} auto recovery
+              </p>
+            </div>
+            <div class="info-row">
+              <strong>Recovery Queue</strong>
+              <p>
+                {{ runtimeSummary.queuedCount }} queued ·
+                {{ runtimeSummary.backoffCount }} backing off
+              </p>
+            </div>
+            <div class="info-row">
+              <strong>Failure Records</strong>
+              <p>{{ runtimeSummary.failureCount }} runtime failures recorded</p>
+            </div>
+            <div class="list-card">
+              <div v-for="item in visibleRuntimeSessions" :key="item.sessionLabel" class="list-row">
+                <div class="list-copy">
+                  <strong>{{ item.sessionLabel }}</strong>
+                  <p>{{ item.endpoint }} · boot #{{ item.generation }} · state {{ item.stateSince }}</p>
+                  <p v-if="runtimeLaunchCopy(item)">{{ item.adapterKind }} adapter · {{ runtimeLaunchCopy(item) }}</p>
+                  <p v-else>{{ item.adapterKind }} adapter</p>
+                  <p v-if="item.resolvedLaunchCommand">resolved {{ item.resolvedLaunchCommand }}</p>
+                  <p v-if="item.launchError" class="failure-copy">{{ item.launchError }}</p>
+                  <p v-if="runtimeLastLaunchCopy(item)">last launch {{ runtimeLastLaunchCopy(item) }}</p>
+                  <p>
+                    {{ item.queueState }} queue ·
+                    {{ item.restartAttempts }} recovery attempts{{ item.nextRetryIn ? ` · next ${item.nextRetryIn}` : "" }}
+                  </p>
+                  <p v-if="item.lastFailureReason" class="failure-copy">{{ runtimeFailureCopy(item) }}</p>
+                  <p>{{ item.lastEvent }} · {{ item.lastEventAt }}</p>
+                </div>
+                <div class="list-tags">
+                  <Tag :value="item.adapterKind" :severity="runtimeAdapterTone(item.adapterKind)" rounded />
+                  <Tag :value="item.launchStatus" :severity="runtimeLaunchTone(item.launchStatus)" rounded />
+                  <Tag :value="item.driver" severity="secondary" rounded />
+                  <Tag :value="item.desiredState" :severity="item.desiredState === 'running' ? 'success' : 'secondary'" rounded />
+                  <Tag :value="item.recoveryPolicy" :severity="item.recoveryPolicy === 'auto' ? 'info' : 'secondary'" rounded />
+                  <Tag :value="item.queueState" :severity="runtimeQueueTone(item.queueState)" rounded />
+                  <Tag v-if="item.lastFailureReason" value="failure recorded" severity="danger" rounded />
+                  <Tag :value="`Boot ${item.generation}`" severity="contrast" rounded />
+                  <Tag :value="item.state" :severity="runtimeTone(item.state)" rounded />
+                </div>
+              </div>
+            </div>
+          </template>
+          <p v-else class="empty-state">No local runtime session mounted yet.</p>
+        </section>
       </template>
 
       <template v-else-if="settingId === 'restore'">
         <section class="hero-card">
           <div class="hero-copy">
-            <h3>Restore Private Relays</h3>
-            <p>Use the circle directory to reconnect invite-based and paid relay contexts. New circles will be stored in the local shell state immediately.</p>
+            <h3>Restore Circle Access</h3>
+            <p>Use the circle directory to reconnect invite-based and private relay contexts. New circle entries are stored in the local shell snapshot immediately.</p>
           </div>
-          <Tag value="Paid Circle Flow" severity="warn" rounded />
+          <Tag value="Circle Restore" severity="warn" rounded />
         </section>
 
         <section class="section-card">
@@ -475,6 +690,60 @@ function activityTone(level: TransportActivityItem["level"]) {
             <strong>Discovery and Sync</strong>
             <p>{{ transportMetrics.discoveredPeers }} peers · {{ transportMetrics.syncJobs }} sync jobs</p>
           </div>
+          <div v-if="runtimeSummary" class="info-row">
+            <strong>Runtime Sessions</strong>
+            <p>
+              {{ runtimeSummary.activeCount }} active ·
+              {{ runtimeSummary.startingCount }} starting ·
+              {{ runtimeSummary.inactiveCount }} inactive
+            </p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Driver</strong>
+            <p>{{ activeRuntimeSession.driver }} · {{ activeRuntimeSession.endpoint }}</p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Adapter</strong>
+            <p>
+              {{ activeRuntimeSession.adapterKind }}
+              {{ runtimeLaunchCopy(activeRuntimeSession) ? ` · ${runtimeLaunchCopy(activeRuntimeSession)}` : "" }}
+            </p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Launch</strong>
+            <p>
+              {{ activeRuntimeSession.launchStatus }}
+              {{ activeRuntimeSession.resolvedLaunchCommand ? ` · ${activeRuntimeSession.resolvedLaunchCommand}` : "" }}
+              {{ activeRuntimeSession.launchError ? ` · ${activeRuntimeSession.launchError}` : "" }}
+            </p>
+          </div>
+          <div v-if="activeRuntimeSession && runtimeLastLaunchCopy(activeRuntimeSession)" class="info-row">
+            <strong>Runtime Launch Attempt</strong>
+            <p>{{ runtimeLastLaunchCopy(activeRuntimeSession) }}</p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Lifecycle</strong>
+            <p>boot #{{ activeRuntimeSession.generation }} · state {{ activeRuntimeSession.stateSince }}</p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Intent</strong>
+            <p>{{ activeRuntimeSession.desiredState }} · {{ activeRuntimeSession.recoveryPolicy }} recovery</p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Queue</strong>
+            <p>
+              {{ activeRuntimeSession.queueState }} ·
+              {{ activeRuntimeSession.restartAttempts }} recovery attempts{{ activeRuntimeSession.nextRetryIn ? ` · next ${activeRuntimeSession.nextRetryIn}` : "" }}
+            </p>
+          </div>
+          <div v-if="activeRuntimeSession?.lastFailureReason" class="info-row">
+            <strong>Runtime Failure</strong>
+            <p>{{ runtimeFailureCopy(activeRuntimeSession) }}</p>
+          </div>
+          <div v-if="activeRuntimeSession" class="info-row">
+            <strong>Runtime Event</strong>
+            <p>{{ activeRuntimeSession.lastEvent }} · {{ activeRuntimeSession.lastEventAt }}</p>
+          </div>
           <div v-if="latestTransportActivity" class="info-row">
             <strong>Latest Activity</strong>
             <p>{{ latestTransportActivity.title }} · {{ latestTransportActivity.time }}</p>
@@ -505,6 +774,14 @@ function activityTone(level: TransportActivityItem["level"]) {
           text
           severity="secondary"
           @click="copyValue('Relay', activeCircle.relay)"
+        />
+        <Button
+          v-if="settingId === 'restore'"
+          icon="pi pi-compass"
+          label="Join with Invite"
+          text
+          severity="secondary"
+          @click="emit('open-join-circle')"
         />
         <Button
           v-if="settingId === 'restore'"
@@ -543,7 +820,7 @@ function activityTone(level: TransportActivityItem["level"]) {
 }
 
 .section-title {
-  color: #6a7d98;
+  color: var(--shell-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.14em;
   font-size: 0.72rem;
@@ -562,17 +839,17 @@ function activityTone(level: TransportActivityItem["level"]) {
 
 .option-chip {
   padding: 10px 14px;
-  border: 1px solid rgba(208, 218, 228, 0.95);
+  border: 1px solid var(--shell-border);
   border-radius: 999px;
-  background: #fbfdff;
-  color: #415772;
+  background: var(--shell-surface-strong);
+  color: var(--shell-text-default);
   cursor: pointer;
 }
 
 .option-chip.active {
-  border-color: rgba(86, 136, 196, 0.82);
-  background: linear-gradient(180deg, #f4f8ff 0%, #f5fbf8 100%);
-  color: #16355c;
+  border-color: var(--shell-selected-border);
+  background: var(--shell-selected);
+  color: var(--shell-text-strong);
 }
 
 .toggle-list {
@@ -587,7 +864,7 @@ function activityTone(level: TransportActivityItem["level"]) {
   gap: 16px;
   padding: 14px 16px;
   border-radius: 20px;
-  background: #f7fafc;
+  background: var(--shell-surface-soft);
 }
 
 .list-row {
@@ -596,7 +873,7 @@ function activityTone(level: TransportActivityItem["level"]) {
   gap: 16px;
   padding: 14px 16px;
   border-radius: 20px;
-  background: #f7fafc;
+  background: var(--shell-surface-soft);
 }
 
 .toggle-row strong,
@@ -607,7 +884,8 @@ function activityTone(level: TransportActivityItem["level"]) {
 .hero-copy p,
 .list-copy strong,
 .list-copy p,
-.copy-feedback {
+.copy-feedback,
+.empty-state {
   margin: 0;
 }
 
@@ -621,9 +899,14 @@ function activityTone(level: TransportActivityItem["level"]) {
 .toggle-row p,
 .info-row p,
 .hero-copy p,
-.list-copy p {
-  color: #6d809a;
+.list-copy p,
+.empty-state {
+  color: var(--shell-text-muted);
   line-height: 1.6;
+}
+
+.failure-copy {
+  color: #ad5c2d;
 }
 
 .hero-card {
@@ -634,7 +917,11 @@ function activityTone(level: TransportActivityItem["level"]) {
   border-radius: 28px;
   background:
     radial-gradient(circle at top left, rgba(106, 168, 255, 0.18), transparent 26%),
-    linear-gradient(180deg, #f7fbfe 0%, #f2f7fb 100%);
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--shell-surface-strong) 94%, rgba(106, 168, 255, 0.08)) 0%,
+      color-mix(in srgb, var(--shell-surface-soft) 96%, rgba(111, 214, 176, 0.06)) 100%
+    );
 }
 
 .copy-feedback {

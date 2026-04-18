@@ -1,10 +1,11 @@
 use crate::domain::chat::{
-    ChatDomainSeed, ContactItem, MessageAuthor, MessageItem, MessageKind, SessionItem, SessionKind,
+    ChatDomainSeed, ContactItem, MergeRemoteMessagesInput, MessageAuthor, MessageItem, MessageKind,
+    MessageSyncSource, SessionItem, SessionKind,
 };
 use crate::domain::transport::{
     CircleTransportDiagnostic, DiscoveredPeer, PeerPresence, SessionSyncItem, SessionSyncState,
-    TransportActivityItem, TransportActivityKind, TransportActivityLevel, TransportCircleAction,
-    TransportCircleActionInput, TransportEngineKind, TransportHealth,
+    TransportActivityItem, TransportActivityKind, TransportActivityLevel, TransportChatEffects,
+    TransportCircleAction, TransportCircleActionInput, TransportEngineKind, TransportHealth,
 };
 use crate::domain::transport_adapter::{TransportAdapter, TransportRuntimeOptions};
 use crate::domain::transport_engine::TransportEngineState;
@@ -25,6 +26,7 @@ pub(crate) fn build_transport_engine_state(
         kind,
         diagnostics,
         cache,
+        chat_effects: TransportChatEffects::default(),
     }
 }
 
@@ -32,8 +34,7 @@ pub(crate) fn build_transport_engine_state_after_action(
     kind: TransportEngineKind,
     seed: &ChatDomainSeed,
     previous_cache: &TransportCache,
-    circle_id: &str,
-    action: &TransportCircleAction,
+    input: &TransportCircleActionInput,
 ) -> Result<TransportEngineState, String> {
     let diagnostics = build_diagnostics(seed);
     let mut cache = build_transport_cache(
@@ -41,15 +42,21 @@ pub(crate) fn build_transport_engine_state_after_action(
         seed,
         &diagnostics,
         previous_cache,
-        Some((circle_id, action)),
+        Some((&input.circle_id, &input.action)),
     );
-    let adapter = adapter_for_circle(seed, circle_id)?;
-    adapter.apply_cache_action(&mut cache.peers, &mut cache.session_sync, action, circle_id);
+    let adapter = adapter_for_circle(seed, &input.circle_id)?;
+    adapter.apply_cache_action(
+        &mut cache.peers,
+        &mut cache.session_sync,
+        &input.action,
+        &input.circle_id,
+    );
 
     Ok(TransportEngineState {
         kind,
         diagnostics,
         cache,
+        chat_effects: build_transport_chat_effects(seed, input),
     })
 }
 
@@ -69,15 +76,6 @@ pub(crate) fn apply_transport_circle_action_to_seed(
             .ok_or_else(|| format!("circle not found: {}", input.circle_id))?;
         let adapter = adapter_for_relay(&circle.relay);
         adapter.apply_circle_action(circle, &input.action, runtime);
-    }
-
-    if matches!(input.action, TransportCircleAction::SyncSessions) {
-        apply_session_sync(
-            seed,
-            &input.circle_id,
-            input.use_tor_network,
-            input.experimental_transport,
-        );
     }
 
     Ok(())
@@ -132,6 +130,8 @@ fn build_transport_cache(
         peers,
         session_sync,
         activities,
+        runtime_registry: Vec::new(),
+        runtime_sessions: Vec::new(),
     }
 }
 
@@ -497,25 +497,69 @@ fn engine_label(kind: &TransportEngineKind) -> &'static str {
     }
 }
 
-fn apply_session_sync(
-    seed: &mut ChatDomainSeed,
+fn build_transport_chat_effects(
+    seed: &ChatDomainSeed,
+    input: &TransportCircleActionInput,
+) -> TransportChatEffects {
+    if !matches!(input.action, TransportCircleAction::SyncSessions) {
+        return TransportChatEffects::default();
+    }
+
+    build_session_sync_chat_effects(
+        seed,
+        &input.circle_id,
+        input.use_tor_network,
+        input.experimental_transport,
+    )
+}
+
+fn build_session_sync_chat_effects(
+    seed: &ChatDomainSeed,
     circle_id: &str,
     use_tor_network: bool,
     experimental_transport: bool,
-) {
-    let mut primary_session_id = None;
+) -> TransportChatEffects {
+    let direct_target_session_id = seed
+        .sessions
+        .iter()
+        .find(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Direct)
+                && session.contact_id.is_some()
+        })
+        .map(|session| session.id.clone());
+    let group_target_session_id = seed
+        .sessions
+        .iter()
+        .find(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Group)
+        })
+        .map(|session| session.id.clone());
+    let primary_session_id = seed
+        .sessions
+        .iter()
+        .find(|session| session.circle_id == circle_id && !session.archived.unwrap_or(false))
+        .map(|session| session.id.clone());
+    let mut touched_session_ids = Vec::new();
+    let mut remote_message_merges = Vec::<MergeRemoteMessagesInput>::new();
 
-    for session in &mut seed.sessions {
-        if session.circle_id != circle_id || session.archived.unwrap_or(false) {
-            continue;
-        }
+    if let Some(session_id) = direct_target_session_id.as_deref() {
+        remote_message_merges.push(MergeRemoteMessagesInput {
+            session_id: session_id.to_string(),
+            messages: vec![build_sync_peer_message(seed, session_id, false)],
+        });
+        touched_session_ids.push(session_id.to_string());
+    }
 
-        if primary_session_id.is_none() {
-            primary_session_id = Some(session.id.clone());
-        }
-
-        session.unread_count = None;
-        session.time = "synced".into();
+    if let Some(session_id) = group_target_session_id.as_deref() {
+        remote_message_merges.push(MergeRemoteMessagesInput {
+            session_id: session_id.to_string(),
+            messages: vec![build_sync_peer_message(seed, session_id, true)],
+        });
+        touched_session_ids.push(session_id.to_string());
     }
 
     if let Some(session_id) = primary_session_id {
@@ -532,20 +576,77 @@ fn apply_session_sync(
             },
             time: "now".into(),
             meta: None,
+            delivery_status: None,
+            remote_id: None,
+            sync_source: Some(MessageSyncSource::System),
+            acked_at: None,
         };
 
-        seed.message_store
-            .entry(session_id.clone())
-            .or_default()
-            .push(system_message.clone());
-
-        if let Some(session) = seed
-            .sessions
+        if let Some(batch) = remote_message_merges
             .iter_mut()
-            .find(|session| session.id == session_id)
+            .find(|batch| batch.session_id == session_id)
         {
-            session.subtitle = system_message.body;
+            batch.messages.push(system_message);
+        } else {
+            remote_message_merges.push(MergeRemoteMessagesInput {
+                session_id: session_id.clone(),
+                messages: vec![system_message],
+            });
         }
+
+        if !touched_session_ids
+            .iter()
+            .any(|current| current == &session_id)
+        {
+            touched_session_ids.push(session_id);
+        }
+    }
+
+    touched_session_ids.reverse();
+
+    TransportChatEffects {
+        remote_message_merges,
+        clear_unread_session_ids: touched_session_ids,
+        ..TransportChatEffects::default()
+    }
+}
+
+fn build_sync_peer_message(seed: &ChatDomainSeed, session_id: &str, is_group: bool) -> MessageItem {
+    let session = seed
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("sync target session missing");
+    let body = if is_group {
+        format!(
+            "{} merged a fresh relay update for the group.",
+            session.name
+        )
+    } else {
+        let contact_name = session
+            .contact_id
+            .as_ref()
+            .and_then(|contact_id| {
+                seed.contacts
+                    .iter()
+                    .find(|contact| contact.id == *contact_id)
+                    .map(|contact| contact.name.as_str())
+            })
+            .unwrap_or(session.name.as_str());
+        format!("{contact_name} sent a fresh relay update.")
+    };
+
+    MessageItem {
+        id: unique_peer_message_id(session_id),
+        kind: MessageKind::Text,
+        author: MessageAuthor::Peer,
+        body,
+        time: "now".into(),
+        meta: None,
+        delivery_status: None,
+        remote_id: Some(unique_remote_peer_message_id(session_id)),
+        sync_source: Some(MessageSyncSource::Relay),
+        acked_at: None,
     }
 }
 
@@ -600,6 +701,24 @@ fn unique_system_message_id(session_id: &str) -> String {
         .unwrap_or_default();
 
     format!("{session_id}-sync-{millis}")
+}
+
+fn unique_peer_message_id(session_id: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+
+    format!("{session_id}-peer-sync-{millis}")
+}
+
+fn unique_remote_peer_message_id(session_id: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+
+    format!("relay-sync:{session_id}:{millis}")
 }
 
 fn unique_activity_id(circle_id: &str, action: &TransportCircleAction) -> String {

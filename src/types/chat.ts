@@ -1,15 +1,33 @@
 export type SessionKind = "direct" | "group" | "self";
 export type MessageKind = "text" | "file" | "audio" | "system";
 export type MessageAuthor = "me" | "peer" | "system";
+export type MessageDeliveryStatus = "sending" | "sent" | "failed";
+export type MessageSyncSource = "local" | "relay" | "system";
 export type CircleType = "default" | "paid" | "bitchat" | "custom";
 export type CircleStatus = "open" | "connecting" | "closed";
 export type SessionAction = "pin" | "mute" | "archive" | "delete" | "unarchive";
 export type CircleCreateMode = "invite" | "private" | "custom";
+export type LoginMethod = "quickStart" | "existingAccount" | "signer";
+export type LoginCircleSelectionMode = "existing" | "invite" | "custom" | "restore";
+export type LoginAccessKind =
+  | "localProfile"
+  | "nsec"
+  | "npub"
+  | "hexKey"
+  | "bunker"
+  | "nostrConnect";
 export type TransportHealth = "online" | "degraded" | "offline";
 export type RelayProtocol = "websocket" | "mesh" | "invite";
 export type TransportEngineKind = "mock" | "nativePreview";
 export type PeerPresence = "online" | "idle" | "offline";
 export type SessionSyncState = "idle" | "syncing" | "pending" | "conflict";
+export type TransportRuntimeState = "inactive" | "starting" | "active";
+export type TransportRuntimeDesiredState = "stopped" | "running";
+export type TransportRuntimeRecoveryPolicy = "manual" | "auto";
+export type TransportRuntimeQueueState = "idle" | "queued" | "backoff";
+export type TransportRuntimeAdapterKind = "embedded" | "localCommand";
+export type TransportRuntimeLaunchStatus = "embedded" | "ready" | "missing" | "unknown";
+export type TransportRuntimeLaunchResult = "spawned" | "reused" | "failed";
 export type TransportActivityKind =
   | "runtime"
   | "connect"
@@ -34,6 +52,38 @@ export interface UserProfile {
   handle: string;
   initials: string;
   status: string;
+}
+
+export interface LoginCircleSelectionInput {
+  mode: LoginCircleSelectionMode;
+  circleId?: string;
+  inviteCode?: string;
+  name?: string;
+  relay?: string;
+}
+
+export interface LoginAccessInput {
+  kind: LoginAccessKind;
+  value?: string;
+}
+
+export interface LoginAccessSummary {
+  kind: LoginAccessKind;
+  label: string;
+}
+
+export interface AuthSessionSummary {
+  loginMethod: LoginMethod;
+  access: LoginAccessSummary;
+  circleSelectionMode: LoginCircleSelectionMode;
+  loggedInAt: string;
+}
+
+export interface LoginCompletionInput {
+  method: LoginMethod;
+  access: LoginAccessInput;
+  userProfile: UserProfile;
+  circleSelection: LoginCircleSelectionInput;
 }
 
 export interface CircleItem {
@@ -83,6 +133,10 @@ export interface MessageItem {
   body: string;
   time: string;
   meta?: string;
+  deliveryStatus?: MessageDeliveryStatus;
+  remoteId?: string;
+  syncSource?: MessageSyncSource;
+  ackedAt?: string;
 }
 
 export interface SettingItem {
@@ -138,8 +192,17 @@ export interface ChatDomainSeed {
   messageStore: Record<string, MessageItem[]>;
 }
 
+export interface ChatDomainOverview {
+  circles: CircleItem[];
+  contacts: ContactItem[];
+  sessions: SessionItem[];
+  groups: GroupProfile[];
+}
+
 export interface PersistedShellState {
   isAuthenticated: boolean;
+  authSession: AuthSessionSummary | null;
+  userProfile: UserProfile;
   circles: CircleItem[];
   appPreferences: AppPreferences;
   notificationPreferences: NotificationPreferences;
@@ -152,9 +215,84 @@ export interface PersistedShellState {
   messageStore: Record<string, MessageItem[]>;
 }
 
+export interface ShellStateSnapshot {
+  isAuthenticated: boolean;
+  authSession: AuthSessionSummary | null;
+  userProfile: UserProfile;
+  appPreferences: AppPreferences;
+  notificationPreferences: NotificationPreferences;
+  advancedPreferences: AdvancedPreferences;
+  activeCircleId: string;
+  selectedSessionId: string;
+}
+
+export interface ChatShellSnapshot {
+  domain: ChatDomainSeed;
+  shell: ShellStateSnapshot;
+}
+
+export interface LoadSessionMessagesInput {
+  sessionId: string;
+  beforeMessageId?: string;
+  limit?: number;
+}
+
+export interface ChatSessionMessagesPage {
+  sessionId: string;
+  messages: MessageItem[];
+  hasMore: boolean;
+  nextBeforeMessageId?: string;
+}
+
+export interface LoadSessionMessageUpdatesInput {
+  sessionId: string;
+  afterMessageId?: string;
+  limit?: number;
+}
+
+export interface ChatSessionMessageUpdates {
+  sessionId: string;
+  messages: MessageItem[];
+  hasMore: boolean;
+  nextAfterMessageId?: string;
+}
+
 export interface SendMessageInput {
   sessionId: string;
   body: string;
+}
+
+export interface UpdateSessionDraftInput {
+  sessionId: string;
+  draft: string;
+}
+
+export interface UpdateMessageDeliveryStatusInput {
+  sessionId: string;
+  messageId: string;
+  deliveryStatus: MessageDeliveryStatus;
+}
+
+export interface RetryMessageDeliveryInput {
+  sessionId: string;
+  messageId: string;
+}
+
+export interface MergeRemoteMessagesInput {
+  sessionId: string;
+  messages: MessageItem[];
+}
+
+export interface RemoteDeliveryReceipt {
+  remoteId: string;
+  messageId?: string;
+  deliveryStatus: MessageDeliveryStatus;
+  ackedAt?: string;
+}
+
+export interface MergeRemoteDeliveryReceiptsInput {
+  sessionId: string;
+  receipts: RemoteDeliveryReceipt[];
 }
 
 export interface StartConversationInput {
@@ -162,9 +300,24 @@ export interface StartConversationInput {
   contactId: string;
 }
 
+export interface StartSelfConversationInput {
+  circleId: string;
+}
+
 export interface StartConversationResult {
   seed: ChatDomainSeed;
   sessionId: string;
+}
+
+export interface CreateGroupConversationInput {
+  circleId: string;
+  name: string;
+  memberContactIds: string[];
+}
+
+export interface StartLookupConversationInput {
+  circleId: string;
+  query: string;
 }
 
 export interface SessionActionInput {
@@ -188,6 +341,16 @@ export interface UpdateCircleInput {
   circleId: string;
   name: string;
   description: string;
+}
+
+export interface UpdateGroupNameInput {
+  sessionId: string;
+  name: string;
+}
+
+export interface UpdateGroupMembersInput {
+  sessionId: string;
+  memberContactIds: string[];
 }
 
 export interface TransportCapabilities {
@@ -241,6 +404,35 @@ export interface TransportActivityItem {
   time: string;
 }
 
+export interface TransportRuntimeSession {
+  circleId: string;
+  driver: string;
+  adapterKind: TransportRuntimeAdapterKind;
+  launchStatus: TransportRuntimeLaunchStatus;
+  launchCommand?: string;
+  launchArguments: string[];
+  resolvedLaunchCommand?: string;
+  launchError?: string;
+  lastLaunchResult?: TransportRuntimeLaunchResult;
+  lastLaunchPid?: number;
+  lastLaunchAt?: string;
+  desiredState: TransportRuntimeDesiredState;
+  recoveryPolicy: TransportRuntimeRecoveryPolicy;
+  queueState: TransportRuntimeQueueState;
+  restartAttempts: number;
+  nextRetryIn?: string;
+  nextRetryAtMs?: number;
+  lastFailureReason?: string;
+  lastFailureAt?: string;
+  state: TransportRuntimeState;
+  generation: number;
+  stateSince: string;
+  sessionLabel: string;
+  endpoint: string;
+  lastEvent: string;
+  lastEventAt: string;
+}
+
 export interface TransportSnapshotInput {
   activeCircleId?: string;
   useTorNetwork: boolean;
@@ -259,6 +451,7 @@ export interface TransportSnapshot {
   peers: DiscoveredPeer[];
   sessionSync: SessionSyncItem[];
   activities: TransportActivityItem[];
+  runtimeSessions: TransportRuntimeSession[];
 }
 
 export interface TransportCircleActionInput {

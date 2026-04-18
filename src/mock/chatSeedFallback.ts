@@ -10,6 +10,7 @@ import {
   defaultAdvancedPreferences,
   defaultAppPreferences,
   defaultNotificationPreferences,
+  defaultUserProfile,
 } from "../data/shellDefaults";
 
 function cloneSeed<T>(value: T): T {
@@ -261,6 +262,7 @@ const messagesBySession: Record<string, MessageItem[]> = {
       author: "me",
       body: "I matched the session list density, the circular avatars, the header actions and the self-chat icon first.",
       time: "12:39",
+      deliveryStatus: "sent",
     },
     {
       id: "alice-3",
@@ -277,6 +279,7 @@ const messagesBySession: Record<string, MessageItem[]> = {
       body: "Voice note",
       meta: "00:28",
       time: "12:43",
+      deliveryStatus: "sent",
     },
     {
       id: "alice-5",
@@ -316,6 +319,7 @@ const messagesBySession: Record<string, MessageItem[]> = {
       author: "me",
       body: "PrimeVue shell initialized. Next: route scaffolding, real store and Rust-backed data.",
       time: "Yesterday",
+      deliveryStatus: "sent",
     },
   ],
   release: [
@@ -398,6 +402,8 @@ const messagesBySession: Record<string, MessageItem[]> = {
 export function createChatSeedFallback(): PersistedShellState {
   return {
     isAuthenticated: false,
+    authSession: null,
+    userProfile: cloneSeed(defaultUserProfile),
     circles: cloneSeed(circleItems),
     appPreferences: cloneSeed(defaultAppPreferences),
     notificationPreferences: cloneSeed(defaultNotificationPreferences),

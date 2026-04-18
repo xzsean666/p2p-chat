@@ -11,12 +11,16 @@ import type { MessageItem, SessionItem } from "../types/chat";
 const props = defineProps<{
   session: SessionItem | null;
   messages: MessageItem[];
+  canLoadOlderMessages: boolean;
+  loadingOlderMessages: boolean;
   composerText: string;
 }>();
 
 const emit = defineEmits<{
+  (event: "load-older"): void;
   (event: "update:composerText", value: string): void;
   (event: "send"): void;
+  (event: "retry-message", messageId: string): void;
   (event: "open-profile"): void;
   (event: "open-details"): void;
 }>();
@@ -40,6 +44,19 @@ const subtitle = computed(() => {
 const showCallActions = computed(() => {
   return props.session?.kind === "direct";
 });
+
+function messageDeliveryLabel(message: MessageItem) {
+  switch (message.deliveryStatus) {
+    case "sending":
+      return "Sending";
+    case "failed":
+      return "Failed";
+    case "sent":
+      return message.ackedAt ? "Delivered" : "Sent";
+    default:
+      return "";
+  }
+}
 </script>
 
 <template>
@@ -90,6 +107,17 @@ const showCallActions = computed(() => {
 
       <ScrollPanel class="message-scroll">
         <div class="message-list">
+          <div v-if="canLoadOlderMessages" class="message-history-action">
+            <Button
+              label="Load older"
+              size="small"
+              text
+              severity="secondary"
+              :loading="loadingOlderMessages"
+              @click="emit('load-older')"
+            />
+          </div>
+
           <template v-for="message in messages" :key="message.id">
             <div v-if="message.kind === 'system'" class="system-line">
               {{ message.body }}
@@ -146,7 +174,24 @@ const showCallActions = computed(() => {
                     </div>
                   </template>
                 </div>
-                <span class="message-time">{{ message.time }}</span>
+                <div class="message-meta">
+                  <span class="message-time">{{ message.time }}</span>
+                  <span
+                    v-if="message.author === 'me' && message.deliveryStatus"
+                    :class="['message-status', `status-${message.deliveryStatus}`]"
+                  >
+                    {{ messageDeliveryLabel(message) }}
+                  </span>
+                  <Button
+                    v-if="message.author === 'me' && message.deliveryStatus === 'failed'"
+                    label="Retry"
+                    size="small"
+                    text
+                    severity="danger"
+                    class="message-retry"
+                    @click="emit('retry-message', message.id)"
+                  />
+                </div>
               </div>
             </div>
           </template>
@@ -192,9 +237,9 @@ const showCallActions = computed(() => {
   min-height: 0;
   padding: 20px 22px 18px;
   border-radius: 28px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(210, 220, 232, 0.9);
-  box-shadow: 0 20px 50px rgba(24, 46, 84, 0.08);
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border);
+  box-shadow: var(--shell-shadow-soft);
 }
 
 .chat-header,
@@ -202,9 +247,11 @@ const showCallActions = computed(() => {
 .chat-actions,
 .composer,
 .composer-actions,
+.message-history-action,
 .message-row,
 .file-card,
-.audio-card {
+.audio-card,
+.message-meta {
   display: flex;
 }
 
@@ -232,7 +279,7 @@ const showCallActions = computed(() => {
 
 .chat-title p {
   margin-top: 4px;
-  color: #68788f;
+  color: var(--shell-text-muted);
 }
 
 .chat-actions {
@@ -241,8 +288,8 @@ const showCallActions = computed(() => {
 
 .contact-avatar,
 .bubble-avatar {
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #1c355d;
+  background: var(--shell-avatar-bg);
+  color: var(--shell-avatar-text);
   font-weight: 700;
 }
 
@@ -265,13 +312,18 @@ const showCallActions = computed(() => {
   padding-right: 10px;
 }
 
+.message-history-action {
+  justify-content: center;
+  margin-bottom: 10px;
+}
+
 .system-line {
   margin: 12px auto 18px;
   width: fit-content;
   padding: 8px 12px;
   border-radius: 999px;
-  background: #f3f7fb;
-  color: #7a8ca3;
+  background: var(--shell-surface-soft);
+  color: var(--shell-text-soft);
   font-size: 0.82rem;
 }
 
@@ -298,13 +350,13 @@ const showCallActions = computed(() => {
 .message-bubble {
   border-radius: 22px;
   padding: 14px 16px;
-  background: #f4f7fb;
-  box-shadow: inset 0 0 0 1px rgba(218, 228, 240, 0.9);
+  background: var(--shell-surface-soft);
+  box-shadow: inset 0 0 0 1px var(--shell-border-soft);
 }
 
 .message-bubble.mine {
-  background: linear-gradient(135deg, #dff4ea 0%, #e7f7ff 100%);
-  box-shadow: inset 0 0 0 1px rgba(176, 219, 205, 0.95);
+  background: var(--shell-selected);
+  box-shadow: inset 0 0 0 1px var(--shell-selected-border);
 }
 
 .message-bubble p {
@@ -313,8 +365,34 @@ const showCallActions = computed(() => {
 }
 
 .message-time {
-  color: #7a8ca3;
+  color: var(--shell-text-soft);
   font-size: 0.82rem;
+}
+
+.message-meta {
+  align-items: center;
+  gap: 8px;
+}
+
+.message-status {
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.message-status.status-sending {
+  color: #7a8ca3;
+}
+
+.message-status.status-sent {
+  color: #5b7e69;
+}
+
+.message-status.status-failed {
+  color: #c95a48;
+}
+
+.message-retry {
+  padding: 0;
 }
 
 .file-card,
@@ -326,12 +404,12 @@ const showCallActions = computed(() => {
 .file-card i,
 .audio-card i {
   font-size: 1.2rem;
-  color: #496c9b;
+  color: color-mix(in srgb, var(--shell-text-default) 72%, #5f8ed8);
 }
 
 .file-card span {
   display: block;
-  color: #72839d;
+  color: var(--shell-text-muted);
   font-size: 0.82rem;
   margin-top: 4px;
 }
@@ -347,7 +425,7 @@ const showCallActions = computed(() => {
 .audio-wave span {
   height: 6px;
   border-radius: 999px;
-  background: #7ea2d6;
+  background: color-mix(in srgb, var(--shell-text-soft) 58%, #7ea2d6);
 }
 
 .audio-wave span:nth-child(odd) {
@@ -375,7 +453,9 @@ const showCallActions = computed(() => {
 .composer-input :deep(.p-textarea) {
   min-height: 52px;
   border-radius: 18px;
-  background: #f6f9fc;
+  background: var(--shell-surface-muted);
+  color: var(--shell-text-default);
+  border-color: var(--shell-border);
 }
 
 .chat-empty {
@@ -393,8 +473,8 @@ const showCallActions = computed(() => {
   width: 72px;
   height: 72px;
   border-radius: 999px;
-  background: #f3f7fb;
-  color: #6c84a4;
+  background: var(--shell-surface-soft);
+  color: var(--shell-text-muted);
   font-size: 1.5rem;
 }
 
@@ -404,6 +484,6 @@ const showCallActions = computed(() => {
 }
 
 .chat-empty p {
-  color: #697b93;
+  color: var(--shell-text-muted);
 }
 </style>

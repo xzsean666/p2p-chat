@@ -24,14 +24,18 @@ struct AdapterBehavior {
     discover_opens_immediately: bool,
 }
 
-pub fn adapter_for_relay(relay: &str) -> &'static dyn TransportAdapter {
+pub fn protocol_for_relay(relay: &str) -> RelayProtocol {
     if relay.starts_with("mesh://") {
-        &MESH_ADAPTER
+        RelayProtocol::Mesh
     } else if relay.starts_with("invite://") {
-        &INVITE_ADAPTER
+        RelayProtocol::Invite
     } else {
-        &WEBSOCKET_ADAPTER
+        RelayProtocol::Websocket
     }
+}
+
+pub fn adapter_for_relay(relay: &str) -> &'static dyn TransportAdapter {
+    adapter_for_protocol(&protocol_for_relay(relay))
 }
 
 pub fn adapter_for_protocol(protocol: &RelayProtocol) -> &'static dyn TransportAdapter {

@@ -160,13 +160,13 @@ const drawerVisible = computed({
 .profile-card {
   padding: 14px;
   border-radius: 20px;
-  background: #f5f8fb;
+  background: var(--shell-surface-soft);
 }
 
 .profile-avatar,
 .circle-avatar {
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
+  background: var(--shell-avatar-bg);
+  color: var(--shell-avatar-text);
   font-weight: 700;
 }
 
@@ -187,7 +187,7 @@ const drawerVisible = computed({
 }
 
 .profile-card p {
-  color: #6f8199;
+  color: var(--shell-text-muted);
   font-size: 0.88rem;
 }
 
@@ -197,7 +197,7 @@ const drawerVisible = computed({
 }
 
 .section-title {
-  color: #6a7d98;
+  color: var(--shell-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.16em;
   font-size: 0.72rem;
@@ -215,12 +215,12 @@ const drawerVisible = computed({
 
 .drawer-row:hover,
 .circle-row-shell:hover {
-  background: #f4f8fb;
+  background: var(--shell-hover);
 }
 
 .drawer-row.active,
 .circle-row-shell.active {
-  background: linear-gradient(135deg, #eff5ff 0%, #eefaf5 100%);
+  background: var(--shell-selected);
 }
 
 .circle-row-main {
@@ -247,7 +247,7 @@ const drawerVisible = computed({
 }
 
 .row-copy span {
-  color: #7487a0;
+  color: var(--shell-text-soft);
   font-size: 0.84rem;
 }
 

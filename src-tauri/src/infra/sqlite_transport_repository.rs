@@ -1,17 +1,24 @@
 use crate::domain::transport::{
     DiscoveredPeer, PeerPresence, SessionSyncItem, SessionSyncState, TransportActivityItem,
-    TransportActivityKind, TransportActivityLevel,
+    TransportActivityKind, TransportActivityLevel, TransportRuntimeAdapterKind,
+    TransportRuntimeDesiredState, TransportRuntimeLaunchResult, TransportRuntimeLaunchStatus,
+    TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry,
+    TransportRuntimeSession, TransportRuntimeState,
 };
 use crate::domain::transport_repository::{TransportCache, TransportRepository};
+use crate::domain::transport_runtime_registry::{
+    infer_runtime_registry_entry_from_legacy_session, project_runtime_session,
+};
 use crate::infra::sqlite_connection::open_connection;
 use rusqlite::params;
+use tauri::Runtime;
 
-pub struct SqliteTransportRepository {
-    app_handle: tauri::AppHandle,
+pub struct SqliteTransportRepository<R: Runtime> {
+    app_handle: tauri::AppHandle<R>,
 }
 
-impl SqliteTransportRepository {
-    pub fn new(app_handle: &tauri::AppHandle) -> Self {
+impl<R: Runtime> SqliteTransportRepository<R> {
+    pub fn new(app_handle: &tauri::AppHandle<R>) -> Self {
         Self {
             app_handle: app_handle.clone(),
         }
@@ -72,13 +79,239 @@ impl SqliteTransportRepository {
               detail TEXT NOT NULL,
               time TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS transport_runtime_session (
+              circle_id TEXT PRIMARY KEY,
+              driver TEXT NOT NULL,
+              adapter_kind TEXT NOT NULL DEFAULT 'embedded',
+              launch_status TEXT NOT NULL DEFAULT 'embedded',
+              launch_command TEXT,
+              launch_arguments_json TEXT NOT NULL DEFAULT '[]',
+              resolved_launch_command TEXT,
+              launch_error TEXT,
+              last_launch_result TEXT,
+              last_launch_pid INTEGER,
+              last_launch_at TEXT,
+              desired_state TEXT NOT NULL DEFAULT 'stopped',
+              recovery_policy TEXT NOT NULL DEFAULT 'manual',
+              queue_state TEXT NOT NULL DEFAULT 'idle',
+              restart_attempts INTEGER NOT NULL DEFAULT 0,
+              next_retry_in TEXT,
+              next_retry_at_ms INTEGER,
+              last_failure_reason TEXT,
+              last_failure_at TEXT,
+              state TEXT NOT NULL,
+              generation INTEGER NOT NULL DEFAULT 0,
+              state_since TEXT NOT NULL DEFAULT 'not started',
+              session_label TEXT NOT NULL,
+              endpoint TEXT NOT NULL,
+              last_event TEXT NOT NULL,
+              last_event_at TEXT NOT NULL DEFAULT 'not started'
+            );
+
+            CREATE TABLE IF NOT EXISTS transport_runtime_registry (
+              circle_id TEXT PRIMARY KEY,
+              driver TEXT NOT NULL,
+              adapter_kind TEXT NOT NULL DEFAULT 'embedded',
+              launch_status TEXT NOT NULL DEFAULT 'embedded',
+              launch_command TEXT,
+              launch_arguments_json TEXT NOT NULL DEFAULT '[]',
+              resolved_launch_command TEXT,
+              launch_error TEXT,
+              last_launch_result TEXT,
+              last_launch_pid INTEGER,
+              last_launch_at TEXT,
+              desired_state TEXT NOT NULL,
+              recovery_policy TEXT NOT NULL,
+              queue_state TEXT NOT NULL DEFAULT 'idle',
+              restart_attempts INTEGER NOT NULL DEFAULT 0,
+              next_retry_in TEXT,
+              next_retry_at_ms INTEGER,
+              last_failure_reason TEXT,
+              last_failure_at TEXT,
+              state TEXT NOT NULL,
+              generation INTEGER NOT NULL DEFAULT 0,
+              state_since TEXT NOT NULL DEFAULT 'not started',
+              session_label TEXT NOT NULL,
+              endpoint TEXT NOT NULL,
+              last_event TEXT NOT NULL,
+              last_event_at TEXT NOT NULL DEFAULT 'not started'
+            );
             "#,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "adapter_kind",
+            "TEXT NOT NULL DEFAULT 'embedded'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "launch_status",
+            "TEXT NOT NULL DEFAULT 'embedded'",
+        )?;
+        ensure_table_column(conn, "transport_runtime_session", "launch_command", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "launch_arguments_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "resolved_launch_command",
+            "TEXT",
+        )?;
+        ensure_table_column(conn, "transport_runtime_session", "launch_error", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "last_launch_result",
+            "TEXT",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "last_launch_pid",
+            "INTEGER",
+        )?;
+        ensure_table_column(conn, "transport_runtime_session", "last_launch_at", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "desired_state",
+            "TEXT NOT NULL DEFAULT 'stopped'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "recovery_policy",
+            "TEXT NOT NULL DEFAULT 'manual'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "queue_state",
+            "TEXT NOT NULL DEFAULT 'idle'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "restart_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_table_column(conn, "transport_runtime_session", "next_retry_in", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "next_retry_at_ms",
+            "INTEGER",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "last_failure_reason",
+            "TEXT",
+        )?;
+        ensure_table_column(conn, "transport_runtime_session", "last_failure_at", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "generation",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "state_since",
+            "TEXT NOT NULL DEFAULT 'not started'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_session",
+            "last_event_at",
+            "TEXT NOT NULL DEFAULT 'not started'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "adapter_kind",
+            "TEXT NOT NULL DEFAULT 'embedded'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "launch_status",
+            "TEXT NOT NULL DEFAULT 'embedded'",
+        )?;
+        ensure_table_column(conn, "transport_runtime_registry", "launch_command", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "launch_arguments_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "resolved_launch_command",
+            "TEXT",
+        )?;
+        ensure_table_column(conn, "transport_runtime_registry", "launch_error", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "last_launch_result",
+            "TEXT",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "last_launch_pid",
+            "INTEGER",
+        )?;
+        ensure_table_column(conn, "transport_runtime_registry", "last_launch_at", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "queue_state",
+            "TEXT NOT NULL DEFAULT 'idle'",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "restart_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_table_column(conn, "transport_runtime_registry", "next_retry_in", "TEXT")?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "next_retry_at_ms",
+            "INTEGER",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "last_failure_reason",
+            "TEXT",
+        )?;
+        ensure_table_column(
+            conn,
+            "transport_runtime_registry",
+            "last_failure_at",
+            "TEXT",
+        )?;
+
+        Ok(())
     }
 }
 
-impl TransportRepository for SqliteTransportRepository {
+impl<R: Runtime> TransportRepository for SqliteTransportRepository<R> {
     fn load_transport_cache(&self) -> Result<TransportCache, String> {
         self.with_connection(|conn| {
             let mut peer_stmt = conn
@@ -157,10 +390,173 @@ impl TransportRepository for SqliteTransportRepository {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
 
+            let mut registry_stmt = conn
+                .prepare(
+                    "SELECT circle_id, driver, adapter_kind, launch_status, launch_command, launch_arguments_json, resolved_launch_command, launch_error, last_launch_result, last_launch_pid, last_launch_at, desired_state, recovery_policy, queue_state, restart_attempts, next_retry_in, next_retry_at_ms, last_failure_reason, last_failure_at, state, generation, state_since, session_label, endpoint, last_event, last_event_at FROM transport_runtime_registry ORDER BY rowid ASC",
+                )
+                .map_err(|error| error.to_string())?;
+            let registry_rows = registry_stmt
+                .query_map([], |row| {
+                    Ok(TransportRuntimeRegistryEntry {
+                        circle_id: row.get(0)?,
+                        driver: row.get(1)?,
+                        adapter_kind: transport_runtime_adapter_kind_from_str(
+                            &row.get::<_, String>(2)?,
+                        )
+                        .map_err(sqlite_user_error)?,
+                        launch_status: transport_runtime_launch_status_from_str(
+                            &row.get::<_, String>(3)?,
+                        )
+                        .map_err(sqlite_user_error)?,
+                        launch_command: row.get(4)?,
+                        launch_arguments: transport_runtime_launch_arguments_from_json(
+                            &row.get::<_, String>(5)?,
+                        )
+                        .map_err(sqlite_user_error)?,
+                        resolved_launch_command: row.get(6)?,
+                        launch_error: row.get(7)?,
+                        last_launch_result: row
+                            .get::<_, Option<String>>(8)?
+                            .map(|value| transport_runtime_launch_result_from_str(&value))
+                            .transpose()
+                            .map_err(sqlite_user_error)?,
+                        last_launch_pid: row
+                            .get::<_, Option<i64>>(9)?
+                            .map(i64_to_u32)
+                            .transpose()
+                            .map_err(sqlite_user_error)?,
+                        last_launch_at: row.get(10)?,
+                        desired_state: transport_runtime_desired_state_from_str(
+                            &row.get::<_, String>(11)?,
+                        )
+                        .map_err(sqlite_user_error)?,
+                        recovery_policy: transport_runtime_recovery_policy_from_str(
+                            &row.get::<_, String>(12)?,
+                        )
+                        .map_err(sqlite_user_error)?,
+                        queue_state: transport_runtime_queue_state_from_str(
+                            &row.get::<_, String>(13)?,
+                        )
+                        .map_err(sqlite_user_error)?,
+                        restart_attempts: row
+                            .get::<_, i64>(14)
+                            .and_then(|value| i64_to_u32(value).map_err(sqlite_user_error))?,
+                        next_retry_in: row.get(15)?,
+                        next_retry_at_ms: row
+                            .get::<_, Option<i64>>(16)?
+                            .map(i64_to_u64)
+                            .transpose()
+                            .map_err(sqlite_user_error)?,
+                        last_failure_reason: row.get(17)?,
+                        last_failure_at: row.get(18)?,
+                        state: transport_runtime_state_from_str(&row.get::<_, String>(19)?)
+                            .map_err(sqlite_user_error)?,
+                        generation: row
+                            .get::<_, i64>(20)
+                            .and_then(|value| i64_to_u32(value).map_err(sqlite_user_error))?,
+                        state_since: row.get(21)?,
+                        session_label: row.get(22)?,
+                        endpoint: row.get(23)?,
+                        last_event: row.get(24)?,
+                        last_event_at: row.get(25)?,
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            let mut runtime_registry = registry_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+
+            if runtime_registry.is_empty() {
+                let mut runtime_stmt = conn
+                    .prepare(
+                        "SELECT circle_id, driver, adapter_kind, launch_status, launch_command, launch_arguments_json, resolved_launch_command, launch_error, last_launch_result, last_launch_pid, last_launch_at, desired_state, recovery_policy, queue_state, restart_attempts, next_retry_in, next_retry_at_ms, last_failure_reason, last_failure_at, state, generation, state_since, session_label, endpoint, last_event, last_event_at FROM transport_runtime_session ORDER BY rowid ASC",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let runtime_rows = runtime_stmt
+                    .query_map([], |row| {
+                        Ok(TransportRuntimeSession {
+                            circle_id: row.get(0)?,
+                            driver: row.get(1)?,
+                            adapter_kind: transport_runtime_adapter_kind_from_str(
+                                &row.get::<_, String>(2)?,
+                            )
+                            .map_err(sqlite_user_error)?,
+                            launch_status: transport_runtime_launch_status_from_str(
+                                &row.get::<_, String>(3)?,
+                            )
+                            .map_err(sqlite_user_error)?,
+                            launch_command: row.get(4)?,
+                            launch_arguments: transport_runtime_launch_arguments_from_json(
+                                &row.get::<_, String>(5)?,
+                            )
+                            .map_err(sqlite_user_error)?,
+                            resolved_launch_command: row.get(6)?,
+                            launch_error: row.get(7)?,
+                            last_launch_result: row
+                                .get::<_, Option<String>>(8)?
+                                .map(|value| transport_runtime_launch_result_from_str(&value))
+                                .transpose()
+                                .map_err(sqlite_user_error)?,
+                            last_launch_pid: row
+                                .get::<_, Option<i64>>(9)?
+                                .map(i64_to_u32)
+                                .transpose()
+                                .map_err(sqlite_user_error)?,
+                            last_launch_at: row.get(10)?,
+                            desired_state: transport_runtime_desired_state_from_str(
+                                &row.get::<_, String>(11)?,
+                            )
+                            .map_err(sqlite_user_error)?,
+                            recovery_policy: transport_runtime_recovery_policy_from_str(
+                                &row.get::<_, String>(12)?,
+                            )
+                            .map_err(sqlite_user_error)?,
+                            queue_state: transport_runtime_queue_state_from_str(
+                                &row.get::<_, String>(13)?,
+                            )
+                            .map_err(sqlite_user_error)?,
+                            restart_attempts: row
+                                .get::<_, i64>(14)
+                                .and_then(|value| i64_to_u32(value).map_err(sqlite_user_error))?,
+                            next_retry_in: row.get(15)?,
+                            next_retry_at_ms: row
+                                .get::<_, Option<i64>>(16)?
+                                .map(i64_to_u64)
+                                .transpose()
+                                .map_err(sqlite_user_error)?,
+                            last_failure_reason: row.get(17)?,
+                            last_failure_at: row.get(18)?,
+                            state: transport_runtime_state_from_str(&row.get::<_, String>(19)?)
+                                .map_err(sqlite_user_error)?,
+                            generation: row
+                                .get::<_, i64>(20)
+                                .and_then(|value| i64_to_u32(value).map_err(sqlite_user_error))?,
+                            state_since: row.get(21)?,
+                            session_label: row.get(22)?,
+                            endpoint: row.get(23)?,
+                            last_event: row.get(24)?,
+                            last_event_at: row.get(25)?,
+                        })
+                    })
+                    .map_err(|error| error.to_string())?;
+                runtime_registry = runtime_rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(infer_runtime_registry_entry_from_legacy_session)
+                    .collect();
+            }
+            let runtime_sessions = runtime_registry
+                .iter()
+                .map(project_runtime_session)
+                .collect::<Vec<_>>();
+
             Ok(TransportCache {
                 peers,
                 session_sync,
                 activities,
+                runtime_registry,
+                runtime_sessions,
             })
         })
     }
@@ -171,6 +567,8 @@ impl TransportRepository for SqliteTransportRepository {
             tx.execute_batch(
                 r#"
                 DELETE FROM transport_activity;
+                DELETE FROM transport_runtime_registry;
+                DELETE FROM transport_runtime_session;
                 DELETE FROM transport_session_sync;
                 DELETE FROM transport_peers;
                 "#,
@@ -228,6 +626,80 @@ impl TransportRepository for SqliteTransportRepository {
                 .map_err(|error| error.to_string())?;
             }
 
+            for item in cache.runtime_registry {
+                tx.execute(
+                    "INSERT INTO transport_runtime_registry (circle_id, driver, adapter_kind, launch_status, launch_command, launch_arguments_json, resolved_launch_command, launch_error, last_launch_result, last_launch_pid, last_launch_at, desired_state, recovery_policy, queue_state, restart_attempts, next_retry_in, next_retry_at_ms, last_failure_reason, last_failure_at, state, generation, state_since, session_label, endpoint, last_event, last_event_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                    params![
+                        item.circle_id,
+                        item.driver,
+                        transport_runtime_adapter_kind_to_str(&item.adapter_kind),
+                        transport_runtime_launch_status_to_str(&item.launch_status),
+                        item.launch_command,
+                        transport_runtime_launch_arguments_to_json(&item.launch_arguments)?,
+                        item.resolved_launch_command,
+                        item.launch_error,
+                        item.last_launch_result
+                            .as_ref()
+                            .map(transport_runtime_launch_result_to_str),
+                        item.last_launch_pid.map(i64::from),
+                        item.last_launch_at,
+                        transport_runtime_desired_state_to_str(&item.desired_state),
+                        transport_runtime_recovery_policy_to_str(&item.recovery_policy),
+                        transport_runtime_queue_state_to_str(&item.queue_state),
+                        i64::from(item.restart_attempts),
+                        item.next_retry_in,
+                        item.next_retry_at_ms.map(|value| value as i64),
+                        item.last_failure_reason,
+                        item.last_failure_at,
+                        transport_runtime_state_to_str(&item.state),
+                        i64::from(item.generation),
+                        item.state_since,
+                        item.session_label,
+                        item.endpoint,
+                        item.last_event,
+                        item.last_event_at,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+
+            for item in cache.runtime_sessions {
+                tx.execute(
+                    "INSERT INTO transport_runtime_session (circle_id, driver, adapter_kind, launch_status, launch_command, launch_arguments_json, resolved_launch_command, launch_error, last_launch_result, last_launch_pid, last_launch_at, desired_state, recovery_policy, queue_state, restart_attempts, next_retry_in, next_retry_at_ms, last_failure_reason, last_failure_at, state, generation, state_since, session_label, endpoint, last_event, last_event_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                    params![
+                        item.circle_id,
+                        item.driver,
+                        transport_runtime_adapter_kind_to_str(&item.adapter_kind),
+                        transport_runtime_launch_status_to_str(&item.launch_status),
+                        item.launch_command,
+                        transport_runtime_launch_arguments_to_json(&item.launch_arguments)?,
+                        item.resolved_launch_command,
+                        item.launch_error,
+                        item.last_launch_result
+                            .as_ref()
+                            .map(transport_runtime_launch_result_to_str),
+                        item.last_launch_pid.map(i64::from),
+                        item.last_launch_at,
+                        transport_runtime_desired_state_to_str(&item.desired_state),
+                        transport_runtime_recovery_policy_to_str(&item.recovery_policy),
+                        transport_runtime_queue_state_to_str(&item.queue_state),
+                        i64::from(item.restart_attempts),
+                        item.next_retry_in,
+                        item.next_retry_at_ms.map(|value| value as i64),
+                        item.last_failure_reason,
+                        item.last_failure_at,
+                        transport_runtime_state_to_str(&item.state),
+                        i64::from(item.generation),
+                        item.state_since,
+                        item.session_label,
+                        item.endpoint,
+                        item.last_event,
+                        item.last_event_at,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+
             tx.commit().map_err(|error| error.to_string())
         })
     }
@@ -243,6 +715,41 @@ fn bool_to_i64(value: bool) -> i64 {
 
 fn i64_to_u32(value: i64) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("invalid integer value: {value}"))
+}
+
+fn i64_to_u64(value: i64) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("invalid integer value: {value}"))
+}
+
+fn ensure_table_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?;
+    let has_column = columns
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .any(|name| name == column);
+
+    if has_column {
+        return Ok(());
+    }
+
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
 }
 
 fn sqlite_user_error(message: String) -> rusqlite::Error {
@@ -330,4 +837,143 @@ fn transport_activity_level_from_str(value: &str) -> Result<TransportActivityLev
         "warn" => Ok(TransportActivityLevel::Warn),
         _ => Err(format!("unknown transport activity level: {value}")),
     }
+}
+
+fn transport_runtime_state_to_str(value: &TransportRuntimeState) -> &'static str {
+    match value {
+        TransportRuntimeState::Inactive => "inactive",
+        TransportRuntimeState::Starting => "starting",
+        TransportRuntimeState::Active => "active",
+    }
+}
+
+fn transport_runtime_state_from_str(value: &str) -> Result<TransportRuntimeState, String> {
+    match value {
+        "inactive" => Ok(TransportRuntimeState::Inactive),
+        "starting" => Ok(TransportRuntimeState::Starting),
+        "active" => Ok(TransportRuntimeState::Active),
+        _ => Err(format!("unknown transport runtime state: {value}")),
+    }
+}
+
+fn transport_runtime_desired_state_to_str(value: &TransportRuntimeDesiredState) -> &'static str {
+    match value {
+        TransportRuntimeDesiredState::Stopped => "stopped",
+        TransportRuntimeDesiredState::Running => "running",
+    }
+}
+
+fn transport_runtime_desired_state_from_str(
+    value: &str,
+) -> Result<TransportRuntimeDesiredState, String> {
+    match value {
+        "stopped" => Ok(TransportRuntimeDesiredState::Stopped),
+        "running" => Ok(TransportRuntimeDesiredState::Running),
+        _ => Err(format!("unknown transport runtime desired state: {value}")),
+    }
+}
+
+fn transport_runtime_recovery_policy_to_str(
+    value: &TransportRuntimeRecoveryPolicy,
+) -> &'static str {
+    match value {
+        TransportRuntimeRecoveryPolicy::Manual => "manual",
+        TransportRuntimeRecoveryPolicy::Auto => "auto",
+    }
+}
+
+fn transport_runtime_recovery_policy_from_str(
+    value: &str,
+) -> Result<TransportRuntimeRecoveryPolicy, String> {
+    match value {
+        "manual" => Ok(TransportRuntimeRecoveryPolicy::Manual),
+        "auto" => Ok(TransportRuntimeRecoveryPolicy::Auto),
+        _ => Err(format!(
+            "unknown transport runtime recovery policy: {value}"
+        )),
+    }
+}
+
+fn transport_runtime_queue_state_to_str(value: &TransportRuntimeQueueState) -> &'static str {
+    match value {
+        TransportRuntimeQueueState::Idle => "idle",
+        TransportRuntimeQueueState::Queued => "queued",
+        TransportRuntimeQueueState::Backoff => "backoff",
+    }
+}
+
+fn transport_runtime_queue_state_from_str(
+    value: &str,
+) -> Result<TransportRuntimeQueueState, String> {
+    match value {
+        "idle" => Ok(TransportRuntimeQueueState::Idle),
+        "queued" => Ok(TransportRuntimeQueueState::Queued),
+        "backoff" => Ok(TransportRuntimeQueueState::Backoff),
+        _ => Err(format!("unknown transport runtime queue state: {value}")),
+    }
+}
+
+fn transport_runtime_adapter_kind_to_str(value: &TransportRuntimeAdapterKind) -> &'static str {
+    match value {
+        TransportRuntimeAdapterKind::Embedded => "embedded",
+        TransportRuntimeAdapterKind::LocalCommand => "localCommand",
+    }
+}
+
+fn transport_runtime_adapter_kind_from_str(
+    value: &str,
+) -> Result<TransportRuntimeAdapterKind, String> {
+    match value {
+        "embedded" => Ok(TransportRuntimeAdapterKind::Embedded),
+        "localCommand" => Ok(TransportRuntimeAdapterKind::LocalCommand),
+        _ => Err(format!("unknown transport runtime adapter kind: {value}")),
+    }
+}
+
+fn transport_runtime_launch_status_to_str(value: &TransportRuntimeLaunchStatus) -> &'static str {
+    match value {
+        TransportRuntimeLaunchStatus::Embedded => "embedded",
+        TransportRuntimeLaunchStatus::Ready => "ready",
+        TransportRuntimeLaunchStatus::Missing => "missing",
+        TransportRuntimeLaunchStatus::Unknown => "unknown",
+    }
+}
+
+fn transport_runtime_launch_status_from_str(
+    value: &str,
+) -> Result<TransportRuntimeLaunchStatus, String> {
+    match value {
+        "embedded" => Ok(TransportRuntimeLaunchStatus::Embedded),
+        "ready" => Ok(TransportRuntimeLaunchStatus::Ready),
+        "missing" => Ok(TransportRuntimeLaunchStatus::Missing),
+        "unknown" => Ok(TransportRuntimeLaunchStatus::Unknown),
+        _ => Err(format!("unknown transport runtime launch status: {value}")),
+    }
+}
+
+fn transport_runtime_launch_result_to_str(value: &TransportRuntimeLaunchResult) -> &'static str {
+    match value {
+        TransportRuntimeLaunchResult::Spawned => "spawned",
+        TransportRuntimeLaunchResult::Reused => "reused",
+        TransportRuntimeLaunchResult::Failed => "failed",
+    }
+}
+
+fn transport_runtime_launch_result_from_str(
+    value: &str,
+) -> Result<TransportRuntimeLaunchResult, String> {
+    match value {
+        "spawned" => Ok(TransportRuntimeLaunchResult::Spawned),
+        "reused" => Ok(TransportRuntimeLaunchResult::Reused),
+        "failed" => Ok(TransportRuntimeLaunchResult::Failed),
+        _ => Err(format!("unknown transport runtime launch result: {value}")),
+    }
+}
+
+fn transport_runtime_launch_arguments_to_json(value: &[String]) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
+}
+
+fn transport_runtime_launch_arguments_from_json(value: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(value).map_err(|error| error.to_string())
 }

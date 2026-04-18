@@ -73,9 +73,9 @@ const emit = defineEmits<{
   width: min(760px, calc(100vw - 36px));
   height: calc(100vh - 36px);
   border-radius: 30px;
-  background: rgba(255, 255, 255, 0.97);
-  border: 1px solid rgba(210, 220, 232, 0.92);
-  box-shadow: 0 26px 64px rgba(17, 36, 66, 0.2);
+  background: var(--shell-surface-strong);
+  border: 1px solid var(--shell-border);
+  box-shadow: var(--shell-shadow-strong);
   overflow: hidden;
 }
 
@@ -90,8 +90,8 @@ const emit = defineEmits<{
   justify-content: space-between;
   gap: 16px;
   padding: 18px 20px 14px;
-  border-bottom: 1px solid rgba(224, 232, 240, 0.9);
-  background: rgba(251, 253, 255, 0.92);
+  border-bottom: 1px solid var(--shell-border-soft);
+  background: color-mix(in srgb, var(--shell-surface-strong) 92%, var(--shell-surface-soft));
 }
 
 .page-shell-leading {
@@ -118,7 +118,7 @@ const emit = defineEmits<{
 
 .page-shell-copy p {
   margin-top: 4px;
-  color: #71839d;
+  color: var(--shell-text-muted);
   font-size: 0.9rem;
 }
 
@@ -130,8 +130,8 @@ const emit = defineEmits<{
 
 .page-shell-footer {
   padding: 16px 22px 22px;
-  border-top: 1px solid rgba(224, 232, 240, 0.9);
-  background: rgba(251, 253, 255, 0.94);
+  border-top: 1px solid var(--shell-border-soft);
+  background: color-mix(in srgb, var(--shell-surface-strong) 94%, var(--shell-surface-soft));
 }
 
 @media (max-width: 920px) {

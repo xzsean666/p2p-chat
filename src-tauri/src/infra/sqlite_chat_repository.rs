@@ -1,21 +1,24 @@
 use crate::domain::chat::{
-    AdvancedPreferences, AppPreferences, ChatDomainSeed, CircleItem, CircleStatus, CircleType,
-    ContactItem, GroupMember, GroupProfile, GroupRole, LanguagePreference, MessageAuthor,
-    MessageItem, MessageKind, NotificationPreferences, PersistedShellState, SessionItem,
-    SessionKind, TextSizePreference, ThemePreference,
+    ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage,
+    CircleItem, CircleStatus, CircleType, ContactItem, GroupMember, GroupProfile, GroupRole,
+    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, MessageAuthor, MessageDeliveryStatus,
+    MessageItem, MessageKind, MessageSyncSource, SessionItem, SessionKind,
 };
-use crate::domain::chat_repository::ChatRepository;
+use crate::domain::chat_repository::{
+    merge_message_records, ChatDomainChangeSet, ChatRepository, ChatUpsert,
+};
 use crate::infra::seed_chat_repository::SeedChatRepository;
 use crate::infra::sqlite_connection::open_connection;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
+use tauri::Runtime;
 
-pub struct SqliteChatRepository {
-    app_handle: tauri::AppHandle,
+pub struct SqliteChatRepository<R: Runtime> {
+    app_handle: tauri::AppHandle<R>,
 }
 
-impl SqliteChatRepository {
-    pub fn new(app_handle: &tauri::AppHandle) -> Self {
+impl<R: Runtime> SqliteChatRepository<R> {
+    pub fn new(app_handle: &tauri::AppHandle<R>) -> Self {
         Self {
             app_handle: app_handle.clone(),
         }
@@ -105,7 +108,11 @@ impl SqliteChatRepository {
               author TEXT NOT NULL,
               body TEXT NOT NULL,
               time TEXT NOT NULL,
-              meta TEXT
+              meta TEXT,
+              delivery_status TEXT,
+              remote_id TEXT,
+              sync_source TEXT,
+              acked_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS chat_meta (
@@ -114,7 +121,12 @@ impl SqliteChatRepository {
             );
             "#,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+        ensure_message_delivery_status_column(conn)?;
+        ensure_message_remote_id_column(conn)?;
+        ensure_message_sync_source_column(conn)?;
+        ensure_message_acked_at_column(conn)
     }
 
     fn ensure_seed_data(&self, conn: &mut rusqlite::Connection) -> Result<(), String> {
@@ -150,7 +162,7 @@ impl SqliteChatRepository {
         }
 
         let seed_repository = SeedChatRepository::default();
-        self.replace_chat_domain_seed(conn, seed_repository.load_chat_seed()?.into())
+        self.replace_chat_domain_seed(conn, seed_repository.load_domain_seed()?)
     }
 
     fn replace_chat_domain_seed(
@@ -175,57 +187,105 @@ impl SqliteChatRepository {
         mark_initialized_tx(&tx)?;
         tx.commit().map_err(|error| error.to_string())
     }
-}
 
-impl ChatRepository for SqliteChatRepository {
-    fn load_chat_seed(&self) -> Result<PersistedShellState, String> {
-        let circles = self.load_seed_circles()?;
-        let sessions = self.load_seed_sessions()?;
-        let contacts = self.load_seed_contacts()?;
-        let groups = self.load_seed_groups()?;
-        let message_store = self.load_seed_message_store()?;
+    pub fn load_domain_seed_preview(
+        &self,
+        preferred_session_id: Option<&str>,
+        message_limit: u32,
+    ) -> Result<ChatDomainSeed, String> {
+        let circles = self.load_circles()?;
+        let contacts = self.load_contacts()?;
+        let sessions = self.load_sessions()?;
+        let groups = self.load_groups()?;
+        let selected_session_id = preferred_session_id
+            .filter(|session_id| sessions.iter().any(|session| session.id == *session_id))
+            .map(str::to_string)
+            .or_else(|| {
+                sessions
+                    .iter()
+                    .find(|session| !session.archived.unwrap_or(false))
+                    .map(|session| session.id.clone())
+            })
+            .or_else(|| sessions.first().map(|session| session.id.clone()));
+        let mut message_store = HashMap::new();
 
-        Ok(PersistedShellState {
-            is_authenticated: false,
-            circles: circles.clone(),
-            app_preferences: AppPreferences {
-                theme: ThemePreference::System,
-                language: LanguagePreference::En,
-                text_size: TextSizePreference::Default,
-            },
-            notification_preferences: NotificationPreferences {
-                allow_send: true,
-                allow_receive: false,
-                show_badge: true,
-                archive_summary: true,
-                mentions_only: false,
-            },
-            advanced_preferences: AdvancedPreferences {
-                show_message_info: false,
-                use_tor_network: false,
-                relay_diagnostics: true,
-                experimental_transport: false,
-            },
-            active_circle_id: circles
-                .first()
-                .map(|circle| circle.id.clone())
-                .unwrap_or_default(),
-            selected_session_id: sessions
-                .first()
-                .map(|session| session.id.clone())
-                .unwrap_or_default(),
-            sessions,
+        if let Some(session_id) = selected_session_id {
+            let page = self.load_session_messages_page(LoadSessionMessagesInput {
+                session_id: session_id.clone(),
+                before_message_id: None,
+                limit: message_limit,
+            })?;
+            message_store.insert(session_id, page.messages);
+        }
+
+        Ok(ChatDomainSeed {
+            circles,
             contacts,
+            sessions,
             groups,
             message_store,
         })
     }
 
-    fn load_seed_circles(&self) -> Result<Vec<CircleItem>, String> {
+    pub fn load_session_messages_page(
+        &self,
+        input: LoadSessionMessagesInput,
+    ) -> Result<ChatSessionMessagesPage, String> {
+        self.with_connection(|conn| load_session_messages_page_with_connection(conn, input))
+    }
+
+    pub fn load_session_message_updates(
+        &self,
+        input: LoadSessionMessageUpdatesInput,
+    ) -> Result<ChatSessionMessageUpdates, String> {
+        self.with_connection(|conn| load_session_message_updates_with_connection(conn, input))
+    }
+
+    pub fn load_sessions_overview(&self) -> Result<Vec<SessionItem>, String> {
+        self.load_sessions()
+    }
+
+    pub fn load_domain_overview(&self) -> Result<ChatDomainOverview, String> {
+        Ok(ChatDomainOverview {
+            circles: self.load_circles()?,
+            contacts: self.load_contacts()?,
+            sessions: self.load_sessions()?,
+            groups: self.load_groups()?,
+        })
+    }
+}
+
+impl<R: Runtime> ChatRepository for SqliteChatRepository<R> {
+    fn load_domain_seed(&self) -> Result<ChatDomainSeed, String> {
+        Ok(ChatDomainSeed {
+            circles: self.load_circles()?,
+            contacts: self.load_contacts()?,
+            sessions: self.load_sessions()?,
+            groups: self.load_groups()?,
+            message_store: self.load_message_store()?,
+        })
+    }
+
+    fn save_domain_seed(&self, seed: ChatDomainSeed) -> Result<(), String> {
+        self.with_connection_mut(|conn| self.replace_chat_domain_seed(conn, seed))
+    }
+
+    fn apply_change_set(&self, change_set: ChatDomainChangeSet) -> Result<(), String> {
+        self.with_connection_mut(|conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            apply_chat_domain_change_set(&tx, change_set)?;
+            mark_initialized_tx(&tx)?;
+            tx.commit().map_err(|error| error.to_string())
+        })
+    }
+}
+
+impl<R: Runtime> SqliteChatRepository<R> {
+    fn load_circles(&self) -> Result<Vec<CircleItem>, String> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, relay, type, status, latency, description FROM circles ORDER BY rowid ASC",
+                    "SELECT id, name, relay, type, status, latency, description FROM circles ORDER BY rowid DESC",
                 )
                 .map_err(|error| error.to_string())?;
 
@@ -250,11 +310,11 @@ impl ChatRepository for SqliteChatRepository {
         })
     }
 
-    fn load_seed_contacts(&self) -> Result<Vec<ContactItem>, String> {
+    fn load_contacts(&self) -> Result<Vec<ContactItem>, String> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, initials, handle, pubkey, subtitle, bio, online, blocked FROM contacts ORDER BY rowid ASC",
+                    "SELECT id, name, initials, handle, pubkey, subtitle, bio, online, blocked FROM contacts ORDER BY rowid DESC",
                 )
                 .map_err(|error| error.to_string())?;
 
@@ -279,11 +339,11 @@ impl ChatRepository for SqliteChatRepository {
         })
     }
 
-    fn load_seed_sessions(&self) -> Result<Vec<SessionItem>, String> {
+    fn load_sessions(&self) -> Result<Vec<SessionItem>, String> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, circle_id, contact_id, name, initials, subtitle, time, unread_count, muted, pinned, draft, kind, category, members, archived FROM sessions ORDER BY rowid ASC",
+                    "SELECT id, circle_id, contact_id, name, initials, subtitle, time, unread_count, muted, pinned, draft, kind, category, members, archived FROM sessions ORDER BY rowid DESC",
                 )
                 .map_err(|error| error.to_string())?;
 
@@ -326,11 +386,11 @@ impl ChatRepository for SqliteChatRepository {
         })
     }
 
-    fn load_seed_groups(&self) -> Result<Vec<GroupProfile>, String> {
+    fn load_groups(&self) -> Result<Vec<GroupProfile>, String> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT session_id, name, description, muted FROM group_profiles ORDER BY rowid ASC",
+                    "SELECT session_id, name, description, muted FROM group_profiles ORDER BY rowid DESC",
                 )
                 .map_err(|error| error.to_string())?;
 
@@ -387,29 +447,17 @@ impl ChatRepository for SqliteChatRepository {
         })
     }
 
-    fn load_seed_message_store(&self) -> Result<HashMap<String, Vec<MessageItem>>, String> {
+    fn load_message_store(&self) -> Result<HashMap<String, Vec<MessageItem>>, String> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT session_id, id, kind, author, body, time, meta FROM messages ORDER BY rowid ASC",
+                    "SELECT session_id, id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at FROM messages ORDER BY rowid ASC",
                 )
                 .map_err(|error| error.to_string())?;
 
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        MessageItem {
-                            id: row.get(1)?,
-                            kind: message_kind_from_str(&row.get::<_, String>(2)?)
-                                .map_err(sqlite_user_error)?,
-                            author: message_author_from_str(&row.get::<_, String>(3)?)
-                                .map_err(sqlite_user_error)?,
-                            body: row.get(4)?,
-                            time: row.get(5)?,
-                            meta: row.get(6)?,
-                        },
-                    ))
+                    Ok((row.get::<_, String>(0)?, message_item_from_row(row, 1)?))
                 })
                 .map_err(|error| error.to_string())?;
 
@@ -425,118 +473,580 @@ impl ChatRepository for SqliteChatRepository {
             Ok(message_store)
         })
     }
+}
 
-    fn save_chat_domain_seed(&self, seed: ChatDomainSeed) -> Result<(), String> {
-        self.with_connection_mut(|conn| self.replace_chat_domain_seed(conn, seed))
-    }
+fn load_session_messages_page_with_connection(
+    conn: &rusqlite::Connection,
+    input: LoadSessionMessagesInput,
+) -> Result<ChatSessionMessagesPage, String> {
+    let limit = input.limit.clamp(1, 100) as usize;
+    let requested_limit = i64::try_from(limit + 1).map_err(|error| error.to_string())?;
+    let before_rowid = match input.before_message_id.as_deref() {
+        Some(before_message_id) => conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![&input.session_id, before_message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+
+    let rows = if let Some(before_rowid) = before_rowid {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, author, body, time, meta, delivery_status
+                        , remote_id, sync_source, acked_at
+                 FROM messages
+                 WHERE session_id = ?1 AND rowid < ?2
+                 ORDER BY rowid DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![&input.session_id, before_rowid, requested_limit],
+                |row| message_item_from_row(row, 0),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, author, body, time, meta, delivery_status
+                        , remote_id, sync_source, acked_at
+                 FROM messages
+                 WHERE session_id = ?1
+                 ORDER BY rowid DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![&input.session_id, requested_limit], |row| {
+                message_item_from_row(row, 0)
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    let has_more = rows.len() > limit;
+    let mut messages = rows.into_iter().take(limit).collect::<Vec<_>>();
+    messages.reverse();
+    let next_before_message_id = has_more.then(|| messages[0].id.clone());
+
+    Ok(ChatSessionMessagesPage {
+        session_id: input.session_id,
+        has_more,
+        next_before_message_id,
+        messages,
+    })
+}
+
+fn load_session_message_updates_with_connection(
+    conn: &rusqlite::Connection,
+    input: LoadSessionMessageUpdatesInput,
+) -> Result<ChatSessionMessageUpdates, String> {
+    let limit = input.limit.clamp(1, 100) as usize;
+    let requested_limit = i64::try_from(limit + 1).map_err(|error| error.to_string())?;
+    let after_rowid = match input.after_message_id.as_deref() {
+        Some(after_message_id) => conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![&input.session_id, after_message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+
+    let rows = if let Some(after_rowid) = after_rowid {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, author, body, time, meta, delivery_status
+                        , remote_id, sync_source, acked_at
+                 FROM messages
+                 WHERE session_id = ?1 AND rowid > ?2
+                 ORDER BY rowid ASC
+                 LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![&input.session_id, after_rowid, requested_limit],
+                |row| message_item_from_row(row, 0),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, author, body, time, meta, delivery_status
+                        , remote_id, sync_source, acked_at
+                 FROM messages
+                 WHERE session_id = ?1
+                 ORDER BY rowid DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![&input.session_id, requested_limit], |row| {
+                message_item_from_row(row, 0)
+            })
+            .map_err(|error| error.to_string())?;
+        let mut rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.reverse();
+        rows
+    };
+
+    let has_more = rows.len() > limit;
+    let messages = rows.into_iter().take(limit).collect::<Vec<_>>();
+    let next_after_message_id = has_more
+        .then(|| messages.last().map(|message| message.id.clone()))
+        .flatten();
+
+    Ok(ChatSessionMessageUpdates {
+        session_id: input.session_id,
+        has_more,
+        next_after_message_id,
+        messages,
+    })
 }
 
 fn insert_chat_domain_seed(
     tx: &rusqlite::Transaction<'_>,
     seed: ChatDomainSeed,
 ) -> Result<(), String> {
-    for circle in seed.circles {
-        tx.execute(
-            "INSERT INTO circles (id, name, relay, type, status, latency, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                circle.id,
-                circle.name,
-                circle.relay,
-                circle_type_to_str(&circle.circle_type),
-                circle_status_to_str(&circle.status),
-                circle.latency,
-                circle.description
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+    for circle in seed.circles.into_iter().rev() {
+        insert_circle(tx, &circle)?;
     }
 
-    for contact in seed.contacts {
-        tx.execute(
-            "INSERT INTO contacts (id, name, initials, handle, pubkey, subtitle, bio, online, blocked) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                contact.id,
-                contact.name,
-                contact.initials,
-                contact.handle,
-                contact.pubkey,
-                contact.subtitle,
-                contact.bio,
-                optional_bool_to_i64(contact.online),
-                optional_bool_to_i64(contact.blocked)
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+    for contact in seed.contacts.into_iter().rev() {
+        insert_contact(tx, &contact)?;
     }
 
-    for session in seed.sessions {
-        tx.execute(
-            "INSERT INTO sessions (id, circle_id, contact_id, name, initials, subtitle, time, unread_count, muted, pinned, draft, kind, category, members, archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                session.id,
-                session.circle_id,
-                session.contact_id,
-                session.name,
-                session.initials,
-                session.subtitle,
-                session.time,
-                session.unread_count.map(i64::from),
-                optional_bool_to_i64(session.muted),
-                optional_bool_to_i64(session.pinned),
-                session.draft,
-                session_kind_to_str(&session.kind),
-                session.category,
-                session.members.map(i64::from),
-                optional_bool_to_i64(session.archived)
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+    for session in seed.sessions.into_iter().rev() {
+        insert_session(tx, &session)?;
     }
 
-    for group in seed.groups {
-        tx.execute(
-            "INSERT INTO group_profiles (session_id, name, description, muted) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                &group.session_id,
-                group.name,
-                group.description,
-                optional_bool_to_i64(group.muted)
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-
-        for member in group.members {
-            tx.execute(
-                "INSERT INTO group_members (session_id, contact_id, role) VALUES (?1, ?2, ?3)",
-                params![
-                    &group.session_id,
-                    member.contact_id,
-                    member.role.as_ref().map(group_role_to_str)
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        }
+    for group in seed.groups.into_iter().rev() {
+        insert_group(tx, &group)?;
     }
 
     for (session_id, messages) in seed.message_store {
         for message in messages {
-            tx.execute(
-                "INSERT INTO messages (id, session_id, kind, author, body, time, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    message.id,
-                    &session_id,
-                    message_kind_to_str(&message.kind),
-                    message_author_to_str(&message.author),
-                    message.body,
-                    message.time,
-                    message.meta
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+            insert_message(tx, &session_id, &message)?;
         }
     }
 
     Ok(())
+}
+
+fn apply_chat_domain_change_set(
+    tx: &rusqlite::Transaction<'_>,
+    change_set: ChatDomainChangeSet,
+) -> Result<(), String> {
+    for circle_id in change_set.circle_ids_to_delete {
+        delete_circle(tx, &circle_id)?;
+    }
+
+    for session_id in change_set.session_ids_to_delete {
+        delete_session(tx, &session_id)?;
+    }
+
+    for upsert in change_set.circles_upsert {
+        upsert_circle(tx, upsert)?;
+    }
+
+    for upsert in change_set.contacts_upsert {
+        upsert_contact(tx, upsert)?;
+    }
+
+    for upsert in change_set.sessions_upsert {
+        upsert_session(tx, upsert)?;
+    }
+
+    for upsert in change_set.groups_upsert {
+        upsert_group(tx, upsert)?;
+    }
+
+    for (session_id, messages) in change_set.messages_replace {
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", [&session_id])
+            .map_err(|error| error.to_string())?;
+        for message in messages {
+            insert_message(tx, &session_id, &message)?;
+        }
+    }
+
+    for (session_id, message) in change_set.messages_upsert {
+        upsert_message(tx, &session_id, &message)?;
+    }
+
+    for (session_id, message) in change_set.messages_append {
+        insert_message(tx, &session_id, &message)?;
+    }
+
+    Ok(())
+}
+
+fn upsert_circle(
+    tx: &rusqlite::Transaction<'_>,
+    upsert: ChatUpsert<CircleItem>,
+) -> Result<(), String> {
+    if upsert.move_to_top {
+        tx.execute("DELETE FROM circles WHERE id = ?1", [&upsert.item.id])
+            .map_err(|error| error.to_string())?;
+        return insert_circle(tx, &upsert.item);
+    }
+
+    tx.execute(
+        "INSERT INTO circles (id, name, relay, type, status, latency, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           relay = excluded.relay,
+           type = excluded.type,
+           status = excluded.status,
+           latency = excluded.latency,
+           description = excluded.description",
+        params![
+            upsert.item.id,
+            upsert.item.name,
+            upsert.item.relay,
+            circle_type_to_str(&upsert.item.circle_type),
+            circle_status_to_str(&upsert.item.status),
+            upsert.item.latency,
+            upsert.item.description
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn upsert_contact(
+    tx: &rusqlite::Transaction<'_>,
+    upsert: ChatUpsert<ContactItem>,
+) -> Result<(), String> {
+    if upsert.move_to_top {
+        tx.execute("DELETE FROM contacts WHERE id = ?1", [&upsert.item.id])
+            .map_err(|error| error.to_string())?;
+        return insert_contact(tx, &upsert.item);
+    }
+
+    tx.execute(
+        "INSERT INTO contacts (id, name, initials, handle, pubkey, subtitle, bio, online, blocked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           initials = excluded.initials,
+           handle = excluded.handle,
+           pubkey = excluded.pubkey,
+           subtitle = excluded.subtitle,
+           bio = excluded.bio,
+           online = excluded.online,
+           blocked = excluded.blocked",
+        params![
+            upsert.item.id,
+            upsert.item.name,
+            upsert.item.initials,
+            upsert.item.handle,
+            upsert.item.pubkey,
+            upsert.item.subtitle,
+            upsert.item.bio,
+            optional_bool_to_i64(upsert.item.online),
+            optional_bool_to_i64(upsert.item.blocked)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn upsert_session(
+    tx: &rusqlite::Transaction<'_>,
+    upsert: ChatUpsert<SessionItem>,
+) -> Result<(), String> {
+    if upsert.move_to_top {
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [&upsert.item.id])
+            .map_err(|error| error.to_string())?;
+        return insert_session(tx, &upsert.item);
+    }
+
+    tx.execute(
+        "INSERT INTO sessions (id, circle_id, contact_id, name, initials, subtitle, time, unread_count, muted, pinned, draft, kind, category, members, archived)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(id) DO UPDATE SET
+           circle_id = excluded.circle_id,
+           contact_id = excluded.contact_id,
+           name = excluded.name,
+           initials = excluded.initials,
+           subtitle = excluded.subtitle,
+           time = excluded.time,
+           unread_count = excluded.unread_count,
+           muted = excluded.muted,
+           pinned = excluded.pinned,
+           draft = excluded.draft,
+           kind = excluded.kind,
+           category = excluded.category,
+           members = excluded.members,
+           archived = excluded.archived",
+        params![
+            upsert.item.id,
+            upsert.item.circle_id,
+            upsert.item.contact_id,
+            upsert.item.name,
+            upsert.item.initials,
+            upsert.item.subtitle,
+            upsert.item.time,
+            upsert.item.unread_count.map(i64::from),
+            optional_bool_to_i64(upsert.item.muted),
+            optional_bool_to_i64(upsert.item.pinned),
+            upsert.item.draft,
+            session_kind_to_str(&upsert.item.kind),
+            upsert.item.category,
+            upsert.item.members.map(i64::from),
+            optional_bool_to_i64(upsert.item.archived)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn upsert_group(
+    tx: &rusqlite::Transaction<'_>,
+    upsert: ChatUpsert<GroupProfile>,
+) -> Result<(), String> {
+    let session_id = upsert.item.session_id.clone();
+    tx.execute(
+        "DELETE FROM group_members WHERE session_id = ?1",
+        [&session_id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    if upsert.move_to_top {
+        tx.execute(
+            "DELETE FROM group_profiles WHERE session_id = ?1",
+            [&session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        return insert_group(tx, &upsert.item);
+    }
+
+    tx.execute(
+        "INSERT INTO group_profiles (session_id, name, description, muted)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET
+           name = excluded.name,
+           description = excluded.description,
+           muted = excluded.muted",
+        params![
+            upsert.item.session_id,
+            upsert.item.name,
+            upsert.item.description,
+            optional_bool_to_i64(upsert.item.muted)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    for member in upsert.item.members {
+        insert_group_member(tx, &session_id, &member)?;
+    }
+
+    Ok(())
+}
+
+fn delete_circle(tx: &rusqlite::Transaction<'_>, circle_id: &str) -> Result<(), String> {
+    let session_ids = load_session_ids_for_circle(tx, circle_id)?;
+    for session_id in session_ids {
+        delete_session(tx, &session_id)?;
+    }
+
+    tx.execute("DELETE FROM circles WHERE id = ?1", [circle_id])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn delete_session(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM group_members WHERE session_id = ?1",
+        [session_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM group_profiles WHERE session_id = ?1",
+        [session_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])
+        .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM sessions WHERE id = ?1", [session_id])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn load_session_ids_for_circle(
+    conn: &rusqlite::Connection,
+    circle_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM sessions WHERE circle_id = ?1 ORDER BY rowid ASC")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([circle_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn insert_circle(tx: &rusqlite::Transaction<'_>, circle: &CircleItem) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO circles (id, name, relay, type, status, latency, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            &circle.id,
+            &circle.name,
+            &circle.relay,
+            circle_type_to_str(&circle.circle_type),
+            circle_status_to_str(&circle.status),
+            &circle.latency,
+            &circle.description
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn insert_contact(tx: &rusqlite::Transaction<'_>, contact: &ContactItem) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO contacts (id, name, initials, handle, pubkey, subtitle, bio, online, blocked) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &contact.id,
+            &contact.name,
+            &contact.initials,
+            &contact.handle,
+            &contact.pubkey,
+            &contact.subtitle,
+            &contact.bio,
+            optional_bool_to_i64(contact.online),
+            optional_bool_to_i64(contact.blocked)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn insert_session(tx: &rusqlite::Transaction<'_>, session: &SessionItem) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO sessions (id, circle_id, contact_id, name, initials, subtitle, time, unread_count, muted, pinned, draft, kind, category, members, archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            &session.id,
+            &session.circle_id,
+            &session.contact_id,
+            &session.name,
+            &session.initials,
+            &session.subtitle,
+            &session.time,
+            session.unread_count.map(i64::from),
+            optional_bool_to_i64(session.muted),
+            optional_bool_to_i64(session.pinned),
+            &session.draft,
+            session_kind_to_str(&session.kind),
+            &session.category,
+            session.members.map(i64::from),
+            optional_bool_to_i64(session.archived)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn insert_group(tx: &rusqlite::Transaction<'_>, group: &GroupProfile) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO group_profiles (session_id, name, description, muted) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            &group.session_id,
+            &group.name,
+            &group.description,
+            optional_bool_to_i64(group.muted)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    for member in &group.members {
+        insert_group_member(tx, &group.session_id, member)?;
+    }
+
+    Ok(())
+}
+
+fn insert_group_member(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    member: &GroupMember,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO group_members (session_id, contact_id, role) VALUES (?1, ?2, ?3)",
+        params![
+            session_id,
+            &member.contact_id,
+            member.role.as_ref().map(group_role_to_str)
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn insert_message(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    message: &MessageItem,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO messages (id, session_id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            &message.id,
+            session_id,
+            message_kind_to_str(&message.kind),
+            message_author_to_str(&message.author),
+            &message.body,
+            &message.time,
+            &message.meta,
+            message
+                .delivery_status
+                .as_ref()
+                .map(message_delivery_status_to_str),
+            &message.remote_id,
+            message.sync_source.as_ref().map(message_sync_source_to_str),
+            &message.acked_at
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn upsert_message(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    message: &MessageItem,
+) -> Result<(), String> {
+    let Some(existing_message) = load_existing_message(tx, message)? else {
+        return insert_message(tx, session_id, message);
+    };
+    let merged_message = merge_message_records(existing_message, message.clone());
+    update_existing_message(tx, session_id, &merged_message)
 }
 
 fn mark_initialized(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -553,6 +1063,104 @@ fn mark_initialized_tx(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute(
         "INSERT INTO chat_meta (id, initialized) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET initialized = excluded.initialized",
         [],
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+fn message_item_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> Result<MessageItem, rusqlite::Error> {
+    Ok(MessageItem {
+        id: row.get(offset)?,
+        kind: message_kind_from_str(&row.get::<_, String>(offset + 1)?)
+            .map_err(sqlite_user_error)?,
+        author: message_author_from_str(&row.get::<_, String>(offset + 2)?)
+            .map_err(sqlite_user_error)?,
+        body: row.get(offset + 3)?,
+        time: row.get(offset + 4)?,
+        meta: row.get(offset + 5)?,
+        delivery_status: row
+            .get::<_, Option<String>>(offset + 6)?
+            .map(|value| message_delivery_status_from_str(&value).map_err(sqlite_user_error))
+            .transpose()?,
+        remote_id: row.get(offset + 7)?,
+        sync_source: row
+            .get::<_, Option<String>>(offset + 8)?
+            .map(|value| message_sync_source_from_str(&value).map_err(sqlite_user_error))
+            .transpose()?,
+        acked_at: row.get(offset + 9)?,
+    })
+}
+
+fn load_existing_message(
+    conn: &rusqlite::Connection,
+    message: &MessageItem,
+) -> Result<Option<MessageItem>, String> {
+    let existing_message = if let Some(remote_id) = message.remote_id.as_deref() {
+        conn.query_row(
+            "SELECT id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at
+             FROM messages
+             WHERE id = ?1 OR remote_id = ?2
+             ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END
+             LIMIT 1",
+            params![&message.id, remote_id],
+            |row| message_item_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    } else {
+        conn.query_row(
+            "SELECT id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at
+             FROM messages
+             WHERE id = ?1
+             LIMIT 1",
+            params![&message.id],
+            |row| message_item_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    };
+
+    Ok(existing_message)
+}
+
+fn update_existing_message(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    message: &MessageItem,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE messages
+         SET session_id = ?2,
+             kind = ?3,
+             author = ?4,
+             body = ?5,
+             time = ?6,
+             meta = ?7,
+             delivery_status = ?8,
+             remote_id = ?9,
+             sync_source = ?10,
+             acked_at = ?11
+         WHERE id = ?1",
+        params![
+            &message.id,
+            session_id,
+            message_kind_to_str(&message.kind),
+            message_author_to_str(&message.author),
+            &message.body,
+            &message.time,
+            &message.meta,
+            message
+                .delivery_status
+                .as_ref()
+                .map(message_delivery_status_to_str),
+            &message.remote_id,
+            message.sync_source.as_ref().map(message_sync_source_to_str),
+            &message.acked_at
+        ],
     )
     .map_err(|error| error.to_string())?;
 
@@ -683,5 +1291,71 @@ fn message_author_from_str(value: &str) -> Result<MessageAuthor, String> {
         "peer" => Ok(MessageAuthor::Peer),
         "system" => Ok(MessageAuthor::System),
         _ => Err(format!("unknown message author: {value}")),
+    }
+}
+
+fn message_delivery_status_to_str(value: &MessageDeliveryStatus) -> &'static str {
+    match value {
+        MessageDeliveryStatus::Sending => "sending",
+        MessageDeliveryStatus::Sent => "sent",
+        MessageDeliveryStatus::Failed => "failed",
+    }
+}
+
+fn message_delivery_status_from_str(value: &str) -> Result<MessageDeliveryStatus, String> {
+    match value {
+        "sending" => Ok(MessageDeliveryStatus::Sending),
+        "sent" => Ok(MessageDeliveryStatus::Sent),
+        "failed" => Ok(MessageDeliveryStatus::Failed),
+        _ => Err(format!("unknown message delivery status: {value}")),
+    }
+}
+
+fn message_sync_source_to_str(value: &MessageSyncSource) -> &'static str {
+    match value {
+        MessageSyncSource::Local => "local",
+        MessageSyncSource::Relay => "relay",
+        MessageSyncSource::System => "system",
+    }
+}
+
+fn message_sync_source_from_str(value: &str) -> Result<MessageSyncSource, String> {
+    match value {
+        "local" => Ok(MessageSyncSource::Local),
+        "relay" => Ok(MessageSyncSource::Relay),
+        "system" => Ok(MessageSyncSource::System),
+        _ => Err(format!("unknown message sync source: {value}")),
+    }
+}
+
+fn ensure_message_delivery_status_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN delivery_status TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_message_remote_id_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN remote_id TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_message_sync_source_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN sync_source TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_message_acked_at_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN acked_at TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }

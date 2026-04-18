@@ -1,11 +1,4 @@
-import type { SettingSection, UserProfile } from "../types/chat";
-
-export const userProfile: UserProfile = {
-  name: "Sean Chen",
-  handle: "@seanchen",
-  initials: "SC",
-  status: "Circle owner",
-};
+import type { SettingSection } from "../types/chat";
 
 export const settingsSections: SettingSection[] = [
   {
@@ -19,7 +12,7 @@ export const settingsSections: SettingSection[] = [
   {
     title: "Help",
     items: [
-      { id: "restore", label: "Restore Purchases", icon: "pi pi-refresh" },
+      { id: "restore", label: "Restore Circle Access", icon: "pi pi-refresh" },
       { id: "about", label: "About XChat", icon: "pi pi-info-circle" },
     ],
   },

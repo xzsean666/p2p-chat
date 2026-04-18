@@ -25,7 +25,7 @@ const emit = defineEmits<{
 }>();
 
 function preview(session: SessionItem) {
-  return session.draft || session.subtitle;
+  return session.draft ? `Draft: ${session.draft}` : session.subtitle;
 }
 
 function emptyCta(circle: CircleItem | null) {
@@ -108,6 +108,13 @@ function emptyCta(circle: CircleItem | null) {
               severity="secondary"
               @click.stop="emit('session-action', { sessionId: session.id, action: 'archive' })"
             />
+            <Button
+              icon="pi pi-trash"
+              rounded
+              text
+              severity="secondary"
+              @click.stop="emit('session-action', { sessionId: session.id, action: 'delete' })"
+            />
           </div>
         </button>
 
@@ -146,9 +153,9 @@ function emptyCta(circle: CircleItem | null) {
   min-height: 0;
   padding: 18px;
   border-radius: 28px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(210, 220, 232, 0.9);
-  box-shadow: 0 20px 50px rgba(24, 46, 84, 0.08);
+  background: var(--shell-surface);
+  border: 1px solid var(--shell-border);
+  box-shadow: var(--shell-shadow-soft);
 }
 
 .search-row {
@@ -162,13 +169,13 @@ function emptyCta(circle: CircleItem | null) {
   align-items: center;
   width: 100%;
   padding: 0 14px;
-  border: 1px solid #d8e2ef;
+  border: 1px solid var(--shell-border);
   border-radius: 16px;
-  background: #f7fafd;
+  background: var(--shell-surface-muted);
 }
 
 .search-field i {
-  color: #7b8ca5;
+  color: var(--shell-text-soft);
 }
 
 .search-field :deep(.p-inputtext) {
@@ -207,16 +214,16 @@ function emptyCta(circle: CircleItem | null) {
 }
 
 .session-row:hover {
-  background: rgba(236, 243, 250, 0.92);
+  background: var(--shell-hover);
 }
 
 .session-row.active {
-  background: linear-gradient(135deg, #eff5ff 0%, #eefaf5 100%);
-  box-shadow: inset 0 0 0 1px rgba(170, 198, 228, 0.92);
+  background: var(--shell-selected);
+  box-shadow: inset 0 0 0 1px var(--shell-selected-border);
 }
 
 .session-row.pinned {
-  background-color: rgba(248, 251, 255, 0.95);
+  background-color: color-mix(in srgb, var(--shell-surface) 92%, var(--shell-hover));
 }
 
 .session-content {
@@ -251,7 +258,7 @@ function emptyCta(circle: CircleItem | null) {
 }
 
 .session-time {
-  color: #7a8ca3;
+  color: var(--shell-text-soft);
   font-size: 0.82rem;
   white-space: nowrap;
 }
@@ -261,7 +268,7 @@ function emptyCta(circle: CircleItem | null) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #60728f;
+  color: var(--shell-text-muted);
 }
 
 .session-subline p.draft {
@@ -271,8 +278,8 @@ function emptyCta(circle: CircleItem | null) {
 .contact-avatar {
   width: 44px;
   height: 44px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #1c355d;
+  background: var(--shell-avatar-bg);
+  color: var(--shell-avatar-text);
   font-weight: 700;
 }
 
@@ -280,7 +287,7 @@ function emptyCta(circle: CircleItem | null) {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: #c4d0de;
+  background: var(--shell-border);
 }
 
 .session-actions {
@@ -301,12 +308,12 @@ function emptyCta(circle: CircleItem | null) {
   border: 0;
   border-radius: 16px;
   background: transparent;
-  color: #51657f;
+  color: var(--shell-text-default);
   cursor: pointer;
 }
 
 .archived-footer:hover {
-  background: #f4f8fb;
+  background: var(--shell-hover);
 }
 
 .empty-state {
@@ -324,9 +331,9 @@ function emptyCta(circle: CircleItem | null) {
   height: 88px;
   border-radius: 999px;
   background:
-    radial-gradient(circle at 30% 30%, #dce9ff 0%, #dce9ff 28%, transparent 29%),
-    radial-gradient(circle at 70% 62%, #d9f9ef 0%, #d9f9ef 30%, transparent 31%),
-    #f3f7fb;
+    radial-gradient(circle at 30% 30%, rgba(111, 154, 220, 0.34) 0%, rgba(111, 154, 220, 0.34) 28%, transparent 29%),
+    radial-gradient(circle at 70% 62%, rgba(97, 198, 157, 0.3) 0%, rgba(97, 198, 157, 0.3) 30%, transparent 31%),
+    var(--shell-surface-soft);
 }
 
 .empty-state h3,
@@ -336,7 +343,7 @@ function emptyCta(circle: CircleItem | null) {
 
 .empty-state p {
   max-width: 30ch;
-  color: #677991;
+  color: var(--shell-text-muted);
   line-height: 1.6;
 }
 

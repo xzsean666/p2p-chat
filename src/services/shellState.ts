@@ -1,10 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
 import type {
   AdvancedPreferences,
+  AuthSessionSummary,
   AppPreferences,
   NotificationPreferences,
   PersistedShellState,
+  UserProfile,
 } from "../types/chat";
+import { defaultUserProfile } from "../data/shellDefaults";
 
 const LOCAL_STORAGE_KEY = "p2p-chat.shell-state";
 
@@ -31,6 +33,10 @@ function writeLocalShellState(state: PersistedShellState) {
   } catch {
     // Ignore storage failures and keep the in-memory shell responsive.
   }
+}
+
+export function persistShellStateLocally(state: PersistedShellState) {
+  writeLocalShellState(cloneState(state));
 }
 
 function normalizeMessageStore(
@@ -97,6 +103,76 @@ function normalizeAdvancedPreferences(
   };
 }
 
+function normalizeUserProfile(
+  value: Partial<UserProfile> | null | undefined,
+  fallback: UserProfile,
+): UserProfile {
+  return {
+    name: typeof value?.name === "string" && value.name.trim() ? value.name : fallback.name,
+    handle:
+      typeof value?.handle === "string" && value.handle.trim() ? value.handle : fallback.handle,
+    initials:
+      typeof value?.initials === "string" && value.initials.trim()
+        ? value.initials.slice(0, 2).toUpperCase()
+        : fallback.initials,
+    status:
+      typeof value?.status === "string" && value.status.trim() ? value.status : fallback.status,
+  };
+}
+
+function normalizeAuthSession(
+  value: Partial<AuthSessionSummary> | null | undefined,
+): AuthSessionSummary | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const loginMethod =
+    value.loginMethod === "quickStart" ||
+    value.loginMethod === "existingAccount" ||
+    value.loginMethod === "signer"
+      ? value.loginMethod
+      : null;
+  const circleSelectionMode =
+    value.circleSelectionMode === "existing" ||
+    value.circleSelectionMode === "invite" ||
+    value.circleSelectionMode === "custom" ||
+    value.circleSelectionMode === "restore"
+      ? value.circleSelectionMode
+      : null;
+  const accessKind =
+    value.access?.kind === "localProfile" ||
+    value.access?.kind === "nsec" ||
+    value.access?.kind === "npub" ||
+    value.access?.kind === "hexKey" ||
+    value.access?.kind === "bunker" ||
+    value.access?.kind === "nostrConnect"
+      ? value.access.kind
+      : null;
+  const accessLabel =
+    typeof value.access?.label === "string" && value.access.label.trim()
+      ? value.access.label
+      : null;
+  const loggedInAt =
+    typeof value.loggedInAt === "string" && value.loggedInAt.trim()
+      ? value.loggedInAt
+      : null;
+
+  if (!loginMethod || !circleSelectionMode || !accessKind || !accessLabel || !loggedInAt) {
+    return null;
+  }
+
+  return {
+    loginMethod,
+    access: {
+      kind: accessKind,
+      label: accessLabel,
+    },
+    circleSelectionMode,
+    loggedInAt,
+  };
+}
+
 function normalizeShellState(
   value: Partial<PersistedShellState> | null | undefined,
   defaults: PersistedShellState,
@@ -106,6 +182,8 @@ function normalizeShellState(
       typeof value?.isAuthenticated === "boolean"
         ? value.isAuthenticated
         : defaults.isAuthenticated,
+    authSession: normalizeAuthSession(value?.authSession),
+    userProfile: normalizeUserProfile(value?.userProfile, defaults.userProfile ?? defaultUserProfile),
     circles: Array.isArray(value?.circles) ? cloneState(value.circles) : cloneState(defaults.circles),
     appPreferences: normalizeAppPreferences(value?.appPreferences, defaults.appPreferences),
     notificationPreferences: normalizeNotificationPreferences(
@@ -131,24 +209,6 @@ function normalizeShellState(
   };
 }
 
-export async function loadShellState(defaults: PersistedShellState): Promise<PersistedShellState> {
-  const localState = readLocalShellState();
-
-  try {
-    const state = await invoke<PersistedShellState | null>("load_shell_state");
-    return normalizeShellState(state ?? localState, defaults);
-  } catch {
-    return normalizeShellState(localState, defaults);
-  }
-}
-
-export async function saveShellState(state: PersistedShellState) {
-  const nextState = cloneState(state);
-  writeLocalShellState(nextState);
-
-  try {
-    await invoke("save_shell_state", { state: nextState });
-  } catch {
-    // Browser mode falls back to localStorage only.
-  }
+export function loadLocalShellState(defaults: PersistedShellState): PersistedShellState {
+  return normalizeShellState(readLocalShellState(), defaults);
 }

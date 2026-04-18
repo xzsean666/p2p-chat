@@ -1,12 +1,17 @@
 # BuildProgress
 
-更新时间: 2026-04-16
+更新时间: 2026-04-18
 
 ## 当前阶段
 
-- 阶段名: `Phase 0 / Foundation`
+- 阶段名: `Phase 3 / P2P Transport`
 - 状态: `In Progress`
-- 目标: 完成桌面端基础工程、PrimeVue 界面壳和文档基线。
+- 目标: 收敛本地 runtime、预览 companion binary、恢复链路、可观测性提示和桌面端验证入口。
+
+## 差距清单
+
+- [x] 新增 `GapChecklist.md`，把当前与目标功能级克隆之间的缺口按 `P0 / P1 / P2` 固化为可执行清单。
+- [ ] 仍未完成的最高优先级缺口: 真实消息收发闭环、真实账号接入、消息模型扩展，以及更完整的消息增量存储能力（真实远端同步、回执、状态回写）。
 
 ## 已完成
 
@@ -18,6 +23,12 @@
 - [x] 补齐启动页、Home 顶栏、circle 切换层、设置抽屉和新建消息弹层。
 - [x] 补齐会话操作、归档会话弹层和联系人/群详情抽屉。
 - [x] 补齐登录页和独立联系人/群资料页。
+- [x] 将“一键登录”替换为四步 onboarding 向导，区分 quick start、existing account、signer、profile setup 与 circle selection。
+- [x] 将动态 `userProfile` 纳入统一 `ChatShellSnapshot`，前端本地副本、Rust shell store 与 SQLite 持久化合同保持一致。
+- [x] 将设置页 `Restore Purchases` 文案改为 `Restore Circle Access`，避免把 circle 恢复入口表述成购买恢复。
+- [x] 为新消息页补齐 `Note to Self`、直接建群和成员选择壳，前端与 Rust mutation 都支持本地闭环。
+- [x] 为找人页补齐 `handle / pubkey / invite-style text` lookup 卡片，可直接创建本地联系人壳并拉起会话。
+- [x] 为 `start_self_conversation / create_group_conversation / start_lookup_conversation` 补齐 Tauri 命令与 Rust 单测。
 - [x] 接入前端状态持久化，并通过 Rust/Tauri 命令桥保存聊天壳状态。
 - [x] 将归档会话、联系人详情和群资料切换为页面式覆盖层，靠近原应用导航方式。
 - [x] 将新建消息改为页面式入口，并补齐找人页、邀请链接复制和联系人筛选流。
@@ -43,17 +54,84 @@
 - [x] 为 transport snapshot 增加 runtime activity 流，并接通 SQLite cache、浏览器 fallback 和 Circle 详情页时间线展示。
 - [x] 将 transport snapshot 进一步接入 Circle 目录页、设置高级页和 About 页，并补齐前端 heartbeat 刷新。
 - [x] 将前端包管理统一切到 `pnpm`，同步更新 Tauri build hook、仓库元数据和项目文档。
+- [x] 将本地 runtime 的 `sending -> sent` 自动确认也收敛到共享远端回执 merge 语义；当 receipt 先拿到 `messageId`、后拿到 `remoteId` 时，也能补齐本地消息状态与确认时间。
+- [x] 将 `SyncSessions` 的聊天副作用从 builder 内部直写 seed，重构为 engine 显式产出 `chat effects`，再由 `LocalTransportService` 统一调用共享远端消息/回执 merge helper 落域。
+- [x] 为 `localCommand` runtime 增加 stdout JSON line 事件采集，runtime manager 会把远端消息/回执/清未读事件并入 `TransportChatEffects`，再交给 `LocalTransportService` 统一落域。
+- [x] 新增 companion binary `p2p-chat-runtime`，支持 `preview-relay / preview-mesh / preview-invite` 预览命令，并按现有 stdout JSON line 合同输出可被 runtime manager 吸收的聊天事件。
+- [x] 为本地 preview runtime 增加 request-aware 的 queue 输入合同；`Sync / DiscoverPeers / SyncSessions` 现在都会携带 `requestId / primarySessionId / sessionIds / unreadSessionIds / peerCount / sessionSyncCount` 写入本地队列，再由 companion runtime 读队列并输出 `clear unread / remote message merge / cache update` 等事件。
+- [x] 为 runtime stdout effects 增加 transport cache 副作用支持；preview runtime 现在除了聊天事件，还能把 peer presence、session sync 状态和 activity 直接写回 transport cache。
+- [x] 为桌面壳 overlay route 增加多级 stack 序列化，并补齐 `group -> group name / members / add members / remove members` 二级页面链路。
+- [x] 为聊天域补齐 `update_group_name / update_group_members` mutation，群资料页现在可真实保存群名和成员变更到 Rust/SQLite，而不是只停留在前端壳层。
+- [x] 将 `New Message` 从单页压平流改为更接近源项目的工作台流，补齐 `new message -> select members -> group creation` 两步群创建栈。
+- [x] 为 `Find People` 增加 `chat / join-circle` 双模式，并将空状态 CTA 与设置里的 restore 入口接到 `join-circle` 输入流。
+- [x] 为 transport 增加本地 runtime hook 抽象，并接通 mock/nativePreview runtime session、SQLite cache 和 Circle 详情页展示。
+- [x] 抽离 runtime session 协议/标签 helper，并在高级设置与 About 页补齐本地 runtime 摘要。
+- [x] 为 runtime session 增加本地 lifecycle registry 字段，持久化 boot 代次、状态切换和最近事件时间线。
+- [x] 将 runtime lifecycle transition 收敛为独立 domain state machine，避免规则散落在 infra builder 中。
+- [x] 引入本地 runtime manager，改为 `runtime profile -> registry session` 投影链路，解耦 runtime 实现与实例表维护。
+- [x] 为 runtime registry 增加 `desired/current` 分离和 recovery policy，并落到独立 SQLite 实例表。
+- [x] 为 runtime registry 增加 recovery queue/backoff 状态、重试次数和 next retry 提示，并同步到 SQLite、浏览器 fallback 和详情页展示。
+- [x] 为本地 runtime 增加 recovery worker，在 snapshot heartbeat 中推进 `queued/backoff -> connect -> sync` 恢复动作。
+- [x] 为 runtime recovery 增加真实 `next retry at` 时间点和自适应 heartbeat，避免到期恢复继续被长轮询拖延。
+- [x] 为 runtime registry 增加最近失败原因/时间记录，并在 Circle/Settings 页补齐失败诊断与明确的 runtime retry 入口。
+- [x] 为桌面壳 overlay 页面栈补齐 route 模块、history/hash 同步与浏览器回退恢复，收敛导航状态组织。
+- [x] 为聊天域与桌面壳增加统一 `ChatShellSnapshot` 启动边界，改为单入口加载 domain + shell 状态。
+- [x] 修正 runtime retry 动作判定、浏览器首启默认种子回退，以及 overlay 全量关闭时的历史栈回退语义。
+- [x] 将聊天壳持久化写链路收敛到 `save_chat_shell_snapshot`，补齐统一的 domain + shell 写边界。
+- [x] 为聊天壳持久化补齐本地同步副本与 `pagehide / visibilitychange` flush，降低窗口关闭前状态丢失风险。
+- [x] 清理前端旧分命令 seed / shell 兼容包装，浏览器 fallback 改为直接走本地副本 + 默认种子。
+- [x] 将聊天壳 query/store 链路改为 runtime 泛型，并为统一 `ChatShellSnapshot` 读写补齐 Rust 单测。
+- [x] 将旧 seed / shell 命令从公开 Tauri invoke handler 退场，收紧聊天壳公开命令面。
+- [x] 统一 `ChatRepository` 内部 helper 命名，移除 SQLite 仓储残留的 `load_seed_*` 语义噪音。
+- [x] 将 runtime profile 投影改为协议 / Tor 感知，按 relay 类型产出更真实的 driver、session label 和 endpoint。
+- [x] 抽出本地 runtime adapter 层，并将 adapter kind、建议启动命令和参数持久化到 SQLite / snapshot / 浏览器 fallback。
+- [x] 为本地 runtime command 增加 PATH 可用性探测，持久化 launch status / resolved path / launch error，并在命令缺失时阻止桌面端静默 fallback connect。
+- [x] 为本地 runtime command 增加 repo-local 构建产物回退解析，并让 preview runtime launch arguments 带上当前 circle 的首个可用 session，避免 companion runtime 输出落到不存在的会话。
+- [x] 为本地 command runtime 接入真实 launch attempt，记录最近一次启动结果 / PID / 时间，并在启动失败时将状态显式回写为 failure + recovery backoff。
+- [x] 为本地 command runtime 增加进程托管表，`Connect` 可复用已托管实例，`Disconnect` 会主动停止本地 runtime 进程。
+- [x] 为本地 command runtime 增加退出探测与恢复回灌，snapshot heartbeat 会识别托管进程退出，并让 auto recovery 真正驱动 runtime launch / stop。
+- [x] 将 circle seed 状态与 runtime cache 对齐，避免旧 `open` seed 把已退出 runtime 重新投影成在线 diagnostics。
+- [x] 为 runtime session 补齐失败事件时间线，并在桌面壳顶部增加缺失命令 / 启动失败 / 退出恢复提示条。
+- [x] 将常用构建 / 检查 / 测试入口统一收口到 `pnpm` 脚本，并同步更新协作与项目文档。
+- [x] 为 Vite 构建增加 vendor chunk 拆分，并补齐 `pnpm desktop:build` 桌面打包入口。
+- [x] 收紧本地 runtime hydrate 退出探测回归测试，消除全量 `pnpm verify` 下的进程退出时序抖动。
+- [x] 验证桌面端 Linux bundler 产物链路，并将默认 `pnpm desktop:build` 收敛到当前环境稳定通过的 `deb / rpm` 目标。
+- [x] 增加 Linux release 收集脚本，自动整理 `deb / rpm` 产物并生成 `manifest.json` 与 `SHA256SUMS`。
+- [x] 为 Linux release 收集流程补齐 `RELEASE_NOTES.md` 生成人类可读的发版说明。
+- [x] 增加统一版本同步脚本，收敛 `package.json / Cargo.toml / tauri.conf.json` 的版本更新入口，并将版本一致性检查接入 `pnpm verify`。
+- [x] 增加一键发布准备脚本，串联版本同步、Linux 产物整理和 changelog 模板生成。
+- [x] 将聊天常用 mutation 写链路切到 `ChatDomainChangeSet -> SQLite apply_change_set`，会话、联系人、Circle 和消息追加不再默认整包重写整个聊天域。
+- [x] 修正 SQLite 增量写入后的顺序语义，`move_to_top` 现在可正确把会话与 Circle 保持在列表顶部，并补齐对应 Rust 回归测试。
+- [x] 将 `save_chat_shell_snapshot` 收敛为 shell-only 持久化，避免前端自动保存再次整包覆盖聊天域 SQLite。
+- [x] 为会话草稿补齐真实 `update_session_draft` mutation，并在 Vue composer 切会话、发消息清空和 Rust/SQLite 持久化之间建立闭环。
+- [x] 为消息模型补齐 `deliveryStatus` 字段，打通 Rust DTO、SQLite 持久化、旧库兼容迁移和聊天窗基础展示。
+- [x] 为消息补齐独立 `update_message_delivery_status` mutation 和 message upsert 仓储路径，后续可按 `message id` 回写发送态而不必整桶重写消息列表。
+- [x] 为失败消息补齐 `retry_message_delivery` mutation 与聊天窗 `Retry` 入口，消息发送态现在会按 circle 当前状态在 `sent / sending / failed` 之间收敛。
+- [x] 为 transport/runtime 状态归一化补齐自动发送态收敛，circle 从 `connecting` 回到 `open` 后，本地 `sending` 消息会自动回写为 `sent` 并持久化到 SQLite。
+- [x] 为聊天窗补齐 session 级消息分页查询，启动 snapshot 只预载当前会话最近一页，切会话和顶部 `Load older` 入口会再按需补拉更早历史。
+- [x] 为消息查询再补 `after message id` 增量刷新契约，Tauri transport heartbeat 现会顺带把当前会话的新消息并入前端已加载时间线，而不必重新拉整包聊天域。
+- [x] 为会话列表补齐独立 overview 查询，Tauri transport heartbeat 现会同步回写跨会话的 `subtitle / time / unreadCount / 顺序`，不再只刷新当前会话时间线。
+- [x] 为聊天域补齐不含消息正文的 `domain overview` 查询，Tauri transport heartbeat 现会一起回写 `circles / contacts / sessions / groups`，让联系人封锁态、群资料和 circle 壳状态不再落后于 SQLite。
+- [x] 将 `SyncSessions` 从“只写系统提示”推进到“向聊天域合并入站式同步结果”，同步动作现在会写入模拟对端消息、更新会话摘要/顺序，并继续保留系统同步记录。
+- [x] 为消息合同补齐 `remoteId / syncSource / ackedAt`，并打通 Rust DTO、SQLite 迁移/持久化、本地发送态回执收敛和聊天窗 `Delivered` 展示，为后续真实远端同步与回执落点预留稳定字段。
+- [x] 补齐独立 `merge_remote_session_messages` mutation，并让消息 upsert 支持按 `remoteId` 去重合并；远端消息现在可直接更新会话摘要/未读/在线态，远端 echo 也不会把本地已发送消息重复插入一条。
+- [x] 将 transport `SyncSessions` 的消息落域逻辑切到共享远端合并路径，builder 不再单独维护一套平行的会话摘要/联系人在线/消息去重规则。
+- [x] 补齐独立 `merge_remote_delivery_receipts` mutation，支持按 `remoteId` 合并远端投递回执并更新 `deliveryStatus / ackedAt`，为后续真实 runtime 回执回写预留正式入口。
+- [x] 为本地登录壳补齐 `authSession` 持久化合同，登录方式、非敏感凭据摘要和 circle 选择模式现在会进入 `ChatShellSnapshot / localStorage / Tauri shell store`，而不是只停留在表单层。
+- [x] 收紧桌面端登出语义：登出会清空本地 shell/domain 预览、重置登录态并立即持久化；Tauri 侧 `load_chat_shell_snapshot` 在未认证时也不再把 SQLite 里的旧 circles/session preview 回灌到登录页。
+- [x] 为无预载 circles 的 `existingAccount / signer` onboarding 补齐 `restore after login` 路径，避免在隐藏旧 circles 后把登录流程卡死。
+- [x] 将桌面壳 `theme / textSize / language` 从纯持久化值推进到真实 DOM 外观投影：主题会切换主壳 surface/background token，字号会调整全局根字号，语言选择会同步更新 `html[lang]`。
 
 ## 进行中
 
-- [ ] 规划应用路由、布局壳和状态组织方式。
 - [ ] 定义聊天域模型与前端 / Rust 引擎数据边界。
 - [ ] 抽象 P2P 通信接口。
 
-## 下一阶段
+## 阶段清单
 
-- [ ] Phase 1: App Shell
-- [ ] Phase 2: Chat Domain
+- [x] Phase 0: Foundation
+- [x] Phase 1: App Shell
+- [x] Phase 2: Chat Domain
 - [ ] Phase 3: P2P Transport
 - [ ] Phase 4: Persistence and Packaging
 
@@ -69,6 +147,21 @@
 - 当前 Rust 读取链路已形成 `commands -> app -> infra -> domain` 的稳定分层，后续可直接替换 seed 仓储为真实存储实现。
 - 当前聊天域表与壳状态表都已接入 SQLite，前端变更会同步写回聊天表和 `app_kv`，并保留一次旧 `shell-state.json` 自动迁移。
 - 当前会话发送、会话归档/静音/删除、联系人拉起会话和圈子管理已优先通过 Rust 命令更新 SQLite，再将结果回灌到 Vue 壳状态。
+- 当前聊天域常见 mutation 已优先通过 `apply_change_set` 做事务式增量写入，前端拿到的结果仍保持统一的完整 `ChatDomainSeed` 回读合同。
+- 当前 `save_chat_shell_snapshot` 只负责保存 shell 状态；聊天域在桌面端优先通过独立 mutation 持久化，避免自动 snapshot 保存把增量写退化回整包重写。
+- 当前 composer 已会按会话同步/恢复 `draft`，切换会话可回显未发送内容，发送成功或本地 fallback 发送后也会正确清空草稿。
+- 当前自己发出的消息已可携带 `deliveryStatus`，SQLite 会保留该字段，聊天窗也会展示基础 `Sent / Sending / Failed` 文案，为后续接真实投递状态回写预留合同。
+- 当前消息状态回写已不必走 `messages_replace` 整桶覆盖；桌面端可按 `session_id + message_id` 独立更新单条消息的 `deliveryStatus`。
+- 当前发送消息会按当前 circle 状态直接落成 `open -> sent / connecting -> sending / closed -> failed`；失败消息也可在聊天窗点击 `Retry` 重新按最新 circle 状态回写。
+- 当前 transport/runtime 心跳和动作链路会在 circle 恢复 `open` 时自动把本地 `sending` 消息收敛成 `sent`；`failed` 消息仍保持手动 `Retry` 语义，不会被误自动翻转。
+- 当前消息合同已不止 `deliveryStatus`；本地消息、relay 同步消息和系统消息都会携带 `syncSource`，已确认的本地消息会补 `remoteId / ackedAt` 并落到 SQLite，但这些字段目前仍主要由本地模拟链路填充，不是真实远端回执。
+- 当前聊天域已具备显式的远端消息合并入口；按 `remoteId` 命中的远端 echo 会直接合并回现有本地消息，而不是重复追加新行，为后续接真实 runtime/session sync 契约预留了稳定的 dedupe 路径。
+- 当前 transport `SyncSessions` 已开始复用这条共享合并路径；模拟同步和显式远端 merge 命令现在会按同一套规则刷新摘要、联系人在线态和消息去重，剩余主要差距是把真实 runtime 输出接进来。
+- 当前聊天域还具备显式的远端回执合并入口；若真实 runtime 仅返回 `remoteId + status + ackedAt`，桌面端已经可以不依赖本地 `messageId` 直接完成发送态回写。
+- 当前聊天窗已不再依赖启动时整桶灌入所有消息；桌面端会优先预载当前会话最近一页，并通过独立 `load_chat_session_messages` 查询按 session 分页补历史。
+- 当前 Tauri transport heartbeat 已会按“当前会话最后一条消息”做增量补拉，并额外通过 `load_chat_sessions_overview` 回写跨会话的列表摘要与顺序；但这仍不是完整真实远端同步，联系人/群资料和回执状态还没有一起联动更新。
+- 当前 Tauri transport heartbeat 还会通过 `load_chat_domain_overview` 回写 `circles / contacts / groups` 壳数据；本地壳层的增量刷新边界已经基本齐了，剩余主要是把真实远端同步和回执合同接进这条链路。
+- 当前 `SyncSessions` 已不再只是改一条系统文案；本地 transport 同步会把模拟远端消息真正并入聊天域，并带动会话摘要、在线态和列表顺序刷新，但消息来源仍是本地模拟，不是真实网络对端。
 - 当前 transport 层已形成 `domain trait -> infra mock service -> app query -> command -> Vue service` 的只读链路，可在不改 UI 合同的前提下替换为真实网络实现。
 - 当前 transport 层已补齐 `connect / disconnect / sync` 命令链路，Circle 详情页可直接触发 relay 状态变更，并同步更新 SQLite 聊天域与 transport snapshot。
 - 当前 transport snapshot 已包含 `diagnostics / peers / sessionSync / activities` 四类数据，Circle 详情页可查看已发现 peer、会话同步状态和本地 runtime activity 时间线，并触发浏览器回退或 Tauri 桌面命令下的一致动作。
@@ -81,4 +174,44 @@
 - 当前 transport runtime activity 已持久化到 SQLite cache，并在浏览器 fallback 下复用上一轮 snapshot 历史，避免本地预览模式丢失最近 relay 动作轨迹。
 - 当前 Circle 目录页已能直接看到每个 relay 的 transport 摘要和最近动作，设置高级页与 About 页也可查看 snapshot 活动摘要；在 diagnostics 或 experimental 模式下，前端会定时刷新 transport snapshot。
 - 当前仓库前端包管理已统一为 `pnpm`，Tauri 前置构建命令、README、Agent 和项目文档都已切换到 `pnpm` 流程。
+- 当前 transport 已不再只有 engine snapshot 推导，`LocalTransportService` 会在 engine 之后再接一层本地 runtime hook，产出并持久化 `runtimeSessions`，为后续接真实本地网络 runtime 预留稳定入口。
+- 当前高级设置与 About 页已可查看本地 runtime driver 分布、session 状态，以及当前 circle 对应的 runtime endpoint 和最近事件。
+- 当前 runtime session 的 `driver / session label / endpoint` 已不再是单一占位值；websocket、mesh、invite 以及 Tor 预览模式都会投影成不同的本地 runtime 身份，浏览器 fallback 与 Tauri 桌面端保持一致。
+- 当前 runtime session 还会携带 `embedded / localCommand` adapter 类型，以及建议的本地启动命令和参数，为后续接真实 runtime 进程拉起链路预留稳定合同。
+- 当前桌面端会额外探测本地 runtime command 是否能在 PATH 中解析，并将 `ready / missing / unknown / embedded` launch 状态、解析后的命令路径和错误原因暴露到 snapshot/UI；若桌面端明确判定命令缺失，将不再悄悄回退到前端本地 connect 假动作。
+- 当前桌面端在 `Connect` 拉起 `localCommand` runtime 时会执行一次真实本地 `spawn` 尝试，并将最近一次 launch result、PID 和时间持久化到 SQLite；若 spawn 失败，runtime registry 会立即回落到 `inactive + backoff`，而不是继续显示假性的 `starting`。
+- 当前桌面端会在进程内维护已托管的本地 runtime 句柄；若同一 circle 的 runtime 仍在运行，重复 `Connect` 会复用现有实例而不是重复拉起，`Disconnect` 则会主动 `kill` 并释放该实例。
+- 当前 snapshot heartbeat 会先归一化 runtime cache，再决定 recovery action；若已托管的本地 runtime 进程在后台退出，runtime registry 会在下一次 heartbeat 中记录明确 failure，并让 auto recovery 在到期时真正再次调用 runtime manager 发起本地 launch。
+- 当前 transport snapshot 会先按 runtime registry/session 归一化 circle 状态，再构建 engine diagnostics；若本地 runtime 已是 `inactive`，circle 与 relay health 将同步回落，不会再被旧 seed 状态错误显示成在线。
+- 当前本地 runtime 在 circle 恢复 `open` 后，不再直接手写消息状态；它会复用 `merge_remote_delivery_receipts` 的共享 change-set 逻辑，把本地 `sending` 消息按 `remoteId` 或回退 `messageId` 统一收敛到 `sent + ackedAt`。
+- 当前 transport `SyncSessions` 也不再由 `transport_state_builder` 直接改聊天域；engine 会先产出显式 `chat effects` batch，`LocalTransportService` 再统一应用 `merge_remote_session_messages / merge_remote_delivery_receipts` 语义并重建 snapshot，为后续接真实 runtime 输出预留稳定入口。
+- 当前 `localCommand` runtime 已不再只能贡献 launch / exit 生命周期；若本地 runtime 进程通过 stdout 输出约定的 JSON line 事件，runtime manager 会在 heartbeat / hydrate 时把它们 drain 成 `remote message merge / delivery receipt merge / clear unread` 三类 chat effects，并通过现有共享 merge 路径写回 SQLite。
+- 当前 runtime failure 不再只停留在 Circle/Settings 详情页；新的命令缺失、启动失败和退出恢复事件会同时进入 activity timeline，并在桌面壳顶部显示一次性提示条。
+- 当前工程常用验证入口已统一收口到 `pnpm check / pnpm native:check / pnpm native:test / pnpm verify`，避免协作文档继续混用裸 `cargo` 命令。
+- 当前前端构建已对 `PrimeVue / Vue / Tauri API` 依赖做基础分包，默认 `pnpm build` 不再保留单一主 chunk 超限警告；桌面端打包入口统一为 `pnpm desktop:build`。
+- 当前全量 `pnpm verify` 已稳定通过；本地 runtime 退出探测相关单测改为轮询 heartbeat 场景，不再依赖固定毫秒级退出窗口。
+- 当前 Linux 桌面打包已实测产出 `deb` 与 `rpm`；完整 `AppImage` 路径保留在 `pnpm desktop:build:full`，但默认入口先避开本机 `linuxdeploy` 波动。
+- 当前 `pnpm release:linux` 会把 Linux 安装包收敛到仓库根 `artifacts/release/linux/<version>/`，并附带可直接发版使用的 `SHA256SUMS` 与清单文件。
+- 当前 `pnpm release:linux` 还会同时生成 `RELEASE_NOTES.md`，包含安装方式、校验命令与产物摘要，减少手工整理发版说明。
+- 当前 `pnpm version:check / pnpm version:set <version>` 已成为唯一建议的桌面端版本同步入口，`pnpm verify` 会先阻止三处版本号漂移后再进入构建和测试。
+- 当前 `pnpm release:prepare <version>` 会自动执行版本同步、Linux 打包收集，并在对应 `artifacts/release/linux/<version>/` 下生成 `CHANGELOG_TEMPLATE.md` 供正式发版前补充说明。
+- 当前 runtime session 已不再是纯派生快照；SQLite 和浏览器 fallback 都会保留 boot 代次、state since 与 last event at，用于后续接真实本地 runtime registry。
+- 当前 transport runtime 的 boot/stop/hydrate transition 已抽到独立 domain state machine，后续接真实本地 runtime 时可直接复用这套生命周期规则。
+- 当前 runtime 实现已不再直接写 transport cache；`LocalTransportService` 会先让 runtime 产出 profile，再由本地 runtime manager 维护 registry session，后续替换为真实实例表时无需改 UI 合同。
+- 当前 runtime cache 已具备独立 `transport_runtime_registry` 表，能保留 desired running/stopped 与 auto/manual recovery policy；Circle 和 Settings 页也能直接看到这些本地实例意图。
+- 当前 auto recovery runtime 已会显式保留 queue/backoff 状态、累计恢复尝试次数与下一次重试提示，桌面端与浏览器 fallback 语义保持一致。
+- 当前 `LocalTransportService` 已会在 snapshot 刷新时驱动本地 recovery worker，将 auto runtime 从关闭态推进到 connect/sync 流程，不再只是静态展示 backoff 提示。
+- 当前 runtime registry 已持久化真实 `next retry at` 毫秒时间点；有恢复队列时，桌面壳会自动把 transport heartbeat 收紧到 3 秒，backoff 到期后能更快推进下一步恢复。
+- 当前 runtime session 已会保留最近一次失败原因与失败时间，并在 Circle 详情页和设置页直接展示；Circle 详情页也已提供明确的 `Retry Runtime` 入口，避免用户只能借助通用 connect/sync 按钮判断恢复动作。
+- 当前 overlay 页面导航已从 `useChatShell` 内联状态提升为独立 route 模块，并支持 `history/hash` 同步；浏览器回退、前进以及刷新后的页面恢复不再丢失当前 overlay 上下文。
+- 当前聊天壳启动已优先通过统一 `ChatShellSnapshot` 契约进入前端，不再依赖前端手工拼接多份 `seed_*` 读取结果和壳状态；旧分命令已从公开 invoke 面移除，初始化所需 seed 读取仅保留在仓储内部。
+- 当前 `Retry Runtime` 已与 recovery worker 的动作语义对齐；浏览器预览首启会落到非空默认聊天种子；批量关闭 overlay 也会真正退回根历史节点，不再让旧页面在浏览器后退时重新弹出。
+- 当前聊天壳持久化已优先走统一 `save_chat_shell_snapshot` 契约，前端不再显式双写聊天域和壳状态；旧壳状态和分命令保存接口已从公开 invoke handler 退场。
+- 当前聊天壳在正常保存前会先同步写入本地副本；页面切后台或窗口关闭时也会主动 flush 一次，避免 debounce 定时器尚未触发就丢失最后一次状态更新。
+- 当前前端浏览器 fallback 已不再依赖旧的 `load_seed_* / save_chat_domain_seed / load_shell_state / save_shell_state` 包装；若统一 snapshot invoke 不可用，会直接从本地副本恢复，并在无本地数据时落到默认种子。
+- 当前聊天壳的 Rust query/store 链路已不再绑死 Wry runtime，`MockRuntime` 下可直接覆盖 `save_chat_shell_snapshot -> load_chat_shell_snapshot` 的完整读写与旧壳状态兼容行为。
+- 当前聊天壳公开命令面已收敛到统一 snapshot 读写和真实 mutation/query；旧 seed/shell 命令不再暴露给 Tauri invoke handler，但 repository 内部 seed 读写仍保留给初始化、transport 和数据变更链路复用。
+- 当前登录页已不再只把 `method / userProfile / circleSelection` 丢给壳层；本地会额外保留 `loginMethod + accessSummary + circleSelectionMode + loggedInAt` 这组非敏感摘要，为后续真实账号/runtime 接入提供稳定边界。
+- 当前登出后登录页不会再直接看到上一次账号的本地 circle/session 预览；若用户重新登录，桌面壳会在认证后再恢复 SQLite 中的 domain 概览。
+- 当前设置页里的 `theme / textSize` 不再只是保存值；主聊天壳、设置抽屉和 overlay panel 已会跟随主题 token 与根字号实时变化，但更细的子页面和完整多语言文案仍未完全接通。
 - 后续每完成一个里程碑，应同步更新本文件中的状态与清单。

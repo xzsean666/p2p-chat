@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::fs;
 const SHELL_STATE_KEY: &str = "shell_state";
 
-pub fn load(app_handle: &tauri::AppHandle) -> Result<Option<Value>, String> {
+pub fn load<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> Result<Option<Value>, String> {
     let conn = open_connection(app_handle)?;
     ensure_schema(&conn)?;
 
@@ -25,7 +25,10 @@ pub fn load(app_handle: &tauri::AppHandle) -> Result<Option<Value>, String> {
     migrate_legacy_shell_state(app_handle, &conn)
 }
 
-pub fn save(app_handle: &tauri::AppHandle, state: Value) -> Result<(), String> {
+pub fn save<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    state: Value,
+) -> Result<(), String> {
     let content = serde_json::to_string_pretty(&state).map_err(|error| error.to_string())?;
     let conn = open_connection(app_handle)?;
     ensure_schema(&conn)?;
@@ -49,7 +52,7 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), String> {
 }
 
 fn migrate_legacy_shell_state(
-    app_handle: &tauri::AppHandle,
+    app_handle: &tauri::AppHandle<impl tauri::Runtime>,
     conn: &rusqlite::Connection,
 ) -> Result<Option<Value>, String> {
     let path = legacy_shell_state_path(app_handle)?;

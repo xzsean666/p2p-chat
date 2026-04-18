@@ -7,6 +7,31 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [vue()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) {
+            return undefined;
+          }
+
+          if (id.includes("/primevue/") || id.includes("/@primeuix/") || id.includes("/primeicons/")) {
+            return "prime-vendor";
+          }
+
+          if (id.includes("/vue/") || id.includes("/@vue/")) {
+            return "vue-vendor";
+          }
+
+          if (id.includes("/@tauri-apps/")) {
+            return "tauri-vendor";
+          }
+
+          return undefined;
+        },
+      },
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
