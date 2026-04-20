@@ -1,11 +1,12 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import Avatar from "primevue/avatar";
 import Button from "primevue/button";
 import ScrollPanel from "primevue/scrollpanel";
 import Tag from "primevue/tag";
 import type { CircleItem } from "../types/chat";
 
-defineProps<{
+const props = defineProps<{
   circles: CircleItem[];
   activeCircleId: string;
 }>();
@@ -13,7 +14,12 @@ defineProps<{
 const emit = defineEmits<{
   (event: "select", circleId: string): void;
   (event: "join"): void;
+  (event: "restore"): void;
 }>();
+
+const titleText = computed(() => {
+  return props.circles.length ? "Switch Circle" : "Add or Restore Circle";
+});
 
 function tone(status: CircleItem["status"]) {
   if (status === "open") {
@@ -45,12 +51,12 @@ function label(status: CircleItem["status"]) {
     <header class="switcher-header">
       <div>
         <p class="eyebrow">Circles</p>
-        <h2>Switch Circle</h2>
+        <h2>{{ titleText }}</h2>
       </div>
       <Tag value="XChat Style" severity="secondary" rounded />
     </header>
 
-    <ScrollPanel class="switcher-scroll">
+    <ScrollPanel v-if="circles.length" class="switcher-scroll">
       <button
         v-for="circle in circles"
         :key="circle.id"
@@ -77,12 +83,30 @@ function label(status: CircleItem["status"]) {
       </button>
     </ScrollPanel>
 
-    <Button
-      icon="pi pi-plus"
-      label="Add a Circle"
-      severity="contrast"
-      @click="emit('join')"
-    />
+    <div v-else class="switcher-empty">
+      <div class="empty-mark">
+        <i class="pi pi-compass"></i>
+      </div>
+      <h3>No circles in this shell</h3>
+      <p>Join a new circle now, or open the local restore catalog for a previously removed one.</p>
+    </div>
+
+    <div class="switcher-actions">
+      <Button
+        icon="pi pi-plus"
+        :label="circles.length ? 'Add a Circle' : 'Join Circle'"
+        severity="contrast"
+        @click="emit('join')"
+      />
+      <Button
+        v-if="!circles.length"
+        icon="pi pi-history"
+        label="Restore Access"
+        severity="secondary"
+        outlined
+        @click="emit('restore')"
+      />
+    </div>
   </section>
 </template>
 
@@ -126,6 +150,46 @@ h2 {
 
 .switcher-scroll {
   min-height: 0;
+}
+
+.switcher-empty {
+  display: grid;
+  gap: 12px;
+  place-items: center;
+  min-height: 220px;
+  padding: 24px;
+  border-radius: 22px;
+  background: linear-gradient(180deg, rgba(244, 248, 252, 0.96) 0%, rgba(239, 245, 250, 0.96) 100%);
+  border: 1px dashed rgba(176, 191, 209, 0.92);
+  text-align: center;
+}
+
+.empty-mark {
+  display: grid;
+  place-items: center;
+  width: 58px;
+  height: 58px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
+  color: #1f4d7a;
+  font-size: 1.35rem;
+}
+
+.switcher-empty h3 {
+  font-size: 1.08rem;
+  color: #17385e;
+}
+
+.switcher-empty p {
+  max-width: 340px;
+  color: #61748f;
+  line-height: 1.6;
+}
+
+.switcher-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .circle-row {

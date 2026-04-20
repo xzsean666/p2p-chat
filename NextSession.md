@@ -1,0 +1,653 @@
+# Next Session
+
+更新时间: 2026-04-20
+
+## 当前状态
+
+- 桌面壳的登录主链已不是纯前端 mock:
+  - `bootstrap_auth_session` 会先把 `authSession / userProfile` 和 restore 选择摘要写进 Rust shell store。
+  - `complete_login` 会在 Rust 里统一解析 `existing / invite / custom / restore` 首个 circle 选择，并返回完整 `ChatShellSnapshot`。
+  - `logout_chat_session` 也已补齐，登出会优先清理 Rust shell store，再由前端同步本地 fallback。
+- shell snapshot 现在还多了一层 `authRuntime` 合同，显式区分:
+  - `localProfile`
+  - `pending`
+  - `connected`
+  - `failed`
+- `authRuntime` 已不再只依赖 shell snapshot 字段:
+  - Rust 新增独立 `auth_runtime_state_store`
+  - `bootstrap / complete_login / update_auth_runtime / logout` 都会同步 native auth runtime
+  - `load_chat_shell_snapshot` 现在会优先用 native auth runtime 对齐当前 session；native store 缺失时，也会从现有 `authSession / authRuntime` 自动回填，不需要重新登录
+  - 新增轻量 `sync_auth_runtime` 命令后，前端在 `pending` runtime 下也会周期性从 native store 重新对齐，不需要整页 reload
+- 设置页 About 已可看到当前 `authSession` 和 `authRuntime` 摘要。
+- About 页现在还会直接显示 `authRuntime` 的来源:
+  - 桌面原生命令返回的是 `native store`
+  - 浏览器 fallback / 本地 helper 生成的是 `local fallback`
+- `AuthRuntimeSummary` 现在还自带发送门禁诊断:
+  - `canSendMessages`
+  - `sendBlockedReason`
+  - ChatPane 和 About 页都直接复用这层合同，不再各自重复推导
+- 当前最大的未完成项仍是“真实账号接入”:
+  - `existingAccount / signer` 现在已有输入校验、非敏感摘要持久化和 circle 选择落域。
+  - 本地 `nsec / hexKey / npub` 输入现在已做真实原生校验:
+    - `nsec / hexKey` 会派生 canonical `npub`
+    - `npub` 会做真实 bech32 + x-only pubkey 校验
+    - `LoginAccessSummary / AuthRuntimeSummary` 都会带上已验证 `pubkey`
+    - 本地 secret 导入后的 label 也不再显示 secret 片段，而是显示脱敏后的 canonical `npub`
+  - `authRuntime` 当前默认分流是:
+    - `quickStart -> localProfile`
+    - `existingAccount(nsec|hexKey) -> connected`
+    - `existingAccount(npub) -> failed`
+    - `existingAccount(bunker) -> pending`
+    - `signer(bunker|nostrconnect) -> pending`
+  - `sync_auth_runtime` 现在对远端 signer 已不再只是 relay probe:
+    - `bunker://` 会用原生持久化的 client key 做真实 NIP-46 `connect + get_public_key` 握手
+    - bunker 握手成功时，runtime 会自动从 `pending -> connected`，并把真实 signer `pubkey` 写回 `auth_runtime_state_store`
+    - bunker 握手失败时，会自动从 `pending -> failed`
+    - pasted `nostrconnect://` 目前会在同步时被明确改判成 `failed`，因为桌面端还没有“本地生成 client URI 再授权”的完整入口
+    - 这些结果都会直接写回 `auth_runtime_state_store`，前端 `pending` 轮询不需要再手工切状态
+  - 远端 signer 现在已不再只有 handshake：
+    - `bunker://` 在 `connected` 后，`send_message / retry_message_delivery` 会按当前 native binding + client key 做真实 NIP-46 `sign_event`
+    - bunker 文本消息现在也会像本地 secret 一样拿到稳定 `eventId` 和完整 `signedNostrEvent`
+    - bunker `sign_event` 的最近结果现在还会反写 native `auth_runtime_state_store + shell_state_store`
+    - 远端签名失败时，runtime 会保留 `connected`，但会把最近 signer error 与新的 `updatedAt` 写回 About / shell snapshot，便于继续重试而不是静默吞掉
+    - pasted `nostrconnect://` 仍会保持不可发送，因为还没有桌面端自生成 client URI 的完整授权流
+  - `connected` 现在开始按实际 signer 能力区分:
+    - `quickStart / existingAccount(nsec|hexKey)` 仍可发
+    - `existingAccount(bunker) / signer(bunker)` 在 handshake 成功后也可发
+    - `npub / nostrconnect` 仍不可发
+  - 旧 snapshot 若只有 `authSession`、还没有 `authRuntime`，当前读取时也会自动回填，不需要重新登录。
+  - 聊天发送入口现在已经会真正读取 `authRuntime`:
+    - `pending / failed` 时会禁用主聊天窗 `Send / Retry`
+    - composer 上方会直接显示阻塞原因
+    - 即使 runtime 仍是 `connected`，最近一次 signer/runtime error 现在也会直接显示在 composer，不需要只去 About 看
+    - Rust `send_message / retry_message_delivery` 也会按 shell store 原生拒绝不可发送 runtime，前端不再是唯一门禁
+  - 现在还多了正式的 `update_auth_runtime` 原生命令:
+    - About 页可手动把 `pending / connected / failed` 写回 Rust shell store
+    - 浏览器 fallback 也会走同一套前端 helper 保持本地语义一致
+- 远端 signer/bunker 现在也不再只有摘要:
+  - `bunker:// / nostrconnect://` 原始目标会写入原生 `auth_runtime_binding_store`
+  - shell snapshot 与 About 页现在除了 `endpoint` 外，还会带 `connectionPubkey / relayCount / hasSecret / requestedPermissions / clientName`
+  - 登出会清掉这份 native binding
+- 本地 secret 账号现在也已有最小 native credential session:
+  - 新增 `auth_runtime_credential_store`
+  - `nsec / hexKey` 登录会把 canonical secret hex 单独写入 native store
+  - `AuthRuntimeSummary` 现在会带 `credentialPersistedInNativeStore`
+  - 桌面端若本地 secret 账号缺少这份 native credential，`authRuntime` 会强制回退为 `failed`，不再只靠壳摘要继续假装 `connected`
+- 本地 secret 账号的发送链路也开始进入真实签名:
+  - `send_message / retry_message_delivery` 现在会按当前 authenticated shell + native credential store 读取本地 `nsec / hexKey`
+  - 文本消息会在 Rust 里直接签出最小 Nostr kind-1 note 的稳定 `eventId`
+  - 本地 `remoteId` 因此不再只能回退成 `relay-ack:*`，`sending / failed / retry` 也能提前拿到真实去重键
+  - 新增正式 `signedNostrEvent` message envelope 后，这份已签事件也会直接进入 SQLite/message DTO，不必再靠 message body 即时重算
+  - open circle 下的本地 secret 消息现在不再因为 circle 已 `open` 就被提前标成 `sent`；它们会保持 `sending`，直到 runtime/relay receipt 真正回写
+  - transport 不再只在手动 `Sync / SyncSessions` 时携带这些待发布事件；snapshot heartbeat 现在也会自动把未派发的 `signedNostrEvent` 作为 background `publishOutboundMessages` 入队
+  - websocket circle 的 preview runtime 已会把这些 event 真实写到 relay socket，并按 relay `OK true/false`、超时或提前关闭来回写 delivery receipt，transport cache 也会持久化 outbound dispatch 记录做最小判重
+- shell 读取 auth binding 时，现在也会校验 native store:
+  - native binding 仍在时，`authRuntimeBinding.persistedInNativeStore = true`
+  - 只剩 shell 摘要、native 原始绑定缺失时，会自动降级成 `local fallback` 摘要，避免继续假装 native 绑定仍存在
+  - 若当前远端 `bunker / nostrconnect` session 连 native binding 也缺失，`authRuntime` 也会自动降级成 `failed`，不再继续假装这是个可用 signer runtime
+- 现在已经有最小可用的 bunker remote `sign_event` 发送链路，但还没有常驻 signer worker、失败状态回写和更完整的运行时诊断；native 侧当前已有 credential + runtime state + binding + remote client key 四块持久化边界。
+- 聊天媒体模型现在也已经不再只停留在文本:
+  - 最小 `reply / mention / message detail / file / image / video / message action report draft` 都已有本地闭环
+  - 当前 `file / image / video` 已开始先写入原生 `chat-media/` 目录，再把 `label + localPath` 持久化进消息 `meta`
+  - 媒体 `meta` 现在也开始给真实远端媒体合同预留位:
+    - file 现在兼容 `version: 1 { label, localPath }` 和 `version: 2 { label, localPath?, remoteUrl? }`
+    - image / video 在兼容旧 `version: 1 previewDataUrl` 与当前 `version: 2 localPath` 之外，新增了 `version: 3 { label, localPath?, remoteUrl? }`
+    - timeline / detail 预览现在会优先吃 `localPath`，缺本地缓存时可直接回落到 `remoteUrl`
+    - Rust `merge_message_records()` 现在也会对 `file / image / video` 的结构化 meta 做字段级合并，不再让 relay echo / cross-device merge 把已有 `localPath` 或 `remoteUrl` 互相覆盖掉
+    - 现在还多了一条正式的 native cache 边界:
+      - 新增 `cache_chat_message_media`
+      - 若消息已经有 `remoteUrl` 但还没有 `localPath`，桌面端可直接下载到 `chat-media/` 并把消息 `meta` 回写成 `localPath + remoteUrl`
+  - 当前 domain mutation 后也会做最小 orphan cleanup，发送失败分支也会主动触发一次 sweep
+  - report draft 现在除了 `localAttachmentPath`，也会一起带上 `remoteAttachmentUrl`
+  - 下一个更该做的是在这层 `localPath + remoteUrl` 边界上继续推进真实 `upload / download / media URL` 合同，以及更完整的引用计数/GC，而不是再把媒体塞回 SQLite
+
+## 本轮刚完成
+
+- 原生 auth/shell helper 已抽到 `src-tauri/src/app/shell_auth.rs`，`chat_queries.rs` 和 `chat_mutations.rs` 共用同一套 snapshot 归一化与 `authRuntime` 推导逻辑。
+- `authRuntime` 现在已有独立 native session store:
+  - 新增 `src-tauri/src/infra/auth_runtime_state_store.rs`
+  - `login / load / update / logout` 都会和这份 SQLite KV 对齐
+  - 旧 authenticated shell 若只有 `authSession` 或旧 `authRuntime` 字段，首次读取也会自动 bootstrap 到 native store
+  - `AuthRuntimeSummary` 现在还显式带 `persistedInNativeStore`，前后端和 About 页不需要再猜来源
+  - 同一份 summary 现在还显式带 `canSendMessages / sendBlockedReason`，发送禁用逻辑和 About 诊断都走同一个源头
+- 聊天发送现在有双层门禁:
+  - 前端 `useChatShell.ts / ChatPane.vue` 会在 `pending / failed` 时禁用 `Send / Retry`
+  - Rust `send_message / retry_message_delivery` 也会返回 `chat_send_blocked:*`，避免绕过 UI 继续发送
+- `update_auth_runtime` 已补齐:
+  - Rust query/command 已可校验并持久化 `authRuntime` 状态切换
+  - 前端 `chatShell.ts / useChatShell.ts` 已接好 invoke + fallback
+  - About 页 `SettingsDetailPage.vue` 已有小型诊断面板，可手动标记 `pending / connected / failed`
+- 远端 auth binding 已补齐最小持久化边界:
+  - Rust `auth_runtime_binding_store` 会单独保存远端 `bunker / nostrconnect` 原始目标
+  - 登录会写入，登出会清理
+  - shell snapshot 现在有 `authRuntimeBinding` 脱敏摘要，前端 fallback 也会生成同形态摘要
+- 远端 signer client key 现在也有独立 native store:
+  - 新增 `src-tauri/src/infra/auth_runtime_client_store.rs`
+  - bunker handshake 会按当前 session 自动加载或生成持久化 client key
+  - logout / binding 切换会清理这份 store
+- 本地 auth credential 也已补齐最小持久化边界:
+  - 新增 `src-tauri/src/infra/auth_runtime_credential_store.rs`
+  - `bootstrap / complete_login / logout` 会同步写入或清理本地 `nsec / hexKey` credential
+  - `AuthRuntimeSummary` 现在显式带 `credentialPersistedInNativeStore`
+  - `load_chat_shell_snapshot` 会校验当前 local-secret session 是否真的还有 native credential；丢失时会自动改判成 `failed`
+- `authRuntime` 现在还多了一条正式“native store -> 壳状态”同步边界:
+  - 新增 `sync_auth_runtime` 原生命令
+  - `shell_auth.rs` 会在同步时把 native `auth_runtime_state_store / auth_runtime_binding_store` 重新投影回当前 shell snapshot，并在必要时直接回写 shell store
+  - 前端 `useChatShell.ts` 现在会在 `pending` runtime 时自动轮询这条命令，后续真实 signer worker 只需要写 native store，不必再改整份 shell snapshot
+- 远端 signer runtime 现在已有第一段真实 NIP-46 worker:
+  - `sync_auth_runtime` 会对 `bunker://` binding 做原生 `connect + get_public_key`
+  - bunker 成功时，runtime 会自动从 `pending -> connected`，并把 signer 返回的真实 `pubkey` 持久化
+  - bunker 失败时会自动落到 `failed`
+  - pasted `nostrconnect://` 目前不会再假装只差 relay；它会被明确标成“尚不支持本地生成 client URI”的失败
+- 远端 bunker signer 现在也已有最小 remote `sign_event` 发送链路:
+  - `shell_auth.rs` 新增按当前 session 读取 native `auth_runtime_binding_store + auth_runtime_client_store` 的 on-demand signer helper
+  - `chat_mutations.rs` 的 text-note signer 已扩成“本地 secret 或远端 bunker”
+  - open / connecting circle 下的 bunker 文本消息现在也会拿到真实 `signedNostrEvent`，并继续保持 `sending` 等待 relay `OK`
+  - 最近一次 remote signer 成功/失败现在也会反写当前 shell：
+    - 成功会清掉旧 signer error
+    - 失败会保留 `connected` 但写入新的 runtime error 与 `updatedAt`
+    - `load_chat_shell_snapshot / sync_auth_runtime / About` 因此都能直接看到这层最近结果
+- 前端 composer 现在也会直接暴露最近 runtime/signer error:
+  - `useChatShell.ts` 会把 `effectiveAuthRuntime.error` 单独透出成 `runtimeDiagnosticError`
+  - `ChatPane.vue` 会把“发送被阻塞”和“最近一次 runtime error”分开显示，避免 `connected + error` 被 UI 吞掉
+  - 若 `sendBlockedReason === error`，composer 会自动去重，不会重复显示两条一样的提示
+- About 页 auth runtime 面板现在也能主动触发原生 sync：
+  - `SettingsDetailPage.vue` 新增 `Retry Handshake / Retry Runtime Sync / Refresh Signer Runtime`
+  - `useChatShell.ts` 已把现有 `sync_auth_runtime` invoke 暴露成手动 shell action，不再只能靠 `pending` 自动轮询
+  - signer/runtime 最近状态因此可在 About 里主动刷新，而不必等下一次自动 poll 或重新发送消息
+- 前端 mutation 的桌面错误语义也开始收紧：
+  - `chatMutations.ts` 对建会话、加圈、改群、归档、联系人备注/拉黑等高风险 mutation 现在统一改成“无 Tauri 才返回 `null`，桌面 invoke 失败则直接抛错”
+  - `useChatShell.ts` 已把这些入口包进 `runFallbackEligibleMutation()`；只有浏览器/无 Tauri 环境才继续走本地 fallback
+  - 桌面端真实 native 失败时，不会再继续生成本地假 session / 假 circle / 假群组更新
+  - `openArchivedSession / leaveGroup / sendMessageFromProfile` 也已避免在 native 失败时继续关闭 overlay 或详情抽屉
+- auth shell 命令的错误语义也同步收紧了一段：
+  - `chatShell.ts` 的 `complete_login / bootstrap_auth_session / update_auth_runtime / sync_auth_runtime` 现在也统一成“无 Tauri 返回 `null`，桌面 invoke 失败直接抛错”
+  - `useChatShell.ts` 已在 `completeLogin / updateAuthRuntime / syncAuthRuntimeState / refreshAuthRuntimeStateFromNative` 明确区分这两类情况
+  - 因此桌面端真实 native 登录/运行时同步失败时，不会再静默回退到本地 auth shell 假状态；`pending` 自动轮询遇到原生异常时也不会立刻把 desktop sync 误判成“不支持”
+- 登出和高风险桌面 mutation 现在也有显式 warning 了：
+  - `logout_chat_session` 已改成和其他 native shell 命令一致；桌面原生登出失败时，UI 会保留当前登录态，并在顶部 notice 明确提示“native shell state 没有清掉”
+  - `useChatShell.ts` 的 `runFallbackEligibleMutation()` 现在可接收 user-facing notice 文案；建会话、加圈、改群、归档、联系人备注/拉黑、更新/删除 circle 等入口在桌面 native 失败时都会直接显示 warning
+  - 因此这批入口不再只是“停止 fallback 但没有反馈”；桌面用户现在能直接看到失败原因，而浏览器模式仍会继续走本地 fallback
+- auth 失败提示现在也不再只限于已登录页面：
+  - `App.vue` 已把顶部 notice 提升到登录前也可见，因此 native `complete_login / bootstrap_auth_session` 失败时，登录页上方也能直接看到原因
+  - `useChatShell.ts` 现在会对 `completeLogin / updateAuthRuntime / syncAuthRuntimeNow / logout` 的桌面原生异常直接弹 warning，而不是静默返回
+  - 自动 `pending` 轮询仍保持静默重试，不会因为一次临时失败就对用户刷警告；只有手动 sync 才会提示
+- 启动时的 shell snapshot 恢复也不再是静默 fallback：
+  - `chatShell.ts` 现在把“浏览器无 Tauri”与“桌面 native 读取失败”分开；只有前者才直接走本地 `loadChatShellSnapshotLocally()`
+  - `useChatShell.ts` 的 `onMounted()` 已在 native `load_chat_shell_snapshot` 失败时弹出 warning，再明确降级到本地缓存 shell snapshot
+  - 因此桌面启动若读不到 native shell store，用户现在会知道 UI 正在使用本地缓存而不是真正的原生状态
+- shell snapshot 的后台保存也不再是静默失败：
+  - `chatShell.ts` 的 `save_chat_shell_snapshot` 现在只有浏览器无 Tauri 时才静默返回；桌面 native 写失败会直接抛错
+  - `useChatShell.ts` 新增 `persistShellSnapshotToNative()`，会在自动/手动持久化失败时弹出一次 warning，并在下次成功写入后自动清除“失败中”状态
+  - 因此桌面端若原生 shell store 写不进去，用户现在会知道自己当前只写到了本地缓存，而不是以为 native 状态已经持久化
+- 聊天读路径和 send/retry 的桌面失败现在也不再静默：
+  - `chatShell.ts` 把 `load_chat_session_messages / load_chat_session_message_updates / load_chat_domain_overview` 也改成“无 Tauri 才直接本地 fallback，桌面 native 查询失败则抛错”，并额外暴露本地 fallback helper
+  - `useChatShell.ts` 的消息首屏加载、`Load older` 和登录后的 overview refresh 现在都会在桌面原生查询失败时提示 warning，再明确回退到本地缓存结果
+  - `refreshSessionMessageUpdates()` 仍保持后台静默降级，避免 transport heartbeat 持续刷提示
+  - `sendPreviewMessage / retryMessageDelivery` 现在在桌面原生失败时也会直接提示 `Send failed / Retry failed`，同时继续保留现有的 composer 恢复和 auth runtime 刷新逻辑
+- 草稿持久化的桌面失败现在也不再静默：
+  - `chatMutations.ts` 的 `update_chat_session_draft` 已改成和其他高风险 mutation 一致：无 Tauri 才返回 `null`，桌面 native 失败会直接抛错
+  - `useChatShell.ts` 的 `persistSessionDraftToRuntime()` 现在会在 native draft 持久化失败时弹出一次 warning，并在下次成功写入后清除失败标记
+  - 因此桌面端若 draft 只落到了本地缓存、没有真正写入 native store，用户现在也能知道
+- transport snapshot / runtime action 的桌面失败语义也继续收紧了：
+  - `transportDiagnostics.ts` 的 `load_transport_snapshot` 现在只有浏览器无 Tauri 时才直接走 fallback；桌面 native 读取失败会直接抛错，并额外暴露 `loadTransportSnapshotLocally()`
+  - `useChatShell.ts` 的 `refreshTransportSnapshot()` 现在会在启动阶段显式提示 transport snapshot native 读取失败，再受控回退到本地缓存 snapshot；这类 desktop 读取失败不会再顺手触发本地 runtime recovery，也不会再借由 fallback snapshot 误报 transport 状态变化
+  - `apply_transport_circle_action` 现在也只有无 Tauri 时才返回 `soft-fallback`；桌面 native runtime action 失败会直接弹 warning，并保持当前 runtime 状态，不再继续在前端假装 `connect / sync / disconnect` 已生效
+- 几条遗留 desktop query/helper 也顺手对齐了：
+  - `useChatShell.ts` 的 `bootstrap_status` 现在会区分“浏览器无 Tauri”和“桌面 native 查询失败”；后者会在启动时提示 warning，不再静默丢成 `null`
+  - `chatShell.ts` 的 `load_chat_sessions_overview` 以及 `chatMutations.ts` 的 `merge_remote_session_messages / merge_remote_delivery_receipts` 也统一成“无 Tauri 才本地/空 fallback，桌面 invoke 失败直接抛错”，避免后续入口复用时又把 native 失败吞掉
+- 后台轮询的 desktop 失败现在开始走“提示一次，再静默重试”的分级：
+  - `syncAuthRuntimeState()` 的后台 `sync_auth_runtime` 失败不再永远静默；首次 desktop native 异常会提示一次 warning，之后继续自动重试，成功后会自动清掉这层失败标记
+  - `refreshSessionMessageUpdates()` 的 heartbeat 增量消息刷新也不再永远静默；当前会话的 desktop 增量读取失败时会提示一次 warning，再回退到本地缓存消息，直到下一次成功读取后再重新允许提示
+  - `refreshTransportSnapshot()` 和 `refreshDomainOverview()` 的后台刷新也开始走同一套规则：首次 desktop native 失败提示一次，之后静默重试；只要下一次原生读取成功，就会自动清掉失败标记
+  - 这些“只提示一次”的 failure flag 现在也会在 `completeLogin / logout` 成功路径上统一 reset，不会再把上一轮会话的 background/native 失败状态错误带进下一次登录，导致首个失败被吞掉
+  - 因此后台 poll 不会像手动操作那样频繁刷 notice，但也不会把长期 desktop 原生异常完全吞掉
+- 登录选圈的 desktop 失败语义也继续收紧了：
+  - `resolveLoginCircle()` 不再在 `add/restore circle` 的 desktop native 失败后偷偷退回到现有旧 circle；这类失败现在会明确返回“不能假装 fallback”
+  - `completeLogin()` 在这类情况下会保留“已登录但无可用 circle”的状态，并弹出 `Logged in without a circle` warning，而不是继续装作用户刚才选的圈子已经生效
+  - `existing` 模式下若带进来的是失效 `circleId`，现在也会先校验再决定是否回退到当前可用 circle，避免 `chooseCircle()` 吃掉一个不存在的 id 后提前 `return`
+- 登录后“无 circle”空态入口现在也对齐了：
+  - `SessionList.vue` 的 empty state 在 `activeCircle === null` 时不再显示 “Add Friends to Chat”，而是明确改成 “Add or Restore Circle”
+  - `App.vue` 里的空态 CTA 现在在“无 active circle”时也会直接走 `join-circle` 入口，不再误导到 chat lookup
+  - 因此前一轮引入的 “Logged in without a circle” 状态现在是可操作的，不会把用户送到一个注定失败的聊天入口
+- 顶栏和通用查找入口的“无 circle”行为也一起收口了：
+  - `useChatShell.ts` 的 `openNewMessage()` 现在在 `activeCircle === null` 时会直接重定向到 `join-circle`，不再打开一个后续操作都会因为缺圈而失败的 `new-message` overlay
+  - `openFindPeoplePage("chat")` 在无 active circle 时也会自动改走 `join-circle` 模式，避免其他入口以后复用时又把用户送进无效 lookup
+  - `HomeTopBar.vue` 的 `+` 按钮 `aria-label` 也会随状态切成 `Add or restore circle`，不再在无 circle 时继续宣称自己是 `New message`
+- 主聊天区的“无 circle”空态也已经对齐：
+  - `ChatPane.vue` 现在会接收 `activeCircle`
+  - `session === null && activeCircle === null` 时，不再显示泛化的 “Select a conversation”，而是明确提示用户先 `Add or restore a circle`
+  - 因此主界面三块核心区域现在对“已登录但无 circle”状态给出的动作方向已经一致，不会再一边让用户选会话、一边让用户去加圈
+- overlay/history 对“无 circle”状态的保底清理也补上了：
+  - `sanitizeOverlayPages()` 现在会在 `activeCircle === null` 时自动清掉 `new-message / self-chat-confirm / group-select-members / group-create / archived / find-people(chat)` 这类依赖当前圈子的页面
+  - `openSelfChatConfirmPage()`、`openGroupSelectMembersPage()` 和 `openGroupCreatePage()` 也都补上了无圈守卫；如果以后有别的入口直接调用它们，也会先改走 `join-circle`
+  - 因此浏览器历史、旧 overlay 栈或未来新入口都不容易再把用户送回一组“看得到但必然失败”的缺圈页面
+- 无效 overlay 的 history 空跳转也一起收掉了：
+  - `pushOverlayPage()` 和 `replaceTopOverlayPage()` 现在会先过一遍 `overlayPageExists()`
+  - 因此即使未来有遗漏入口直接尝试打开一个当前状态下无效的 overlay，也不会再留下“界面没变，但 history depth 增加了一层”的空导航记录
+- circle switcher 的空状态现在也补上了 restore 直达入口：
+  - `CircleSwitcher.vue` 在 `circles.length === 0` 时不再只是空列表加一个 “Add a Circle” 按钮，而是会明确显示 “Add or Restore Circle” 空态
+  - 空态下现在同时提供 `Join Circle` 和 `Restore Access` 两个动作；后者会直接打开现有的 settings restore catalog
+  - 因此当前 UI 文案里多次出现的 `Add or restore circle` 终于和实际可点击入口对齐，不再只是文字上说得更全、动作上却只能 join
+- settings drawer 的“无 circle”入口也已经补齐：
+  - `SettingsDrawer.vue` 现在会接收 `restorableCount`
+  - `circles.length === 0` 时，抽屉不再只剩一个空白 circle 区块；会明确显示 `Add or Restore Circle / Join a Circle` 文案，并提示当前 shell 还没有 mounted circle
+  - 抽屉底部现在也会和 circle switcher 一样直接给出 `Join Circle` 与 `Restore Access` 两个动作；后者会直达 `handleSettingsAction('restore')`
+- circle directory 现在也不再是“只能 add、不能 restore”的半套管理页：
+  - `CircleDirectoryPage.vue` 现在会接收 `restorableCircles`
+  - 无 circle 时，目录页顶部不再继续假装用户主要是在 `switch circles`；subtitle 和当前圈子区块都会明确改成“先 restore 或 connect”
+  - 目录页中间现在还会直接展示 restore catalog，并提供 `Restore / Forget` 动作；`App.vue` 已接到现有 `restoreCircleAccess / forgetRestorableCircle`
+  - 因此 circle switcher、settings drawer、restore settings page 和 circle directory 四个主要 circle 管理入口，现在都已经能直接走 restore，不会再出现某个入口只能 join 的割裂状态
+- 剩下几条 helper-level 的缺圈静默 no-op 也开始显式收口了：
+  - `useChatShell.ts` 新增统一 `redirectToCircleSetup()` helper，会先弹一次 `No active circle` warning，再把当前 overlay 受控切到 `find-people(join-circle)`，而不是继续静默 `return`
+  - `startConversation()`、`startSelfChat()`、`createGroupChat()` 和 `startLookupChat()` 现在在无 `activeCircleId` 时都会走这条 helper
+  - 因此像 contact profile 这种旁路入口，即使绕过了前面的空态页，也不会再点了没反应
+- contact profile 在“无 circle”时的主动作也不再自相矛盾：
+  - `ContactProfilePage.vue` 现在会接收 `activeCircle`
+  - 无 active circle 时，底部主按钮不再显示一个点了只会失败的 `Send Message`，而是直接改成 `Join Circle`
+  - 因此前面那轮“聊天入口改走 join-circle”不再只停留在列表和主空态，profile 侧路也不会再留一个误导按钮
+- 远端 signer runtime 现在也有了和本地 secret credential 对称的前置校验:
+  - `bunker / nostrconnect` 若缺少匹配的 native binding，会被原生改判成 `failed`
+  - `send / retry` 的壳层和 Rust 门禁都会直接看到这层失败原因
+- `connected` runtime 的发送能力现在也开始按实现能力而不是只看 state:
+  - 本地 `localProfile / nsec / hexKey` 仍可发送
+  - `bunker` 在 runtime 已 `connected` 后现在也可发送；`nostrconnect` 仍会保持 `false`
+  - Rust `send_message` 现在已有回归测试，确保 `bunker connected` 被正确放行，而 `nostrconnect connected` 仍不会被误开放发送
+- 远端 binding 输入现在也不再只做 scheme 前缀检查:
+  - Rust `auth_access.rs` 会真实解析 `bunker / nostrconnect` URI
+  - 会校验连接 pubkey、至少一个 `ws/wss` relay，以及 `nostrconnect` 的 `secret`
+  - 浏览器 fallback 的 `authRuntimeBinding` helper 也会尽量生成同形态诊断字段
+- 本地 text note signer 也已补齐最小原生实现:
+  - `auth_access.rs` 新增轻量 Nostr text-note signer
+  - 当前先产出稳定 `eventId / pubkey / createdAt / kind / tags / content / signature`
+  - 这份 envelope 现在也会落进 `MessageItem.signedNostrEvent`
+- transport/runtime publish preview 合同也已补上:
+  - `TransportRuntimeActionRequest` 新增 `outboundMessages`
+  - `LocalTransportService` 会从当前 circle 的本地已签消息抽取待发布 envelope，并过滤已派发记录
+  - `LocalTransportRuntimeManager` 会在 runtime queue 成功写入后持久化 `transport_outbound_dispatch`
+  - websocket 模式下，preview `p2p-chat-runtime` 现在会把这些 outbound event 编码成真实 Nostr `["EVENT", {...}]` client message 并写到 relay socket
+  - runtime 现在会继续等待 relay `["OK", event_id, accepted, message]`，并按 `accepted=true/false` 回写 `MergeRemoteDeliveryReceipts`
+  - 若 relay 超时、提前关闭连接或返回非法 ack，也会把对应消息回写成 `failed`
+  - preview runtime launch arguments 现在也会带上真实 `--relay-url`
+  - `retry_message_delivery` 现在会清理对应 dispatch 记录，避免同一条消息 retry 后被旧判重挡住
+  - 这轮还把 background publish 从“只能手动 Sync 触发”推进到了 heartbeat 自动触发：live local runtime 在 hydrate 时会单独消费 `publishOutboundMessages`，不再伪装成一次 sync activity
+  - outbound publish 收集现在也收紧成“只看本地 `syncSource=local`、已签名、且仍处于 `deliveryStatus=sending` 的消息”：
+    - 已 `sent / failed` 的本地签名消息不会再继续占着 dispatch 记录
+    - 从别的设备 sync 回来的 `self-authored relay` event 也不会再被本机 heartbeat 当成待发布消息重复发回 relay
+    - 旧库里若存在 `syncSource` 缺失、但仍处于 `sending` 的本地已签消息，也会继续被视为本地 pending publish，不会被这次收紧误饿死
+  - `transport_outbound_dispatch` 现在会额外记录 runtime `generation`
+    - runtime 重启后，旧 generation 的 dispatch 记录会在 reconcile 时自动丢弃
+    - 因此“runtime 崩掉后旧 dispatch 一直挡着同一条已签消息重发”的卡死边界，这轮也一起收掉了
+  - open circle 的自动 `sending -> sent` 收敛现在只保留给未签名本地消息；带 `signedNostrEvent` 的消息会明确等待 runtime 回执
+  - direct session 的本地已签文本消息现在也会补单个 contact `p` tag；group session 会补成员 `p` tags；本地 secret 和 remote bunker signer 都会复用这层 tag 集合
+  - `Sync` 动作现在还会额外发一轮保守的 `REQ -> EVENT/EOSE -> CLOSE`，把 relay 返回的 kind-1 文本事件映射成 `MergeRemoteMessages`
+  - `LocalTransportService` 现在会在发起 `Sync` 前优先读取 transport cache 里的每圈持久 `relay_sync_cursor`；旧数据或首轮 bootstrap 时，才回退到当前 circle 已落库的 relay peer 历史来推 `syncSinceCreatedAt`
+  - 这层 cursor 会随 inbound relay peer 消息自动回填/推进，并保留 5 分钟 overlap 窗口；runtime 会把它编码进 relay `REQ` filter，避免每次都完全从头扫
+  - `Sync` 的 relay `REQ` 现在也不再只剩 `{ kinds, limit, since }`：
+    - `LocalTransportService` 会按当前 circle 的 direct/group session 派生 `relaySyncFilters`
+    - direct 会话会聚合成 `authors`
+    - group 会话会尽量派生成 `authors + #p`
+    - 单成员 group 会回退成 author-only，避免把兼容性直接卡死在 `#p` 上
+  - `TransportRuntimeActionRequest` 现在会把这组 `relaySyncFilters` 透传给 `p2p-chat-runtime`
+  - preview runtime 会把它编码成多 filter 的 Nostr `REQ` payload，先在 relay 入口缩小“相关作者 + 相关 `p` tag”范围，再进入本地 reroute
+  - 当前会过滤本轮刚 publish 的 outbound event id，避免同步窗口立刻把自己刚发的 echo 再灌回会话
+  - `LocalTransportService` 在应用这些 inbound merge 时，现在会先按 sender pubkey + `p` tags 识别最小 group session；若 group 结构命中，会优先落到 group，不再先被同联系人的 direct session 吞掉
+  - 若没有 group 结构，才会继续按 `signedNostrEvent.pubkey` 把 peer 文本消息重路由到“同 circle、contact pubkey 命中”的 direct session；不再一律塞回 runtime 的 `primarySessionId`
+  - `LocalTransportService` 现在还会读取当前 authenticated shell 的 pubkey，把“我自己在别的设备发出来、再经 relay sync 回来的事件”纠正成 `author=me`
+  - 这类 self-authored relay event 现在也会参与 reroute：
+    - direct 会按单个 `p` tag` 落到匹配 direct session
+    - group 会按成员 `p` tags` 落到匹配 group session
+    - 没有 `p` tag` 时会优先落到同圈唯一 self-chat
+  - reroute 之前现在还会先做一层 message identity 锚定：只要 inbound event 的 `id/remote_id` 已经在某个 session 里存在，就优先回到那个已知 session，不再因为 fallback session、缺失 tags 或 self-chat 规则把已有消息挪家
+  - self-authored relay message 现在还会按 `syncSource=relay` 计入 session preview/time 更新，但不会误增 unread
+  - `build_remote_message_merge_change_set` 现在只会用“真正新增且计入远端会话活动”的消息刷新 session preview/time；批次末尾若夹着旧 relay duplicate/self echo，不会再把刚到的新消息 preview/time 顶回旧值
+  - 若同一批里有多条新的 relay activity，session preview 会优先按 `signedNostrEvent.created_at` 选最新；缺失签名时间时才回退到输入顺序
+  - 当前已落地的是“direct `p`-tag send + 同圈 direct reroute + 基于 `p` tags` 的最小 group reroute/优先级修正 + self-authored relay reroute + existing-message session anchor”；无签名 preview message / richer tag scheme / MLS 仍会继续回落到原始 session
+  - SQLite merge 这边也补了 `remote_id` 去重保护：同一条本地已签消息后续若再被 relay echo 回来，不会再把已有 `author=me / syncSource=local` 记录翻成 peer
+  - 这已经不再只是 socket write 级别；但 inbound 仍只是单次 `Sync` 动作里的 bounded read window。当前已有“每圈持久 cursor + 5 分钟 overlap + direct/group 最小 reroute”，但还没有常驻订阅、per-relay marker、更丰富的 group/tag/MLS 路由和更完整的网络恢复策略
+- 本地 credential 解析已从“字符串占位”推进到真实 key 解析:
+  - 新增 `src-tauri/src/app/auth_access.rs`
+  - Rust 已引入轻量 `bech32 + secp256k1 + sha2`
+  - `build_auth_session_summary / validate_access_input` 现在统一走这层 helper
+  - `nsec / hexKey` 会导出 canonical `npub`，`npub` 也会 canonicalize
+  - About 页 `SettingsDetailPage.vue` 现在可直接显示已验证 pubkey
+- 最小 reply 链路现在也已经打通:
+  - Rust `MessageItem` 新增 `reply_to`，`SendMessageInput` 新增 `reply_to_message_id`
+  - SQLite `messages` 现在会持久化 `reply_to` JSON；老库会自动补列
+  - 本地发送 reply 时会把被回复消息压成 `MessageReplyPreview`，并在已签文本事件里补 `e` tag
+  - relay merge 远端消息时，会按 `signedNostrEvent.tags` 里的 `e` tag 回填 `reply_to`；找不到原消息时会退回占位 preview
+  - 前端 `useChatShell.ts / App.vue / ChatPane.vue` 已接好 reply state、composer reply bar、消息气泡引用块和 `Reply` 动作
+- message detail 现在也已有第一版桌面 overlay:
+  - `advanced.showMessageInfo` 终于接到真实入口，聊天气泡会显示 message detail 按钮
+  - 新增 `message-detail` overlay route，history/hash 序列化和页面合法性校验都已接通
+  - 新页面会展示 `body / meta / replyTo / deliveryStatus / syncSource / remoteId / ackedAt / signedNostrEvent`
+  - 当前还支持 `Copy Body / Copy Remote ID / Copy Event JSON`，以及对失败本地消息直接 `Retry`
+  - 若 reply target 仍在当前已加载消息页里，也可从 detail 继续打开被引用消息；尚未支持自动分页跳转
+- mention 现在也有最小前端闭环:
+  - composer 在 direct/group 会话里输入 `@` 会出现当前会话范围内的 mention 候选
+  - `Up / Down / Tab / Enter` 已可选中 mention，点击候选也会把 handle 插入 composer
+  - 文本消息正文里的 `@handle` 现在会高亮显示，至少把最常用的 mention 阅读/输入交互补齐了一段
+  - 当前还只是前端文本级交互，没有独立 mention DTO、持久化元数据或远端 mention tag 语义
+- 最小 file attachment send 现在也已接通:
+  - Rust 新增 `SendFileMessageInput / send_chat_file_message / send_file_message`
+  - 当前附件发送仍是“只落消息记录、不做真实上传”的最小闭环:
+    - `MessageKind::File`
+    - `body = 文件名`
+    - `meta = 类型 + 大小`
+  - file message 会复用现有 session move-to-top、reply preview、delivery status 和 SQLite 持久化链路
+  - `ChatPane.vue` 的 paperclip 已接成真实 `<input type="file">`，`App.vue / useChatShell.ts` 也已接好附件发送入口
+  - 当前 file message 不会像文本消息那样生成 `signedNostrEvent`；真正的上传/下载、file server、媒体预览还没开始
+- 最小 image message 现在也已接通:
+  - Rust 新增 `MessageKind::Image` 和 `SendImageMessageInput / send_chat_image_message / send_image_message`
+  - 前端附件发送现在会按 MIME 把图片从普通 file 分流出来:
+    - 读取本地 image data URL
+    - 推导最小尺寸信息
+    - 生成可持久化的 image meta payload
+  - 当前 image message 的最小合同是:
+    - `kind = image`
+    - `body = 文件名`
+    - `meta = JSON payload(label + localPath)`
+  - `ChatPane.vue` 和 `MessageDetailPage.vue` 现在都能直接显示本地图片预览
+  - image message 也会复用现有 session move-to-top、reply preview、delivery status 和 SQLite 持久化链路
+  - 当前 image message 仍不会生成 `signedNostrEvent`，也还没有真实上传/download、远端 media URL、压缩或 file server
+- 最小 video message 现在也已接通:
+  - Rust 新增 `MessageKind::Video` 和 `SendVideoMessageInput / send_chat_video_message / send_video_message`
+  - 前端附件发送现在会按 MIME 把视频从普通 file 分流出来:
+    - 读取本地 video data URL
+    - 推导最小分辨率和时长
+    - 生成可持久化的 video meta payload
+  - 当前 video message 的最小合同是:
+    - `kind = video`
+    - `body = 文件名`
+    - `meta = JSON payload(label + localPath)`
+  - `ChatPane.vue` 和 `MessageDetailPage.vue` 现在都能直接显示本地视频预览
+  - video message 也会复用现有 session move-to-top、reply preview、delivery status 和 SQLite 持久化链路
+  - 当前 video message 仍不会生成 `signedNostrEvent`，也还没有真实上传/download、远端 media URL、转码或 file server
+- 媒体本地存储边界这轮也开始从“内联 data URL”往外迁了:
+  - Rust 新增 `store_chat_media_asset` 命令和 `src-tauri/src/infra/media_store.rs`
+  - 当前桌面端附件发送会先把 `file / image / video` 写到原生 `app_config_dir/chat-media/{files|images|videos}`
+  - 文件名会按时间戳 + 清洗后的 stem 持久化，消息 `meta` 则开始收敛成结构化 `label + localPath`
+  - `ChatPane.vue` 和 `MessageDetailPage.vue` 现在会把这些 `localPath` 转成 Tauri `asset://` URL 来预览图片/视频
+  - `MessageDetailPage.vue` 现在还可直接 `Open Attachment / Reveal in Folder`
+  - 旧 image/video 的 `previewDataUrl` meta 仍兼容读取，避免已有消息历史直接失效
+  - 这轮还把 media merge 语义补齐了一段:
+    - `src-tauri/src/domain/chat_repository.rs` 现在会在 duplicate merge / relay echo 时按字段合并 `localPath + remoteUrl`
+    - file meta 现在也不再只停留在“必须本地文件”的老结构；已兼容远端 `remoteUrl` 形态
+    - 新增 Rust 回归测试，覆盖 image/video/file 的 local/remote 混合 merge
+  - 这轮还新增了真正可用的远端缓存入口:
+    - `src-tauri/src/infra/media_store.rs` 新增 `http/https -> chat-media/` 下载缓存
+    - `src-tauri/src/app/chat_mutations.rs` 新增 `cache_chat_message_media`
+    - `useChatShell.ts` 现在会在 `Open attachment / Reveal in folder / Copy local path` 时，若只有 `remoteUrl` 没有 `localPath`，先自动缓存再继续动作
+    - `ChatPane.vue` 与 `MessageDetailPage.vue` 现在对 remote-only attachment 也会继续显示附件动作，不再只对本地文件开放
+    - 新增 Rust 端到端回归测试，验证 remote-only image message 会被下载进 `chat-media/`，并把消息 `meta` 回写成 `localPath + remoteUrl`
+  - 现在还补了一层最小清理链路:
+    - `apply_domain_change_set()` 成功后会按当前全部消息引用扫一遍 `chat-media/`，删除 orphan 文件
+    - 前端附件发送失败时，也会额外调用一次显式 `cleanup_chat_media_assets`
+  - 当前仍未做的部分是:
+    - 远端上传/下载与 media URL
+    - 本地 `chat-media/` 更完整的引用计数、清理或 GC
+    - file preview / richer file action
+- 最小 message action menu / report draft 现在也已补上:
+  - `ChatPane.vue` 的消息气泡现在支持 `...` 菜单和右键打开 action menu
+  - 当前已接的动作有:
+    - `Reply`
+    - `Copy message / file name / audio label`
+    - `Message detail`
+    - 本地 `file / image / video` 的 `Open attachment / Reveal in folder / Copy local path`
+    - peer message 的 `Report message`
+  - report 当前不是远端提交，而是弹出 reason picker 后，把结构化 moderation handoff JSON 复制到剪贴板
+  - `useChatShell.ts` 会统一处理 copy/report 的 clipboard 成功/失败 notice
+  - 这已经补上了最小 desktop message action/report 交互，但真实 moderation/report API 仍未接通
+
+## 这轮验证
+
+- `pnpm check` 通过
+- `cargo test --manifest-path src-tauri/Cargo.toml` 通过
+- `git diff --check` 通过
+
+## 下个 session 直接做
+
+1. 不要再补壳层小交互，直接接真实媒体合同。
+2. 先做最小 `remote media` 写入链路:
+   - 当前 `chat_repository` 已能正确合并 `localPath + remoteUrl`，native cache/download 也已存在；所以下一步不再是补 merge 或 cache，而是让真实链路开始产出 `remoteUrl`。
+   - 优先把 `remoteUrl` 的回写边界收敛到 `chat_mutations` 或 `merge_remote_session_messages`，不要散落到组件层。
+   - 如果先做本地 upload 成功回写，就直接把消息 meta 从 `local-only` 升到 `local + remote`；如果先做远端 sync 拉回，也走同一套 merge 入口。
+3. 再做最小 download/cache:
+   - image/video 预览已经能直链回退，attachment action 也已能自动缓存；下一步更该补的是显式下载状态/进度反馈，而不是从零开始做 cache 命令。
+   - 如果要继续扩这层，优先做 detail/timeline 上更明确的 `Downloading...` / failure UX，而不是改存储结构。
+4. cleanup/GC 继续保持增量:
+   - 当前 Rust `media_store` 已验证 `localPath + remoteUrl` 混合 meta 不会误删本地文件。
+   - 下一步只需要补“download 后 localPath 补写/替换”时的安全回收语义，不要现在就大改 SQLite 或上完整引用计数。
+- 新增原生回归测试:
+  - `send_message_rejects_when_auth_runtime_cannot_send`
+  - `send_message_rejects_when_remote_signer_is_connected_without_send_support`
+  - `send_message_in_open_circle_with_remote_bunker_auth_waits_for_runtime_receipt`
+  - `send_message_with_remote_bunker_auth_persists_runtime_sign_error`
+  - `send_message_with_remote_bunker_auth_clears_previous_runtime_sign_error`
+  - `send_message_in_connecting_circle_with_local_auth_sets_signed_remote_id`
+  - `send_file_message_persists_file_metadata_and_session_preview`
+  - `send_file_message_with_local_auth_does_not_create_signed_nostr_event`
+  - `send_file_message_preserves_reply_preview`
+  - `send_image_message_persists_meta_and_session_preview`
+  - `send_image_message_with_local_auth_does_not_create_signed_nostr_event`
+  - `send_image_message_preserves_reply_preview`
+  - `retry_message_delivery_rejects_when_auth_runtime_is_pending`
+  - `retry_message_delivery_with_local_auth_preserves_signed_remote_id`
+  - `update_auth_runtime_promotes_pending_signer_to_connected_and_persists`
+  - `update_auth_runtime_rejects_invalid_quick_start_transition`
+  - `bootstrap_auth_session_persists_remote_auth_runtime_binding`
+  - `load_chat_shell_snapshot_prefers_native_auth_runtime_state_for_current_session`
+  - `load_chat_shell_snapshot_marks_remote_signer_runtime_failed_when_native_binding_is_missing`
+  - `sync_auth_runtime_persists_rehydrated_runtime_into_shell_state_store`
+  - `sync_auth_runtime_promotes_pending_bunker_signer_when_handshake_succeeds`
+  - `sync_auth_runtime_marks_pasted_nostrconnect_failed_until_client_uri_support_exists`
+  - `sync_auth_runtime_reuses_persisted_bunker_client_keys_across_retries`
+  - `signs_nostr_text_note_from_valid_secret_key`
+  - `resolves_bunker_auth_runtime_binding_summary`
+  - `resolves_nostrconnect_auth_runtime_binding_summary`
+  - `rejects_nostrconnect_binding_without_secret`
+  - `send_direct_message_with_local_auth_sets_contact_p_tag`
+  - `send_group_message_with_local_auth_sets_group_member_p_tags`
+  - `merge_remote_messages_updates_session_preview_for_self_authored_relay_message`
+  - `merge_remote_messages_keeps_new_peer_preview_when_batch_ends_with_duplicate_echo`
+  - `merge_remote_messages_prefers_latest_relay_created_at_for_session_preview`
+  - `merge_remote_messages_keeps_new_self_authored_relay_preview_when_batch_ends_with_duplicate_echo`
+  - `collect_transport_outbound_messages_ignores_self_authored_relay_echoes`
+  - `collect_transport_outbound_messages_keeps_legacy_pending_local_signed_messages`
+  - `reconcile_transport_outbound_dispatches_drops_missing_replaced_and_stale_generation_records`
+  - `apply_transport_chat_effects_prefers_existing_message_session_over_self_chat_fallback`
+  - `relay_sync_since_created_at_prefers_persisted_cursor_over_seed_history`
+  - `relay_sync_filters_include_direct_authors_and_group_member_p_tags`
+  - `relay_sync_filters_fall_back_to_author_only_for_single_member_groups`
+  - `reconcile_transport_relay_sync_cursors_backfills_and_advances_from_seed`
+  - `sqlite_transport_repository_roundtrips_relay_sync_cursors`
+  - `apply_transport_chat_effects_routes_inbound_peer_message_to_matching_group_session`
+  - `apply_transport_chat_effects_prefers_group_session_over_direct_session_for_group_tags`
+  - `apply_transport_chat_effects_routes_self_authored_relay_message_to_matching_direct_session`
+  - `apply_transport_chat_effects_routes_self_authored_relay_message_to_matching_group_session`
+  - `apply_transport_chat_effects_routes_self_authored_relay_message_to_self_chat_session`
+  - `send_reply_message_persists_reply_preview_and_sets_e_tag`
+  - `merge_remote_messages_hydrates_reply_preview_from_signed_event_e_tag`
+
+## 本轮补充盘点
+
+- 当前已经额外确认: `tmp/xchat-app-main` 的真实功能面主要不在根 `lib/`，而是在 `packages/` 里的多模块组合。
+  - 业务模块主要是:
+    - `packages/business_modules/ox_home`
+    - `packages/business_modules/ox_login`
+    - `packages/business_modules/ox_usercenter`
+    - `packages/business_modules/ox_chat`
+    - `packages/business_modules/ox_chat_ui`
+  - 基础/平台模块主要是:
+    - `packages/base_framework/ox_common`
+    - `packages/base_framework/ox_call`
+    - `packages/0xchat-core`
+    - `packages/nostr-dart`
+    - `packages/nostr-mls-package`
+    - `packages/bitchat-flutter-plugin`
+- 因此下个 session 若继续做“功能级克隆”判断，不要只看 `tmp/xchat-app-main/lib/main.dart`，要把 `packages/` 视为真正对标对象。
+- 当前完成度的粗略判断:
+  - 若只按“桌面壳 + 本地持久化 + preview transport”算，当前大约已到 `70%~80%`
+  - 若按“桌面端可用产品”算，当前大约在 `45%~55%`
+  - 若按“对 `tmp/xchat-app-main` 做功能级克隆”算，当前大约在 `35%~45%`
+- 模块级判断:
+  - `ox_home` 对位度较高；当前桌面壳、会话列表、聊天主窗、overlay/history、circle 管理和归档流已经比较完整
+  - `ox_login` 对位度中等；多步 onboarding、auth session/runtime、restore catalog 已有，但 `capacity / duration / checkout / private cloud / activated` 这类私有 circle / 商业化流程还未对齐
+  - `ox_chat` 对位度中等；文本聊天、自聊、建群、找人、联系人备注、群成员管理、最小 reply、mention、message detail、最小 file/image/video message 和最小 message action/report draft 已有，且本地媒体已落到原生文件存储，但 reaction、真实媒体传输和真实 moderation/report submit 等 richer flow 仍明显缺失
+  - `ox_chat_ui` 对位度偏低；当前只有自建 `ChatPane.vue`，虽已补 paperclip file picker、reply bar、mention list、detail 入口、图片/视频预览、附件打开入口和消息 action menu，但仍没有原项目那套更完整的 typing/unread/theme/config/chat-list 体系
+  - `ox_usercenter` 对位度偏低到中等；当前 settings 只收口成 `preferences / notifications / advanced / restore / about` 五项，还没有 `keys / QR / avatar / bio / nickname / file server` 这些原项目页面
+  - `ox_call` 目前基本未开始；还没有真实 call/webrtc 映射
+  - `ox_common` 的平台能力也只映射了一部分；push / share / scan / upload / purchase / file server / tor / permission 这些基础设施大都还没有正式落到 Tauri 版
+- 关键结论:
+  - 当前真正最大的缺口已经不是桌面壳 UI，而是数据面和平台能力面
+  - 现在还不应该继续长时间停留在 “no-circle UX / warning dedupe / empty state polish” 这种壳层打磨，除非就是刻意做收尾 polish
+  - 现有 transport 虽然已经很强，但它仍主要是 `mock / nativePreview` 预览链路；不要把这条 preview runtime 误判成“真实网络层已经完成”
+  - 现有 auth/signer 也已经越过了纯 mock，但仍未达到“真实账号接入已完成”；当前更准确的说法是“真实边界和原生 store 已搭起，真实 runtime 还没完全闭环”
+
+## 下一刀建议
+
+目标: 若当前明确是在做 `tmp/xchat-app-main -> Tauri + Vue` 的功能级重构，下一刀不应再只围着壳层微交互转，而要把桌面版从“可演示的 preview shell”推进到“数据链路真正可用”的状态。
+
+建议顺序:
+
+1. 先锁定 P0 数据面，不要再分神做大面积 UI polish。
+   - 当前最关键的 unfinished area 仍是:
+     - 真实消息收发闭环
+     - 真实账号/runtime/signer 闭环
+     - richer message model
+     - 更完整的增量存储与状态回写
+   - 这四项若不先收掉，后面再补 `usercenter / media / QR / call` 也会不断返工
+2. transport 先从 preview 走向真正可用，而不是继续把 preview runtime 打磨得越来越像生产。
+   - 当前 `signedNostrEvent + publishOutboundMessages + relay OK receipt` 已经把最小 publish preview 做出来了
+   - 当前还额外有了一条最小 inbound preview：`Sync -> REQ/EVENT/EOSE -> MergeRemoteMessages`
+   - 当前还多了一条更稳的最小增量边界：`LocalTransportService` 会优先读取每圈持久 `relay_sync_cursor`，缺失时才回退到 relay peer 历史来推 `syncSinceCreatedAt`，并保留 5 分钟 overlap
+   - relay 入口现在也已经开始缩窄：direct/group 会话会派生到 `authors / #p` 级别的 `REQ` filter，不再每次都按裸 `kind-1 + since` 全量扫
+   - direct peer message 现在已可在 service 层按 sender pubkey 重路由到匹配会话；group message 也开始支持最小 `p`-tag 路由，而且 group 命中会先于 direct 执行，所以“全部落回 primary session”这个最粗糙的问题已经先收掉一段
+   - 下一步更应该决定:
+     - 是否引入常驻 relay runtime / publish worker
+     - 是否补显式 publish job / retry backoff / reconnect 语义
+     - 当前这套“每圈持久 cursor + overlap”是否要继续升级成 per-relay marker / overlap policy / 更明确的 crash-safe checkpoint
+     - group / MLS / tag message 的 session 路由怎么继续扩；当前只有同圈 direct reroute + 最小 `p`-tag group reroute
+    - 当前 self-authored relay reroute 已补上，但 self echo / multi-device echo / cross-session dedupe 最终还要放在哪一层完全收口
+   - 若这块不定，消息收发闭环永远只能算“本地预演”
+3. auth/runtime 继续收敛成真正运行中的 signer，而不是只停在原生 store 与一次性动作。
+   - bunker 方向更适合作为当前主线
+   - `nostrconnect://` 先明确产品语义；如果近期不做 client URI 授权流，就不要把它继续当高优先级实现目标
+   - 当前更值得做的是:
+     - 把 on-demand bunker signer 收敛成常驻 worker
+     - 明确 handshake / sign / retry / failure state 的持久化边界
+     - 把更多 worker 级诊断露到 About/Settings，而不只是 binding 摘要
+4. richer message / media 应该作为下一批高频产品缺口尽快补齐。
+   - 原 Flutter 工程这块已经明显超出当前桌面版:
+     - reply、mention、message detail、最小 file/image/video message 和最小 message action/report draft 都已有闭环，但还没有自动定位旧引用、真实 moderation/report submit 和更完整事件语义
+     - 真实 file/image/video upload/download、media URL，以及当前 `chat-media/` 本地缓存从 orphan cleanup 走向更完整生命周期治理
+     - call message
+     - reaction / richer message actions 等附属动作
+   - 当前桌面版若还只围着 text/system message 转，会越来越偏离 `ox_chat + ox_chat_ui`
+5. 用户中心至少要补一轮“桌面必需版”，不要一直只停留在聚合 settings page。
+   - 下一批更像 `ox_usercenter` 的目标页应优先考虑:
+     - keys
+     - QR / invite
+     - profile fields
+     - file server
+   - 当前 `preferences / notifications / advanced / restore / about` 只是最小收口，不算功能级对位
+6. 私有 circle / 购买恢复 / 权限确认若目标真是功能级克隆，迟早要补，但优先级应排在 P0 数据面之后。
+   - 当前 restore catalog 已能覆盖“本地移除后恢复”这一类桌面壳语义
+   - 但原项目那套 `capacity / duration / checkout / activated / restore purchases` 仍未对位
+7. call / push / share / scan / permission 这些平台能力先明确边界。
+   - 若当前只做 Linux/macOS 桌面版，可以先挑桌面真正需要的:
+     - URL scheme / deep link
+     - file drop / upload
+     - clipboard / share
+     - notification
+   - `call / mobile push / share extension` 可以放在更后面，但要明确它们现在基本仍是未开始状态
+
+## 关键文件
+
+- `src-tauri/src/app/chat_queries.rs`
+  - 登录/登出、`update_auth_runtime` 和新的 `sync_auth_runtime` 主边界都在这里。
+- `src-tauri/src/app/chat_mutations.rs`
+  - 原生 `send / retry` 现在也会按 `authRuntime` 做兜底拒绝；本地 `nsec / hexKey` 文本消息也会在这里拿到真实 signed `remoteId` 和 `signedNostrEvent`，`retry` 还会清理对应 transport dispatch 判重记录；direct/group session 的本地已签文本消息也会在这里补 `p` tags；reply send 也会在这里解析 `reply_to_message_id` 并补 `e` tag；新的 `send_file_message` 也会在这里落 `MessageKind::File` 本地消息与 reply preview。
+- `src-tauri/src/domain/chat_repository.rs`
+  - 远端 merge 的 reply hydration、`MessageReplyPreview` 构造、session preview merge 以及 relay echo 去重保留策略都在这里。
+- `src-tauri/src/infra/sqlite_chat_repository.rs`
+  - `messages.reply_to` 的 SQLite 持久化、自动补列和 DTO encode/decode 都在这里。
+- `src-tauri/src/infra/local_transport_service.rs`
+  - 当前 circle 下待发布的 `signedNostrEvent` 会在这里被抽成 runtime `outboundMessages`，并和 transport cache 的 dispatch 记录做最小判重/清理；heartbeat 也会在这里触发 background publish 入队；runtime inbound merge 进入 chat domain 前，也会在这里做同圈 direct session 的 sender-pubkey 重路由、最小 group `p`-tag 重路由、group-over-direct 优先级修正、existing-message session anchor，以及 self-authored relay message 的 `author=me + direct/group/self-chat` reroute，并为 `Sync` 维护/推导带持久 cursor 的 `syncSinceCreatedAt` + `relaySyncFilters`。
+- `src-tauri/src/infra/local_transport_runtime_manager.rs`
+  - live local runtime 的显式 action queue、background `publishOutboundMessages` 入队和 `transport_outbound_dispatch` 持久化都在这里；service 推导出来的带持久 cursor 的 `syncSinceCreatedAt` 和新的 `relaySyncFilters` 也会在这里透传进 runtime request。
+- `src-tauri/src/bin/p2p-chat-runtime.rs`
+  - preview runtime 现在会对 websocket relay 做真实 Nostr `EVENT` publish，并按 relay `OK true/false`、超时和 close 回写 `MergeRemoteDeliveryReceipts`；`Sync` 时还会做一轮 bounded `REQ/EVENT/EOSE` 入站读取并发出 `MergeRemoteMessages`，并消费 service 透传下来的、由持久 cursor 驱动的 `syncSinceCreatedAt`，以及新的 per-circle `relaySyncFilters` 多 filter `REQ` 编码。
+- `src-tauri/src/app/shell_auth.rs`
+  - shell snapshot 读取、回填、`authRuntime` 推导、更新校验、remote binding 摘要生成和 send-block 原因都收敛在这里。
+- `src-tauri/src/app/auth_access.rs`
+  - 本地 `nsec / npub / hexKey` 的真实校验、canonical `npub` 派生、最小 Nostr text-note signer，以及远端 `bunker / nostrconnect` binding URI 的结构化解析都在这里。
+- `src-tauri/src/infra/auth_runtime_binding_store.rs`
+  - 原生远端 signer/bunker 目标的独立 SQLite store。
+- `src-tauri/src/infra/auth_runtime_client_store.rs`
+  - 远端 bunker signer session 的本地 client key store。
+- `src-tauri/src/infra/auth_runtime_credential_store.rs`
+  - 原生本地 `nsec / hexKey` credential 的独立 SQLite store。
+- `src-tauri/src/infra/auth_runtime_state_store.rs`
+  - 原生 `authRuntime` session 的独立 SQLite store。
+- `src-tauri/src/domain/chat.rs`
+  - `LoginCompletionInput / AuthSessionSummary / AuthRuntimeSummary / AuthRuntimeBindingSummary / SignedNostrEvent / MessageReplyPreview / UpdateAuthRuntimeInput / ShellStateSnapshot`
+- `src/types/chat.ts`
+  - 前端 `MessageItem.replyTo / MessageReplyPreview / SendMessageInput.replyToMessageId / SendFileMessageInput` 合同。
+- `src/services/chatMutations.ts`
+  - 前端 `send_chat_file_message / send_chat_image_message` invoke 封装，以及其他聊天 mutation invoke helper。
+- `src/features/chat/imageMessageMeta.ts`
+  - image meta payload 的 encode/decode helper；当前本地图片预览就是通过这层 JSON payload 持久化的。
+- `src/services/chatShell.ts`
+  - 前端 invoke 封装，包括 `updateAuthRuntime()` 和 `syncAuthRuntime()`
+- `src/services/authRuntime.ts`
+  - 前端 `authRuntime` 与 `authRuntimeBinding` 的 fallback/helper 逻辑
+- `src/features/shell/useChatShell.ts`
+  - `completeLogin()` / `logout()` / `updateAuthRuntime()`，`pending` auth runtime 的 native 轮询同步，以及 reply state、mention composer state、message detail overlay、composer send、attachment send/image send，以及消息 copy/report draft clipboard notice 都在这里。
+- `src/components/ChatPane.vue`
+  - reply 按钮、message detail 按钮、message action menu、report reason dialog、mention suggestion list、composer reply bar、paperclip file picker、图片预览、消息气泡 reply preview、mention 高亮和 send/retry UI 都在这里。
+- `src/components/MessageDetailPage.vue`
+  - 第一版桌面 message detail overlay，现还可直接显示 image preview，并展示内容/回执/已签事件元数据与 copy/retry。
+- `src/components/LoginScreen.vue`
+  - onboarding 表单输入和 access kind 推导
+- `src/components/SettingsDetailPage.vue`
+  - 当前 auth 摘要展示，包括新的 remote binding 诊断
+- `tmp/xchat-app-main/pubspec.yaml`
+  - 原 Flutter 工程真正的模块清单；下个 session 做功能对照时应以这里的 package 组合为准，而不是只看根 `lib/`
+- `tmp/xchat-app-main/lib/main.dart`
+  - 原工程入口；可快速确认 push / scheme / locale / lifecycle / heartbeat 这类全局能力
+- `tmp/xchat-app-main/packages/business_modules/ox_home/lib`
+  - 原项目主壳、会话列表、归档、home scaffold
+- `tmp/xchat-app-main/packages/business_modules/ox_login/lib`
+  - 原项目 onboarding、private circle、checkout/restore 流
+- `tmp/xchat-app-main/packages/business_modules/ox_usercenter/lib`
+  - 原项目 settings / profile / keys / QR / file server
+- `tmp/xchat-app-main/packages/business_modules/ox_chat/lib`
+  - 原项目聊天页、找人、建群、reply/mention/media 等主交互
+- `tmp/xchat-app-main/packages/business_modules/ox_chat_ui/lib`
+  - 原项目 chat UI 组件层；typing/unread/theme/config 等细节都在这里
+- `tmp/xchat-app-main/packages/base_framework/ox_common/lib`
+  - 原项目 push / upload / purchase / scheme / scan / permission / tor 等基础设施
+- `tmp/xchat-app-main/packages/base_framework/ox_call/lib`
+  - 原项目通话能力；当前桌面版基本尚未对位
+
+## 验证基线
+
+2026-04-19 本地已确认:
+
+- `pnpm check` 通过
+- `cargo test --manifest-path src-tauri/Cargo.toml` 通过
+  - Rust `117 + 13` 全绿
+
+2026-04-20 本地已确认:
+
+- `pnpm check` 通过
+- `cargo test --manifest-path src-tauri/Cargo.toml` 通过
+  - Rust `162 + 17` 全绿
+- `git diff --check` 通过
+
+## 风险与注意
+
+- 仓库当前是 dirty worktree，不要用 `git reset --hard` 之类的方式清场。
+- 当前已经引入轻量 `bech32 / secp256k1 / sha2` 依赖并用于本地 key 校验、canonical `npub` 派生和最小 text-note 签名；如果下一步要做完整 signer 握手、NIP 事件签名发布或更高层 nostr session 管理，仍可能需要继续补库或抽独立 auth runtime。
+- 现有 transport runtime 很完整，但它服务的是 circle/relay/runtime 生命周期，不等于 auth runtime；不要直接把两者混成一个状态机。

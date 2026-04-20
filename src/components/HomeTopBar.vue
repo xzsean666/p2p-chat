@@ -33,6 +33,10 @@ const titleText = computed(() => {
 const statusClass = computed(() => {
   return `status-${props.circle?.status ?? "closed"}`;
 });
+
+const addButtonLabel = computed(() => {
+  return props.circle ? "New message" : "Add or restore circle";
+});
 </script>
 
 <template>
@@ -56,7 +60,7 @@ const statusClass = computed(() => {
       icon="pi pi-plus"
       rounded
       severity="contrast"
-      aria-label="New message"
+      :aria-label="addButtonLabel"
       @click="emit('add-click')"
     />
   </header>

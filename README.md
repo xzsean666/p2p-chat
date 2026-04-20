@@ -76,3 +76,4 @@ pnpm desktop:build
 - `Project.md`: 项目定位、架构分层、里程碑和开发约束。
 - `Agent.md`: 协作规范、目录职责和交付要求。
 - `BuildProgress.md`: 当前阶段、已完成事项和下一步计划。
+- `NextSession.md`: 给下一次新 session 的交接上下文、验证基线和建议切口。

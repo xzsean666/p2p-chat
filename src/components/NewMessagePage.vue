@@ -20,7 +20,7 @@ const emit = defineEmits<{
   (event: "close"): void;
   (event: "open-contact", contactId: string): void;
   (event: "select-contact", contactId: string): void;
-  (event: "start-self"): void;
+  (event: "open-self-confirm"): void;
   (event: "open-group-select"): void;
   (event: "open-find-people"): void;
 }>();
@@ -47,6 +47,10 @@ const filteredContacts = computed(() => {
 });
 
 const highlightedContacts = computed(() => filteredContacts.value.slice(0, 10));
+
+function contactMetaLine(contact: ContactItem) {
+  return contact.subtitle ? `${contact.handle} · ${contact.subtitle}` : contact.handle;
+}
 
 async function copyInviteLink() {
   try {
@@ -84,7 +88,7 @@ async function copyInviteLink() {
         </div>
 
         <div class="quick-grid">
-          <button type="button" class="quick-card" @click="emit('start-self')">
+          <button type="button" class="quick-card" @click="emit('open-self-confirm')">
             <SelfChatIcon size="md" />
             <div class="quick-copy">
               <strong>Note to Self</strong>
@@ -154,7 +158,7 @@ async function copyInviteLink() {
                   <strong>{{ contact.name }}</strong>
                   <span v-if="contact.online" class="online-dot"></span>
                 </div>
-                <p>{{ contact.handle }} · {{ contact.subtitle }}</p>
+                <p>{{ contactMetaLine(contact) }}</p>
               </div>
             </button>
 

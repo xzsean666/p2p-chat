@@ -103,6 +103,7 @@ pub fn recovery_action_input(
         active_circle_id,
         use_tor_network: runtime.use_tor_network,
         experimental_transport: runtime.experimental_transport,
+        sync_since_created_at: None,
     }
 }
 

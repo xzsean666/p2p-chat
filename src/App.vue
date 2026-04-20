@@ -16,7 +16,9 @@ import GroupProfilePage from "./components/GroupProfilePage.vue";
 import HomeTopBar from "./components/HomeTopBar.vue";
 import LaunchScreen from "./components/LaunchScreen.vue";
 import LoginScreen from "./components/LoginScreen.vue";
+import MessageDetailPage from "./components/MessageDetailPage.vue";
 import NewMessagePage from "./components/NewMessagePage.vue";
+import SelfChatConfirmPage from "./components/SelfChatConfirmPage.vue";
 import SelectGroupMembersPage from "./components/SelectGroupMembersPage.vue";
 import SettingsDetailPage from "./components/SettingsDetailPage.vue";
 import SessionList from "./components/SessionList.vue";
@@ -30,7 +32,11 @@ const {
   searchText,
   composerText,
   isAuthenticated,
+  authSession,
+  authRuntime,
+  authRuntimeBinding,
   userProfile,
+  restorableCircles,
   showLaunch,
   showCircleSwitcher,
   showSettingsDrawer,
@@ -50,6 +56,10 @@ const {
   filteredSessions,
   selectedSession,
   activeMessages,
+  replyingToMessage,
+  mentionSuggestions,
+  showMentionSuggestions,
+  mentionSelectionIndex,
   canLoadOlderMessages,
   loadingOlderMessages,
   selectedContact,
@@ -57,9 +67,15 @@ const {
   selectedGroupMembers,
   transportSnapshot,
   transportNotice,
+  canSendMessages,
+  sendBlockedReason,
+  runtimeDiagnosticError,
   activeTransportDiagnostic,
   activeOverlayPage,
   activeOverlayContact,
+  activeOverlayMessageSession,
+  activeOverlayMessage,
+  activeOverlayMessageReplyTarget,
   activeOverlayCircle,
   activeOverlayTransportDiagnostic,
   activeOverlayDiscoveredPeers,
@@ -81,16 +97,28 @@ const {
   chooseCircle,
   toggleCircleSwitcher,
   openNewMessage,
+  openSelfChatConfirmPage,
   openFindPeoplePage,
   openCircleManagement,
   openCircleDetail,
   openDetailsDrawer,
   openContactProfile,
+  openMessageDetailPage,
   openGroupSelectMembersPage,
   openGroupCreatePage,
   openProfilePage,
   updateComposerText,
+  navigateMentionSuggestions,
+  selectMentionSuggestion,
+  startReplyToMessage,
+  cancelReplyToMessage,
+  copyMessageContent,
+  copyMessageAttachmentPath,
+  openMessageAttachment,
+  revealMessageAttachment,
+  reportMessage,
   loadOlderMessages,
+  sendAttachmentMessage,
   sendPreviewMessage,
   retryMessageDelivery,
   startConversation,
@@ -102,9 +130,12 @@ const {
   closeCircleOverlay,
   completeLogin,
   logout,
+  updateAuthRuntime,
+  syncAuthRuntimeNow,
   handleSessionAction,
   openArchivedSession,
   toggleContactBlock,
+  updateContactRemark,
   toggleGroupMute,
   leaveGroup,
   openMemberProfile,
@@ -119,6 +150,8 @@ const {
   addCircleFromDirectory,
   updateCircle,
   removeCircle,
+  restoreCircleAccess,
+  forgetRestorableCircle,
   runTransportCircleAction,
   updateAppPreferences,
   updateNotificationPreferences,
@@ -139,11 +172,13 @@ const {
     :user="userProfile"
     :circles="circles"
     :active-circle-id="activeCircleId"
+    :restorable-count="restorableCircles.length"
     :sections="settingsSections"
     :phase="bootstrapStatus?.phase"
     :show-logout="isAuthenticated"
     @select-circle="chooseCircle"
     @join-circle="openCircleManagement"
+    @open-restore="handleSettingsAction('restore')"
     @open-circle-detail="openCircleDetail"
     @item-click="handleSettingsAction"
     @logout="logout"
@@ -166,11 +201,14 @@ const {
       key="circle-directory"
       :circles="circles"
       :active-circle-id="activeCircleId"
+      :restorable-circles="restorableCircles"
       :transport-snapshot="transportSnapshot"
       @close="closeTopOverlayPage"
       @select-circle="chooseCircle"
       @open-circle-detail="openCircleDetail"
       @add-circle="addCircleFromDirectory"
+      @restore-circle="restoreCircleAccess"
+      @forget-restorable-circle="forgetRestorableCircle"
     />
 
     <CircleDetailPage
@@ -203,8 +241,12 @@ const {
       :setting-id="activeOverlayPage.settingId"
       :phase="bootstrapStatus?.phase"
       :version="appVersion"
+      :auth-session="authSession"
+      :auth-runtime="authRuntime"
+      :auth-runtime-binding="authRuntimeBinding"
       :active-circle="activeCircle"
       :circles-count="circles.length"
+      :restorable-circles="restorableCircles"
       :session-count="sessions.length"
       :preferences="appPreferences"
       :notifications="notificationPreferences"
@@ -217,6 +259,10 @@ const {
       @update-preferences="updateAppPreferences"
       @update-notifications="updateNotificationPreferences"
       @update-advanced="updateAdvancedPreferences"
+      @update-auth-runtime="updateAuthRuntime"
+      @sync-auth-runtime="syncAuthRuntimeNow"
+      @restore-circle="restoreCircleAccess"
+      @forget-restorable-circle="forgetRestorableCircle"
     />
 
     <NewMessagePage
@@ -229,9 +275,17 @@ const {
       @close="closeTopOverlayPage"
       @open-contact="openContactProfile"
       @select-contact="startConversation"
-      @start-self="startSelfChat"
+      @open-self-confirm="openSelfChatConfirmPage"
       @open-group-select="openGroupSelectMembersPage"
       @open-find-people="openFindPeoplePage"
+    />
+
+    <SelfChatConfirmPage
+      v-else-if="activeOverlayPage?.kind === 'self-chat-confirm'"
+      key="self-chat-confirm"
+      :circle="activeCircle"
+      @close="closeTopOverlayPage"
+      @confirm="startSelfChat"
     />
 
     <SelectGroupMembersPage
@@ -282,9 +336,26 @@ const {
       v-else-if="activeOverlayPage?.kind === 'contact'"
       :key="`contact-${activeOverlayPage.contactId}`"
       :contact="activeOverlayContact"
+      :active-circle="activeCircle"
       @close="closeTopOverlayPage"
+      @open-join-circle="openFindPeoplePage('join-circle')"
       @toggle-block="toggleContactBlock"
+      @save-remark="updateContactRemark"
       @send-message="sendMessageFromProfile"
+    />
+
+    <MessageDetailPage
+      v-else-if="activeOverlayPage?.kind === 'message-detail'"
+      :key="`message-${activeOverlayPage.sessionId}-${activeOverlayPage.messageId}`"
+      :session="activeOverlayMessageSession"
+      :message="activeOverlayMessage"
+      :replied-message="activeOverlayMessageReplyTarget"
+      :can-send-messages="canSendMessages"
+      @close="closeTopOverlayPage"
+      @retry-message="retryMessageDelivery"
+      @open-attachment="openMessageAttachment($event, activeOverlayPage.sessionId)"
+      @open-replied-message="openMessageDetailPage($event, activeOverlayPage.sessionId)"
+      @reveal-attachment="revealMessageAttachment($event, activeOverlayPage.sessionId)"
     />
 
     <GroupProfilePage
@@ -350,6 +421,30 @@ const {
   </Transition>
 
   <main class="app-shell">
+    <Transition name="notice-slide">
+      <section
+        v-if="transportNotice"
+        class="transport-notice"
+        :class="`transport-notice-${transportNotice.tone}`"
+        :role="transportNotice.tone === 'warn' ? 'alert' : 'status'"
+        :aria-live="transportNotice.tone === 'warn' ? 'assertive' : 'polite'"
+      >
+        <div class="transport-notice-copy">
+          <strong>{{ transportNotice.title }}</strong>
+          <p>{{ transportNotice.detail }}</p>
+        </div>
+
+        <Button
+          icon="pi pi-times"
+          text
+          rounded
+          aria-label="Dismiss transport notice"
+          class="transport-notice-dismiss"
+          @click="dismissTransportNotice"
+        />
+      </section>
+    </Transition>
+
     <template v-if="isAuthenticated">
       <HomeTopBar
         :user="userProfile"
@@ -358,30 +453,6 @@ const {
         @title-click="toggleCircleSwitcher"
         @add-click="openNewMessage"
       />
-
-      <Transition name="notice-slide">
-        <section
-          v-if="transportNotice"
-          class="transport-notice"
-          :class="`transport-notice-${transportNotice.tone}`"
-          :role="transportNotice.tone === 'warn' ? 'alert' : 'status'"
-          :aria-live="transportNotice.tone === 'warn' ? 'assertive' : 'polite'"
-        >
-          <div class="transport-notice-copy">
-            <strong>{{ transportNotice.title }}</strong>
-            <p>{{ transportNotice.detail }}</p>
-          </div>
-
-          <Button
-            icon="pi pi-times"
-            text
-            rounded
-            aria-label="Dismiss transport notice"
-            class="transport-notice-dismiss"
-            @click="dismissTransportNotice"
-          />
-        </section>
-      </Transition>
 
       <Transition name="overlay-fade">
         <div v-if="showCircleSwitcher" class="overlay-layer">
@@ -392,6 +463,7 @@ const {
               :active-circle-id="activeCircleId"
               @select="chooseCircle"
               @join="openCircleManagement"
+              @restore="handleSettingsAction('restore')"
             />
           </div>
         </div>
@@ -405,19 +477,39 @@ const {
           :active-circle="activeCircle"
           :archived-count="archivedSessionsForCircle.length"
           @select-session="selectSession"
-          @empty-action="activeCircle?.type === 'paid' ? openFindPeoplePage('join-circle') : openFindPeoplePage('chat')"
+          @empty-action="!activeCircle || activeCircle.type === 'paid' ? openFindPeoplePage('join-circle') : openFindPeoplePage('chat')"
           @session-action="handleSessionAction"
           @open-archived="openArchivedPage"
         />
 
         <ChatPane
           :session="selectedSession"
+          :active-circle="activeCircle"
           :messages="activeMessages"
+          :replying-to-message="replyingToMessage"
+          :mention-suggestions="mentionSuggestions"
+          :show-mention-suggestions="showMentionSuggestions"
+          :mention-selection-index="mentionSelectionIndex"
           :can-load-older-messages="canLoadOlderMessages"
           :loading-older-messages="loadingOlderMessages"
           :composer-text="composerText"
+          :show-message-info="advancedPreferences.showMessageInfo"
+          :can-send-messages="canSendMessages"
+          :send-blocked-reason="sendBlockedReason"
+          :runtime-error="runtimeDiagnosticError"
           @load-older="loadOlderMessages"
           @update:composer-text="updateComposerText"
+          @mention-navigate="navigateMentionSuggestions"
+          @mention-select="selectMentionSuggestion"
+          @reply-message="startReplyToMessage"
+          @cancel-reply="cancelReplyToMessage"
+          @open-message-detail="openMessageDetailPage"
+          @attach-file="sendAttachmentMessage"
+          @copy-message="copyMessageContent"
+          @copy-attachment-path="copyMessageAttachmentPath"
+          @open-attachment="openMessageAttachment"
+          @report-message="reportMessage($event.messageId, $event.reason)"
+          @reveal-attachment="revealMessageAttachment"
           @send="sendPreviewMessage"
           @retry-message="retryMessageDelivery"
           @open-profile="openProfilePage"
@@ -429,6 +521,7 @@ const {
     <LoginScreen
       v-else
       :circles="circles"
+      :restorable-circles="restorableCircles"
       :profile="userProfile"
       @complete="completeLogin"
     />

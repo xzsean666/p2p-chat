@@ -1,4 +1,7 @@
-use crate::domain::transport::{TransportChatEffects, TransportCircleActionInput};
+use crate::domain::transport::{
+    TransportChatEffects, TransportCircleActionInput, TransportRelaySyncFilter,
+    TransportRuntimeOutboundMessage,
+};
 use crate::domain::transport_repository::TransportCache;
 use crate::domain::transport_runtime_registry::TransportRuntimeProfile;
 
@@ -9,5 +12,7 @@ pub trait TransportRuntimeManager {
         cache: &mut TransportCache,
         profiles: Vec<TransportRuntimeProfile>,
         action: Option<&TransportCircleActionInput>,
+        outbound_messages: &[TransportRuntimeOutboundMessage],
+        relay_sync_filters: &[TransportRelaySyncFilter],
     ) -> Result<TransportChatEffects, String>;
 }

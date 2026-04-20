@@ -545,6 +545,9 @@ mod tests {
                 unread_session_ids: vec!["session-1".into()],
                 peer_count: 2,
                 session_sync_count: 1,
+                sync_since_created_at: None,
+                relay_sync_filters: Vec::new(),
+                outbound_messages: Vec::new(),
             }),
         )
         .expect("queue event should be written");

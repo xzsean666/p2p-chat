@@ -4,7 +4,9 @@ export type OverlayPage =
   | { kind: "circle-directory" }
   | { kind: "circle-detail"; circleId: string }
   | { kind: "settings-detail"; settingId: SettingPageId }
+  | { kind: "message-detail"; sessionId: string; messageId: string }
   | { kind: "new-message" }
+  | { kind: "self-chat-confirm" }
   | { kind: "group-select-members" }
   | { kind: "group-create"; memberContactIds: string[] }
   | { kind: "find-people"; mode?: "chat" | "join-circle" }
@@ -52,6 +54,7 @@ function parseOverlayPageRecord(value: unknown): OverlayPage | null {
   switch (kind) {
     case "circle-directory":
     case "new-message":
+    case "self-chat-confirm":
     case "group-select-members":
     case "archived":
       return { kind };
@@ -74,6 +77,10 @@ function parseOverlayPageRecord(value: unknown): OverlayPage | null {
     case "settings-detail":
       return typeof record.settingId === "string" && isSettingPageId(record.settingId)
         ? { kind, settingId: record.settingId }
+        : null;
+    case "message-detail":
+      return typeof record.sessionId === "string" && typeof record.messageId === "string"
+        ? { kind, sessionId: record.sessionId, messageId: record.messageId }
         : null;
     case "contact":
       return typeof record.contactId === "string"
@@ -133,8 +140,12 @@ export function overlayRouteHash(pages: OverlayPage[]): string {
       return `#/circles/${encodeURIComponent(page.circleId)}`;
     case "settings-detail":
       return `#/settings/${encodeURIComponent(page.settingId)}`;
+    case "message-detail":
+      return `#/messages/${encodeURIComponent(page.sessionId)}/${encodeURIComponent(page.messageId)}`;
     case "new-message":
       return "#/new-message";
+    case "self-chat-confirm":
+      return "#/new-message/self";
     case "group-select-members":
       return "#/new-group/select";
     case "group-create":
@@ -184,6 +195,14 @@ export function parseOverlayRouteHash(hash: string): OverlayPage[] {
 
   if (segments[0] === "settings" && segments[1] && isSettingPageId(segments[1])) {
     return [{ kind: "settings-detail", settingId: segments[1] }];
+  }
+
+  if (segments[0] === "messages" && segments[1] && segments[2]) {
+    return [{ kind: "message-detail", sessionId: segments[1], messageId: segments[2] }];
+  }
+
+  if (segments[0] === "new-message" && segments[1] === "self") {
+    return [{ kind: "self-chat-confirm" }];
   }
 
   if (segments[0] === "new-message") {

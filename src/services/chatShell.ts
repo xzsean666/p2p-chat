@@ -9,27 +9,61 @@ import type {
   ChatSessionMessageUpdates,
   ChatSessionMessagesPage,
   ChatShellSnapshot,
+  LoginCompletionInput,
   LoadSessionMessageUpdatesInput,
   LoadSessionMessagesInput,
   MessageItem,
   PersistedShellState,
+  ShellStateSnapshot,
   SessionItem,
+  UpdateAuthRuntimeInput,
 } from "../types/chat";
 
 function cloneState<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function hasTauriRuntime() {
+  const globalWindow = globalThis as typeof globalThis & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  };
+
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in globalWindow || "__TAURI__" in globalWindow);
+}
+
+async function invokeDesktopShellCommand<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T | null> {
+  if (!hasTauriRuntime()) {
+    return null;
+  }
+
+  const result = await invoke<T>(command, args);
+  return cloneState(result);
+}
+
 export async function loadChatShellSnapshot(
   fallback: PersistedShellState,
 ): Promise<ChatShellSnapshot> {
-  try {
-    const snapshot = await invoke<ChatShellSnapshot>("load_chat_shell_snapshot");
-    return cloneState(snapshot);
-  } catch {
-    const persistedState = loadLocalShellState(fallback);
-    return createChatShellSnapshotFromPersistedState(persistedState);
+  const snapshot = await invokeDesktopShellCommand<ChatShellSnapshot>("load_chat_shell_snapshot");
+  if (snapshot) {
+    return snapshot;
   }
+
+  return loadChatShellSnapshotLocally(fallback);
+}
+
+export function loadChatShellSnapshotLocally(
+  fallback: PersistedShellState,
+): ChatShellSnapshot {
+  const persistedState = loadLocalShellState(fallback);
+  return createChatShellSnapshotFromPersistedState(persistedState);
+}
+
+export async function syncAuthRuntime(): Promise<ShellStateSnapshot | null> {
+  return invokeDesktopShellCommand<ShellStateSnapshot>("sync_auth_runtime");
 }
 
 export function persistChatShellSnapshotLocally(snapshot: ChatShellSnapshot) {
@@ -40,13 +74,41 @@ export async function saveChatShellSnapshot(snapshot: ChatShellSnapshot) {
   const nextSnapshot = cloneState(snapshot);
   persistChatShellSnapshotLocally(nextSnapshot);
 
-  try {
-    await invoke("save_chat_shell_snapshot", {
-      snapshot: nextSnapshot,
-    });
-  } catch {
-    // Browser mode keeps the local shell snapshot as the durable fallback.
+  if (!hasTauriRuntime()) {
+    return;
   }
+
+  await invoke("save_chat_shell_snapshot", {
+    snapshot: nextSnapshot,
+  });
+}
+
+export async function bootstrapAuthSession(
+  input: LoginCompletionInput,
+): Promise<ShellStateSnapshot | null> {
+  return invokeDesktopShellCommand<ShellStateSnapshot>("bootstrap_auth_session", {
+    input: cloneState(input),
+  });
+}
+
+export async function completeLogin(
+  input: LoginCompletionInput,
+): Promise<ChatShellSnapshot | null> {
+  return invokeDesktopShellCommand<ChatShellSnapshot>("complete_login", {
+    input: cloneState(input),
+  });
+}
+
+export async function logoutChatSession(): Promise<ChatShellSnapshot | null> {
+  return invokeDesktopShellCommand<ChatShellSnapshot>("logout_chat_session");
+}
+
+export async function updateAuthRuntime(
+  input: UpdateAuthRuntimeInput,
+): Promise<ShellStateSnapshot | null> {
+  return invokeDesktopShellCommand<ShellStateSnapshot>("update_auth_runtime", {
+    input: cloneState(input),
+  });
 }
 
 function loadSessionMessagesFallback(
@@ -71,20 +133,26 @@ function loadSessionMessagesFallback(
   };
 }
 
+export function loadChatSessionMessagesLocally(
+  input: LoadSessionMessagesInput,
+  fallbackStore: Record<string, MessageItem[]>,
+): ChatSessionMessagesPage {
+  return loadSessionMessagesFallback(cloneState(input), fallbackStore);
+}
+
 export async function loadChatSessionMessages(
   input: LoadSessionMessagesInput,
   fallbackStore: Record<string, MessageItem[]>,
 ): Promise<ChatSessionMessagesPage> {
   const nextInput = cloneState(input);
-
-  try {
-    const page = await invoke<ChatSessionMessagesPage>("load_chat_session_messages", {
-      input: nextInput,
-    });
-    return cloneState(page);
-  } catch {
+  if (!hasTauriRuntime()) {
     return loadSessionMessagesFallback(nextInput, fallbackStore);
   }
+
+  const page = await invoke<ChatSessionMessagesPage>("load_chat_session_messages", {
+    input: nextInput,
+  });
+  return cloneState(page);
 }
 
 function loadSessionMessageUpdatesFallback(
@@ -110,40 +178,58 @@ function loadSessionMessageUpdatesFallback(
   };
 }
 
+export function loadChatSessionMessageUpdatesLocally(
+  input: LoadSessionMessageUpdatesInput,
+  fallbackStore: Record<string, MessageItem[]>,
+): ChatSessionMessageUpdates {
+  return loadSessionMessageUpdatesFallback(cloneState(input), fallbackStore);
+}
+
 export async function loadChatSessionMessageUpdates(
   input: LoadSessionMessageUpdatesInput,
   fallbackStore: Record<string, MessageItem[]>,
 ): Promise<ChatSessionMessageUpdates> {
   const nextInput = cloneState(input);
-
-  try {
-    const updates = await invoke<ChatSessionMessageUpdates>("load_chat_session_message_updates", {
-      input: nextInput,
-    });
-    return cloneState(updates);
-  } catch {
+  if (!hasTauriRuntime()) {
     return loadSessionMessageUpdatesFallback(nextInput, fallbackStore);
   }
+
+  const updates = await invoke<ChatSessionMessageUpdates>("load_chat_session_message_updates", {
+    input: nextInput,
+  });
+  return cloneState(updates);
 }
 
 export async function loadChatSessionsOverview(
   fallbackSessions: SessionItem[],
 ): Promise<SessionItem[]> {
-  try {
-    const sessions = await invoke<SessionItem[]>("load_chat_sessions_overview");
-    return cloneState(sessions);
-  } catch {
-    return cloneState(fallbackSessions);
+  if (!hasTauriRuntime()) {
+    return loadChatSessionsOverviewLocally(fallbackSessions);
   }
+
+  const sessions = await invoke<SessionItem[]>("load_chat_sessions_overview");
+  return cloneState(sessions);
+}
+
+export function loadChatSessionsOverviewLocally(
+  fallbackSessions: SessionItem[],
+): SessionItem[] {
+  return cloneState(fallbackSessions);
 }
 
 export async function loadChatDomainOverview(
   fallbackOverview: ChatDomainOverview,
 ): Promise<ChatDomainOverview> {
-  try {
-    const overview = await invoke<ChatDomainOverview>("load_chat_domain_overview");
-    return cloneState(overview);
-  } catch {
+  if (!hasTauriRuntime()) {
     return cloneState(fallbackOverview);
   }
+
+  const overview = await invoke<ChatDomainOverview>("load_chat_domain_overview");
+  return cloneState(overview);
+}
+
+export function loadChatDomainOverviewLocally(
+  fallbackOverview: ChatDomainOverview,
+): ChatDomainOverview {
+  return cloneState(fallbackOverview);
 }

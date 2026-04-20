@@ -1,5 +1,6 @@
 export type SessionKind = "direct" | "group" | "self";
-export type MessageKind = "text" | "file" | "audio" | "system";
+export type MessageKind = "text" | "image" | "video" | "file" | "audio" | "system";
+export type ChatMediaKind = "file" | "image" | "video";
 export type MessageAuthor = "me" | "peer" | "system";
 export type MessageDeliveryStatus = "sending" | "sent" | "failed";
 export type MessageSyncSource = "local" | "relay" | "system";
@@ -16,6 +17,7 @@ export type LoginAccessKind =
   | "hexKey"
   | "bunker"
   | "nostrConnect";
+export type AuthRuntimeState = "localProfile" | "pending" | "connected" | "failed";
 export type TransportHealth = "online" | "degraded" | "offline";
 export type RelayProtocol = "websocket" | "mesh" | "invite";
 export type TransportEngineKind = "mock" | "nativePreview";
@@ -70,6 +72,7 @@ export interface LoginAccessInput {
 export interface LoginAccessSummary {
   kind: LoginAccessKind;
   label: string;
+  pubkey?: string;
 }
 
 export interface AuthSessionSummary {
@@ -79,11 +82,45 @@ export interface AuthSessionSummary {
   loggedInAt: string;
 }
 
+export interface AuthRuntimeSummary {
+  state: AuthRuntimeState;
+  loginMethod: LoginMethod;
+  accessKind: LoginAccessKind;
+  label: string;
+  pubkey?: string;
+  error?: string;
+  canSendMessages: boolean;
+  sendBlockedReason?: string;
+  persistedInNativeStore: boolean;
+  credentialPersistedInNativeStore: boolean;
+  updatedAt: string;
+}
+
+export interface AuthRuntimeBindingSummary {
+  accessKind: LoginAccessKind;
+  endpoint: string;
+  connectionPubkey?: string;
+  relayCount: number;
+  hasSecret: boolean;
+  requestedPermissions: string[];
+  clientName?: string;
+  persistedInNativeStore: boolean;
+  updatedAt: string;
+}
+
+export interface UpdateAuthRuntimeInput {
+  state: AuthRuntimeState;
+  error?: string;
+  updatedAt?: string;
+  label?: string;
+}
+
 export interface LoginCompletionInput {
   method: LoginMethod;
   access: LoginAccessInput;
   userProfile: UserProfile;
   circleSelection: LoginCircleSelectionInput;
+  loggedInAt?: string;
 }
 
 export interface CircleItem {
@@ -94,6 +131,17 @@ export interface CircleItem {
   status: CircleStatus;
   latency: string;
   description: string;
+}
+
+export interface RestoreCircleInput {
+  name: string;
+  relay: string;
+  type: CircleType;
+  description: string;
+}
+
+export interface RestorableCircleEntry extends RestoreCircleInput {
+  archivedAt: string;
 }
 
 export interface ContactItem {
@@ -137,6 +185,27 @@ export interface MessageItem {
   remoteId?: string;
   syncSource?: MessageSyncSource;
   ackedAt?: string;
+  signedNostrEvent?: SignedNostrEvent;
+  replyTo?: MessageReplyPreview;
+}
+
+export interface SignedNostrEvent {
+  eventId: string;
+  pubkey: string;
+  createdAt: number;
+  kind: number;
+  tags: string[][];
+  content: string;
+  signature: string;
+}
+
+export interface MessageReplyPreview {
+  messageId: string;
+  remoteId?: string;
+  author: MessageAuthor;
+  authorLabel: string;
+  kind: MessageKind;
+  snippet: string;
 }
 
 export interface SettingItem {
@@ -202,7 +271,10 @@ export interface ChatDomainOverview {
 export interface PersistedShellState {
   isAuthenticated: boolean;
   authSession: AuthSessionSummary | null;
+  authRuntime: AuthRuntimeSummary | null;
+  authRuntimeBinding: AuthRuntimeBindingSummary | null;
   userProfile: UserProfile;
+  restorableCircles: RestorableCircleEntry[];
   circles: CircleItem[];
   appPreferences: AppPreferences;
   notificationPreferences: NotificationPreferences;
@@ -218,7 +290,10 @@ export interface PersistedShellState {
 export interface ShellStateSnapshot {
   isAuthenticated: boolean;
   authSession: AuthSessionSummary | null;
+  authRuntime: AuthRuntimeSummary | null;
+  authRuntimeBinding: AuthRuntimeBindingSummary | null;
   userProfile: UserProfile;
+  restorableCircles: RestorableCircleEntry[];
   appPreferences: AppPreferences;
   notificationPreferences: NotificationPreferences;
   advancedPreferences: AdvancedPreferences;
@@ -260,6 +335,52 @@ export interface ChatSessionMessageUpdates {
 export interface SendMessageInput {
   sessionId: string;
   body: string;
+  replyToMessageId?: string;
+}
+
+export interface SendFileMessageInput {
+  sessionId: string;
+  name: string;
+  meta?: string;
+  replyToMessageId?: string;
+}
+
+export interface SendImageMessageInput {
+  sessionId: string;
+  name: string;
+  meta: string;
+  replyToMessageId?: string;
+}
+
+export interface SendVideoMessageInput {
+  sessionId: string;
+  name: string;
+  meta: string;
+  replyToMessageId?: string;
+}
+
+export interface StoreChatMediaAssetInput {
+  kind: ChatMediaKind;
+  name: string;
+  dataUrl: string;
+}
+
+export interface StoredChatMediaAsset {
+  localPath: string;
+}
+
+export interface CleanupChatMediaAssetsResult {
+  removedCount: number;
+}
+
+export interface CacheChatMessageMediaInput {
+  sessionId: string;
+  messageId: string;
+}
+
+export interface CachedChatMessageMediaResult {
+  seed: ChatDomainSeed;
+  localPath: string;
 }
 
 export interface UpdateSessionDraftInput {
@@ -341,6 +462,11 @@ export interface UpdateCircleInput {
   circleId: string;
   name: string;
   description: string;
+}
+
+export interface UpdateContactRemarkInput {
+  contactId: string;
+  remark: string;
 }
 
 export interface UpdateGroupNameInput {
@@ -460,6 +586,7 @@ export interface TransportCircleActionInput {
   activeCircleId?: string;
   useTorNetwork: boolean;
   experimentalTransport: boolean;
+  syncSinceCreatedAt?: number;
 }
 
 export interface TransportMutationResult {

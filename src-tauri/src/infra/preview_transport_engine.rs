@@ -433,6 +433,7 @@ mod tests {
                     active_circle_id: Some("circle-1".into()),
                     use_tor_network: false,
                     experimental_transport: true,
+                    sync_since_created_at: None,
                 },
             )
             .expect("preview connect should succeed");
@@ -502,6 +503,7 @@ mod tests {
                     active_circle_id: Some("circle-1".into()),
                     use_tor_network: false,
                     experimental_transport: true,
+                    sync_since_created_at: None,
                 },
             )
             .expect("preview sync should succeed");

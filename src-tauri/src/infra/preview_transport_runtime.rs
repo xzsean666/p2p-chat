@@ -105,6 +105,8 @@ mod tests {
             profiles[0].launch_arguments,
             vec![
                 "preview-relay".to_string(),
+                "--relay-url".to_string(),
+                "wss://relay.example.com".to_string(),
                 "--circle".to_string(),
                 "circle-1".to_string(),
                 "--session".to_string(),
@@ -177,6 +179,8 @@ mod tests {
             vec![
                 "preview-relay".to_string(),
                 "--tor".to_string(),
+                "--relay-url".to_string(),
+                "wss://relay.example.com".to_string(),
                 "--circle".to_string(),
                 "circle-1".to_string(),
                 "--session".to_string(),

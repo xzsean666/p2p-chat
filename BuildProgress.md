@@ -1,6 +1,6 @@
 # BuildProgress
 
-更新时间: 2026-04-18
+更新时间: 2026-04-20
 
 ## 当前阶段
 
@@ -11,7 +11,16 @@
 ## 差距清单
 
 - [x] 新增 `GapChecklist.md`，把当前与目标功能级克隆之间的缺口按 `P0 / P1 / P2` 固化为可执行清单。
-- [ ] 仍未完成的最高优先级缺口: 真实消息收发闭环、真实账号接入、消息模型扩展，以及更完整的消息增量存储能力（真实远端同步、回执、状态回写）。
+- [ ] 仍未完成的最高优先级缺口: 真实消息收发闭环、真实账号接入、消息模型扩展，以及更完整的消息增量存储能力（真实远端同步、更完整的网络级 publish/runtime、状态回写）。
+- [ ] 若以 `tmp/xchat-app-main` 的功能级克隆为目标，当前更大的缺口已不是桌面壳页面数量，而是数据面与平台能力面:
+  - transport 仍主要停留在 `mock / nativePreview`
+  - auth/signer 已越过纯 mock，但还不是完整可用 runtime
+  - `ox_usercenter / ox_chat_ui / ox_call / ox_common` 这几块与原项目相比仍有明显缺口
+- [ ] 当前阶段不建议把主要时间继续投在壳层 polish；更合理的主线仍是:
+  - 真实消息收发闭环
+  - 真实 signer/runtime 闭环
+  - richer message / media
+  - 用户中心最小桌面必需版
 
 ## 已完成
 
@@ -118,9 +127,36 @@
 - [x] 将 transport `SyncSessions` 的消息落域逻辑切到共享远端合并路径，builder 不再单独维护一套平行的会话摘要/联系人在线/消息去重规则。
 - [x] 补齐独立 `merge_remote_delivery_receipts` mutation，支持按 `remoteId` 合并远端投递回执并更新 `deliveryStatus / ackedAt`，为后续真实 runtime 回执回写预留正式入口。
 - [x] 为本地登录壳补齐 `authSession` 持久化合同，登录方式、非敏感凭据摘要和 circle 选择模式现在会进入 `ChatShellSnapshot / localStorage / Tauri shell store`，而不是只停留在表单层。
+- [x] 为 onboarding 增加 `bootstrap_auth_session` 原生命令：`completeLogin` 现在会优先把 access 输入校验、`authSession / userProfile` 写入和 restore 选择摘要下沉到 Rust shell store，再由前端继续走 circle 解析与壳状态刷新。
+- [x] 将 onboarding 的首个 circle 选择继续下沉到 `complete_login`：`existing / invite / custom / restore` 现在都优先由 Rust 统一解析、必要时直接落域，再返回完整 `ChatShellSnapshot` 给前端；浏览器/无 invoke 场景才回退到本地分步逻辑。
+- [x] 为退出登录补齐 `logout_chat_session` 原生命令：桌面端登出现在会优先清理 Rust shell store 并返回 logged-out snapshot，再由前端同步清空本地预览与 localStorage fallback；设置页 About 也会直接展示当前 `authSession` 摘要。
+- [x] 为 shell snapshot 增加独立 `authRuntime` 合同：现在会显式持久化 `localProfile / pending / connected / failed` 这层 auth runtime 状态，并在登录/登出、localStorage 归一化、Rust shell store 和 About 页之间保持一致，为后续真实 `nsec / signer` runtime 接入预留稳定边界。
+- [x] 细化 `authRuntime` 初始分流：`quickStart` 现在落为 `localProfile`，本地 `nsec / hexKey` 导入会直接标成 `connected`，`npub` 导入会明确标成 `failed` 并提示“只读无法签名”，`bunker / nostrconnect` 则继续保留为 `pending` 并暴露“远端 signer handshake 尚未实现”的原因。
+- [x] 为旧 shell snapshot 增加 `authRuntime` 自动回填：若历史 Tauri shell store 或浏览器 fallback 里只有 `authSession`、还没有新字段，读取时会按共享规则自动补出 `authRuntime`，避免升级后必须重新登录才能看到正确状态。
+- [x] 让 `authRuntime` 真正影响聊天发送: 主聊天窗现在会按 `authRuntime` 禁用 `Send / Retry`，并在 `pending / failed` 状态下直接展示阻塞原因；Rust `send_message / retry_message_delivery` 也会在桌面端读取 shell store 做同样的原生拒绝，避免 `npub` 只读导入或未完成 signer 握手的账号绕过前端继续假性发送消息。
+- [x] 为 `authRuntime` 增加独立 `update_auth_runtime` 原生命令与 About 诊断面板：桌面端现在已有正式的 signer/runtime 状态写回边界，可显式把 `pending -> connected/failed` 落进 Rust shell store，并在前端 fallback、本地持久化和发送门禁之间保持一致，为后续真实 signer 握手结果接入预留稳定入口。
+- [x] 为远端 signer/bunker 补齐独立 `auth_runtime_binding_store`：登录时现在会把 `bunker:// / nostrconnect://` 原始目标单独落进原生 SQLite `app_kv`，shell snapshot 里只保留脱敏 `authRuntimeBinding` 摘要；登出会清掉原生 binding，About 页也会显示当前 binding endpoint 与它是否真的已写入 native store，为后续真实 signer 握手读取原始目标预留稳定边界。
+- [x] 将 `authRuntime` 从 shell 字段进一步提升为独立 native session store：新增 `auth_runtime_state_store`，`bootstrap / complete_login / load / update / logout` 都会和这份原生 KV 对齐；旧 authenticated shell 若还没有这份 native state，也会在首次读取时自动从 `authSession / authRuntime` bootstrap 进去，避免下一步接真实 signer/runtime 结果时继续依赖整份 shell snapshot 改写。
+- [x] 为 `AuthRuntimeSummary` 增加来源位 `persistedInNativeStore`：桌面原生命令现在会明确返回 `native store`，浏览器 fallback 会显式标成 `local fallback`，About 页可直接展示这层诊断信息，不再需要根据运行环境或 binding 状态间接猜测。
+- [x] 为 `AuthRuntimeSummary` 再增加发送门禁诊断：`canSendMessages / sendBlockedReason` 现在直接进入共享合同，Rust shell helper、浏览器 fallback、聊天主窗禁用态和 About 页不再各自重复推导 `pending / failed` 的发送阻塞语义。
+- [x] 为本地 auth access 引入真实 key 校验与 canonical pubkey 归一化：新增 `src-tauri/src/app/auth_access.rs`，并接入轻量 `bech32 / secp256k1`；`nsec / hexKey` 现在会在 Rust 里真实验参并派生 canonical `npub`，`npub` 也会做真实 bech32/x-only pubkey 校验，`LoginAccessSummary / AuthRuntimeSummary` 则统一带上可供 About 页显示的已验证 `pubkey`。
+- [x] 为本地 secret 账号补齐独立 `auth_runtime_credential_store`：`bootstrap / complete_login / logout` 现在会把 `nsec / hexKey` 的 canonical secret hex 独立写入或清理 native store；`AuthRuntimeSummary` 也新增了 `credentialPersistedInNativeStore`，桌面端 `load_chat_shell_snapshot` 会显式校验当前 local-secret session 是否真的还有 native credential，缺失时会自动把 runtime 改判为 `failed`，不再只靠 shell 摘要假装 `connected`。
+- [x] 为远端 signer runtime 再补一层原生同步边界：新增 `sync_auth_runtime` 命令与前端 `pending` 轮询，壳层现在会定期从 `auth_runtime_state_store / auth_runtime_binding_store` 重新对齐当前 session；同时远端 `bunker / nostrconnect` runtime 若缺少匹配的 native binding，也会像本地 secret 缺 credential 一样自动降级为 `failed`，避免继续把仅存 shell 摘要当成可用 signer session。
+- [x] 将远端 `bunker / nostrconnect` 从“前缀字符串”推进到结构化 binding 诊断：Rust `auth_access` 现在会真实解析 remote binding URI，校验连接 pubkey、至少一个 `ws/wss` relay，以及 `nostrconnect` 必需的 `secret`；`AuthRuntimeBindingSummary` 也新增了 `connectionPubkey / relayCount / hasSecret / requestedPermissions / clientName`，桌面端与浏览器 fallback 的 About 页都能直接看到这层 signer 绑定诊断，为后续真实 auth runtime worker 复用同一份 binding 合同铺路。
+- [x] 将本地 `nsec / hexKey` 发送从“只会落本地 ack 占位”推进到最小真实 Nostr signer：Rust `auth_access` 新增 text-note signer，`send_message / retry_message_delivery` 会按当前 authenticated shell + native credential store 给本地文本消息产出稳定的 kind-1 `eventId`，并把它写进 `remoteId`；同时新增 `MessageItem.signedNostrEvent` 正式 envelope，`eventId / pubkey / createdAt / kind / tags / content / signature` 现在也会进 SQLite/message DTO；这样 `sending / failed / retry` 路径也能提前拿到真实远端去重键，而不是只能回退成 `relay-ack:*`。
+- [x] 将已签 `signedNostrEvent` 从“只落消息存储”推进到 transport/runtime preview publish 合同：`TransportRuntimeActionRequest` 新增 `outboundMessages`，`LocalTransportService` 会抽取当前 circle 下待发布的本地已签消息，`LocalTransportRuntimeManager` 会在 queue 写入成功后持久化 `transport_outbound_dispatch` 做最小判重，preview `p2p-chat-runtime` 也会把这些 outbound event 回写成 `MergeRemoteDeliveryReceipts`；`retry_message_delivery` 同时会清掉对应 dispatch 记录，避免 retry 被旧判重挡住。
+- [x] 将 websocket circle 的 preview publish 从“本地假 receipt”推进到“真实 relay socket write”：preview runtime launch arguments 现在会携带真实 `--relay-url`，`p2p-chat-runtime` 收到 `outboundMessages` 后会把 `signedNostrEvent` 编码成 Nostr `["EVENT", {...}]` client message 并写到 websocket relay；socket write 成功/失败会直接回写 `MergeRemoteDeliveryReceipts`，同时已补本地 ws relay 单测验证 payload。
+- [x] 将 websocket circle 的 preview publish 再推进到最小 NIP-20 ack：`p2p-chat-runtime` 现在在写出 `EVENT` 后会继续等待 relay `["OK", event_id, accepted, message]`；只有 `accepted=true` 才回 `sent`，`accepted=false`、超时、提前 close 或非法 ack 都会回 `failed`，并补 warn activity；同时已增加 relay reject 单测。
+- [x] 收紧本地 signed message 的发送语义：open circle 下带 `signedNostrEvent` 的本地消息不再被本地 runtime 自动翻成 `sent`，而是保持 `sending` 直到 runtime/relay receipt 真正回写。
+- [x] 将 outbound publish 从“只能手动 `Sync / SyncSessions` 触发”推进到 heartbeat 自动入队：`LocalTransportService` 会在 snapshot hydrate 时自动收集未派发的 signed outbound message，`LocalTransportRuntimeManager` 会单独写入 `publishOutboundMessages` runtime 输入事件，避免把自动 publish 伪装成 sync activity。
 - [x] 收紧桌面端登出语义：登出会清空本地 shell/domain 预览、重置登录态并立即持久化；Tauri 侧 `load_chat_shell_snapshot` 在未认证时也不再把 SQLite 里的旧 circles/session preview 回灌到登录页。
 - [x] 为无预载 circles 的 `existingAccount / signer` onboarding 补齐 `restore after login` 路径，避免在隐藏旧 circles 后把登录流程卡死。
 - [x] 将桌面壳 `theme / textSize / language` 从纯持久化值推进到真实 DOM 外观投影：主题会切换主壳 surface/background token，字号会调整全局根字号，语言选择会同步更新 `html[lang]`。
+- [x] 将 `Restore Circle Access` 从静态占位页推进为真实恢复目录：删除 circle 后会把原 `relay / type / description` 归档到本地 restore catalog，设置页可直接 `Restore / Forget`，登出后 catalog 仍保留，登录时选择 `restore` 也可在本地归档项中显式选择要恢复的 circle。
+- [x] 为 `Cargo.toml` 补齐 `default-run = "p2p_chat"`，让 `pnpm tauri dev / build` 在 companion `p2p-chat-runtime` binary 共存时仍能稳定选择桌面主入口。
+- [x] 将 `Find People / Add Friends` 里的 invite-like 文本分流补成真实 circle 导入分支：聊天模式下输入 `invite / p2pchat / relay / http(s)` 风格链接时，会优先按 circle join 处理而不是错误创建 fake contact；若该入口来自 `New Message`，成功加入后会直接回到新 circle 的建消息页。
+- [x] 为联系人资料页补齐 `Remark` 的真实编辑与持久化：新增 `update_contact_remark` 命令链路、SQLite 持久化与前端本地 fallback，联系人备注现在可在资料页直接保存，也支持清空；联系人选择页会自动省略空备注的多余分隔符。
+- [x] 为 `New Message -> Note to Self` 增加独立确认页，并接入 overlay route/history 栈；现在会先展示当前 circle 作用域与用途，再进入自聊会话，节奏更接近原应用。
 
 ## 进行中
 
@@ -153,8 +189,9 @@
 - 当前自己发出的消息已可携带 `deliveryStatus`，SQLite 会保留该字段，聊天窗也会展示基础 `Sent / Sending / Failed` 文案，为后续接真实投递状态回写预留合同。
 - 当前消息状态回写已不必走 `messages_replace` 整桶覆盖；桌面端可按 `session_id + message_id` 独立更新单条消息的 `deliveryStatus`。
 - 当前发送消息会按当前 circle 状态直接落成 `open -> sent / connecting -> sending / closed -> failed`；失败消息也可在聊天窗点击 `Retry` 重新按最新 circle 状态回写。
-- 当前 transport/runtime 心跳和动作链路会在 circle 恢复 `open` 时自动把本地 `sending` 消息收敛成 `sent`；`failed` 消息仍保持手动 `Retry` 语义，不会被误自动翻转。
+- 当前 transport/runtime 心跳和动作链路会在 circle 恢复 `open` 时自动把未签名本地 `sending` 消息收敛成 `sent`；带 `signedNostrEvent` 的消息会继续等待 runtime/relay receipt，`failed` 消息仍保持手动 `Retry` 语义，不会被误自动翻转。
 - 当前消息合同已不止 `deliveryStatus`；本地消息、relay 同步消息和系统消息都会携带 `syncSource`，已确认的本地消息会补 `remoteId / ackedAt` 并落到 SQLite，但这些字段目前仍主要由本地模拟链路填充，不是真实远端回执。
+- 当前本地 secret 文本消息在桌面端发送/重试时，已经会基于 native credential store 里的 secret 产出稳定 `remoteId`，并把完整 `signedNostrEvent` envelope 持久化到消息记录；这些 envelope 不再只靠手动 `Sync / SyncSessions` 才能发出，heartbeat 也会自动把未派发事件作为 `publishOutboundMessages` 入 preview runtime；对于 websocket circle，preview runtime 现在不仅会真实写 relay socket，还会等待最小 NIP-20 `OK` 再决定 sent/failed；但它仍是“一次性连接 -> publish -> 等 ack”的 preview 合同，还没有常驻连接、订阅态和更完整的网络恢复策略。
 - 当前聊天域已具备显式的远端消息合并入口；按 `remoteId` 命中的远端 echo 会直接合并回现有本地消息，而不是重复追加新行，为后续接真实 runtime/session sync 契约预留了稳定的 dedupe 路径。
 - 当前 transport `SyncSessions` 已开始复用这条共享合并路径；模拟同步和显式远端 merge 命令现在会按同一套规则刷新摘要、联系人在线态和消息去重，剩余主要差距是把真实 runtime 输出接进来。
 - 当前聊天域还具备显式的远端回执合并入口；若真实 runtime 仅返回 `remoteId + status + ackedAt`，桌面端已经可以不依赖本地 `messageId` 直接完成发送态回写。
@@ -214,4 +251,6 @@
 - 当前登录页已不再只把 `method / userProfile / circleSelection` 丢给壳层；本地会额外保留 `loginMethod + accessSummary + circleSelectionMode + loggedInAt` 这组非敏感摘要，为后续真实账号/runtime 接入提供稳定边界。
 - 当前登出后登录页不会再直接看到上一次账号的本地 circle/session 预览；若用户重新登录，桌面壳会在认证后再恢复 SQLite 中的 domain 概览。
 - 当前设置页里的 `theme / textSize` 不再只是保存值；主聊天壳、设置抽屉和 overlay panel 已会跟随主题 token 与根字号实时变化，但更细的子页面和完整多语言文案仍未完全接通。
+- 当前 circle 生命周期已不再只有“加入 / 删除”的壳层动作；被移除的 circle 会进入本地 restore catalog，可在设置页按原 relay/type/description 恢复，也可显式遗忘该归档项。
+- 当前联系人资料已不再只是静态展示；联系人备注可从资料页直接编辑并落到 Rust/SQLite，联系人列表与建群选择页也会同步反映这项本地备注。
 - 后续每完成一个里程碑，应同步更新本文件中的状态与清单。

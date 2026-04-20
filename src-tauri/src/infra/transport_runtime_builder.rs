@@ -33,6 +33,7 @@ pub(crate) fn build_runtime_profiles(
                 &protocol,
                 options,
                 &circle.id,
+                Some(circle.relay.as_str()),
                 preferred_session_id.as_deref(),
             );
             let session_label = format!(

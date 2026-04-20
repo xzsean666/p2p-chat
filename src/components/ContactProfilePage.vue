@@ -1,19 +1,50 @@
 <script setup lang="ts">
+import { computed, ref, watch } from "vue";
 import Avatar from "primevue/avatar";
 import Button from "primevue/button";
+import InputText from "primevue/inputtext";
 import Tag from "primevue/tag";
 import OverlayPageShell from "./OverlayPageShell.vue";
-import type { ContactItem } from "../types/chat";
+import type { CircleItem, ContactItem, UpdateContactRemarkInput } from "../types/chat";
 
-defineProps<{
+const props = defineProps<{
   contact: ContactItem | null;
+  activeCircle: CircleItem | null;
 }>();
 
 const emit = defineEmits<{
   (event: "close"): void;
+  (event: "open-join-circle"): void;
   (event: "toggle-block", contactId: string): void;
   (event: "send-message", contactId: string): void;
+  (event: "save-remark", payload: UpdateContactRemarkInput): void;
 }>();
+
+const remarkDraft = ref("");
+
+watch(
+  () => props.contact,
+  (contact) => {
+    remarkDraft.value = contact?.subtitle ?? "";
+  },
+  { immediate: true },
+);
+
+const trimmedRemarkDraft = computed(() => remarkDraft.value.trim());
+const remarkChanged = computed(() => {
+  return trimmedRemarkDraft.value !== (props.contact?.subtitle ?? "");
+});
+
+function saveRemark() {
+  if (!props.contact || !remarkChanged.value) {
+    return;
+  }
+
+  emit("save-remark", {
+    contactId: props.contact.id,
+    remark: trimmedRemarkDraft.value,
+  });
+}
 </script>
 
 <template>
@@ -37,9 +68,14 @@ const emit = defineEmits<{
       <section class="section-card">
         <div class="section-title">Profile</div>
         <div class="info-list">
-          <div class="info-row">
+          <div class="info-row block">
             <span class="label">Remark</span>
-            <strong>{{ contact.subtitle }}</strong>
+            <InputText
+              v-model="remarkDraft"
+              placeholder="Add a local remark for this contact"
+              @keydown.enter.prevent="saveRemark"
+            />
+            <p v-if="!trimmedRemarkDraft">No local remark saved yet.</p>
           </div>
           <div class="info-row block">
             <span class="label">Public Key</span>
@@ -61,10 +97,17 @@ const emit = defineEmits<{
     <template v-if="contact" #footer>
       <div class="profile-actions">
         <Button
-          icon="pi pi-send"
-          label="Send Message"
+          :icon="activeCircle ? 'pi pi-send' : 'pi pi-compass'"
+          :label="activeCircle ? 'Send Message' : 'Join Circle'"
           severity="contrast"
-          @click="emit('send-message', contact.id)"
+          @click="activeCircle ? emit('send-message', contact.id) : emit('open-join-circle')"
+        />
+        <Button
+          icon="pi pi-check"
+          label="Save Remark"
+          :disabled="!remarkChanged"
+          severity="secondary"
+          @click="saveRemark"
         />
         <Button
           :icon="contact.blocked ? 'pi pi-lock-open' : 'pi pi-ban'"
@@ -164,6 +207,10 @@ code {
 code {
   color: #415772;
   line-height: 1.65;
+}
+
+.info-row :deep(.p-inputtext) {
+  width: 100%;
 }
 
 code {

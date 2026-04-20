@@ -1,8 +1,13 @@
+pub mod auth_runtime_binding_store;
+pub mod auth_runtime_client_store;
+pub mod auth_runtime_credential_store;
+pub mod auth_runtime_state_store;
 pub mod local_command_transport_runtime_launcher;
 pub mod local_transport_recovery_worker;
 pub mod local_transport_runtime_adapter;
 pub mod local_transport_runtime_manager;
 pub mod local_transport_service;
+pub mod media_store;
 pub mod mock_transport_adapters;
 pub mod mock_transport_engine;
 pub mod mock_transport_runtime;

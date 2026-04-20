@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   createChatShellSnapshotFromPersistedState,
   createEmptyShellState,
@@ -9,32 +10,74 @@ import { createChatSeedFallback } from "../../mock/chatSeedFallback";
 import {
   addChatCircle,
   applyChatSessionAction,
+  cacheChatMessageMedia,
+  cleanupChatMediaAssets,
   createGroupConversation,
   removeChatCircle,
+  restoreChatCircle,
   retryChatMessageDelivery,
+  sendChatFileMessage,
+  sendChatImageMessage,
+  sendChatVideoMessage,
   sendChatMessage,
   startDirectConversation,
   startLookupConversation,
   startSelfConversation,
+  storeChatMediaAsset,
   toggleChatContactBlock,
+  updateChatContactRemark,
   updateChatGroupMembers,
   updateChatGroupName,
   updateChatSessionDraft,
   updateChatCircle,
 } from "../../services/chatMutations";
 import {
+  bootstrapAuthSession,
+  completeLogin as completeLoginViaRuntime,
   loadChatDomainOverview,
+  loadChatDomainOverviewLocally,
   loadChatSessionMessageUpdates,
+  loadChatSessionMessageUpdatesLocally,
   loadChatSessionMessages,
+  loadChatSessionMessagesLocally,
   loadChatShellSnapshot,
+  loadChatShellSnapshotLocally,
+  logoutChatSession,
   persistChatShellSnapshotLocally,
   saveChatShellSnapshot,
+  syncAuthRuntime as syncAuthRuntimeViaRuntime,
+  updateAuthRuntime as updateAuthRuntimeViaRuntime,
 } from "../../services/chatShell";
+import {
+  buildAuthRuntimeBindingSummary,
+  buildUpdatedAuthRuntime,
+  deriveAuthRuntimeFromAuthSession,
+} from "../../services/authRuntime";
+import { classifyChatQuery, isCircleQuery } from "../../services/chatQueryIntents";
+import {
+  encodeFileMessageMeta,
+  fileMessageLocalPath,
+  fileMessageMetaLabel,
+  fileMessageRemoteUrl,
+} from "../chat/fileMessageMeta";
 import {
   applyTransportCircleAction,
   deriveRuntimeRecoveryAction,
   loadTransportSnapshot,
+  loadTransportSnapshotLocally,
 } from "../../services/transportDiagnostics";
+import {
+  encodeImageMessageMeta,
+  imageMessageLocalPath,
+  imageMessageMetaLabel,
+  imageMessageRemoteUrl,
+} from "../chat/imageMessageMeta";
+import {
+  encodeVideoMessageMeta,
+  videoMessageLocalPath,
+  videoMessageMetaLabel,
+  videoMessageRemoteUrl,
+} from "../chat/videoMessageMeta";
 import {
   cloneOverlayPages,
   createOverlayHistoryState,
@@ -47,6 +90,8 @@ import type {
   AdvancedPreferences,
   AddCircleInput,
   AppPreferences,
+  AuthRuntimeSummary,
+  AuthRuntimeBindingSummary,
   AuthSessionSummary,
   ChatDomainOverview,
   ChatDomainSeed,
@@ -61,19 +106,26 @@ import type {
   MessageItem,
   NotificationPreferences,
   PersistedShellState,
+  RestorableCircleEntry,
   ShellStateSnapshot,
   SessionSyncItem,
   SettingPageId,
   SessionAction,
   SessionItem,
+  StoreChatMediaAssetInput,
+  StoredChatMediaAsset,
   TransportActivityItem,
   TransportCircleAction,
   TransportMutationResult,
   TransportRuntimeSession,
   TransportSnapshot,
   UpdateCircleInput,
+  UpdateContactRemarkInput,
+  UpdateAuthRuntimeInput,
   UpdateGroupMembersInput,
   UpdateGroupNameInput,
+  SendImageMessageInput,
+  SendVideoMessageInput,
   UserProfile,
 } from "../../types/chat";
 
@@ -103,9 +155,19 @@ type SessionMessagePageState = {
 type DomainSeedMessageMode = "full" | "preview";
 
 const SESSION_MESSAGE_PAGE_SIZE = 30;
+const AUTH_RUNTIME_SYNC_INTERVAL_MS = 2500;
 
 function cloneState<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function hasTauriRuntime() {
+  const globalWindow = globalThis as typeof globalThis & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  };
+
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in globalWindow || "__TAURI__" in globalWindow);
 }
 
 export function useChatShell() {
@@ -116,6 +178,14 @@ export function useChatShell() {
   let transportTimer: ReturnType<typeof window.setTimeout> | null = null;
   let transportHeartbeatTimer: ReturnType<typeof window.setInterval> | null = null;
   let transportNoticeTimer: ReturnType<typeof window.setTimeout> | null = null;
+  let authRuntimeSyncTimer: ReturnType<typeof window.setTimeout> | null = null;
+  let authRuntimeNativeSyncSupported = true;
+  let authRuntimeBackgroundSyncFailed = false;
+  let transportSnapshotBackgroundRefreshFailed = false;
+  let domainOverviewBackgroundRefreshFailed = false;
+  let shellSnapshotPersistenceFailed = false;
+  let draftRuntimePersistenceFailed = false;
+  let sessionMessageUpdatesFailedSessionId = "";
   let activeTransportHeartbeatIntervalMs = 0;
   let latestDraftMutationSerial = 0;
   let pendingDraftSessionId: string | null = null;
@@ -124,9 +194,13 @@ export function useChatShell() {
 
   const searchText = ref("");
   const composerText = ref("");
+  const replyToMessageId = ref<string | null>(null);
   const isAuthenticated = ref(initialShellState.isAuthenticated);
   const authSession = ref(initialShellState.authSession);
+  const authRuntime = ref(initialShellState.authRuntime);
+  const authRuntimeBinding = ref<AuthRuntimeBindingSummary | null>(initialShellState.authRuntimeBinding);
   const userProfile = ref<UserProfile>(initialShellState.userProfile);
+  const restorableCircles = ref(initialShellState.restorableCircles);
   const showLaunch = ref(true);
   const showCircleSwitcher = ref(false);
   const showSettingsDrawer = ref(false);
@@ -211,6 +285,40 @@ export function useChatShell() {
     );
   });
 
+  const effectiveAuthRuntime = computed(() => {
+    return authRuntime.value ?? deriveAuthRuntimeFromAuthSession(authSession.value);
+  });
+
+  const sendBlockedReason = computed(() => {
+    if (!isAuthenticated.value) {
+      return "Log in before sending messages.";
+    }
+
+    const runtime = effectiveAuthRuntime.value;
+    if (!runtime) {
+      return "";
+    }
+
+    return runtime.sendBlockedReason ?? "";
+  });
+
+  const canSendMessages = computed(() => {
+    if (!isAuthenticated.value) {
+      return false;
+    }
+
+    const runtime = effectiveAuthRuntime.value;
+    if (!runtime) {
+      return true;
+    }
+
+    return runtime.canSendMessages;
+  });
+
+  const runtimeDiagnosticError = computed(() => {
+    return effectiveAuthRuntime.value?.error?.trim() ?? "";
+  });
+
   const activeMessages = computed(() => {
     if (!selectedSession.value) {
       return [];
@@ -218,6 +326,87 @@ export function useChatShell() {
 
     return messageStore.value[selectedSession.value.id] ?? [];
   });
+
+  const replyingToMessage = computed(() => {
+    const sessionId = selectedSession.value?.id;
+    if (!sessionId || !replyToMessageId.value) {
+      return null;
+    }
+
+    return (
+      messageStore.value[sessionId]?.find((message) => message.id === replyToMessageId.value) ??
+      null
+    );
+  });
+
+  const mentionableContacts = computed<ContactItem[]>(() => {
+    if (!selectedSession.value) {
+      return [];
+    }
+
+    if (selectedSession.value.kind === "direct") {
+      return selectedContact.value ? [selectedContact.value] : [];
+    }
+
+    if (selectedSession.value.kind === "group") {
+      return selectedGroupMembers.value;
+    }
+
+    return [];
+  });
+
+  const activeComposerMentionMatch = computed(() => {
+    if (!selectedSession.value) {
+      return null;
+    }
+
+    const match = composerText.value.match(/(^|\s)@([A-Za-z0-9_.-]*)$/);
+    if (!match) {
+      return null;
+    }
+
+    return {
+      prefix: match[1] ?? "",
+      query: (match[2] ?? "").toLowerCase(),
+      mentionStart: composerText.value.length - match[0].length + (match[1]?.length ?? 0),
+    };
+  });
+
+  const mentionSuggestions = computed<ContactItem[]>(() => {
+    const match = activeComposerMentionMatch.value;
+    if (!match) {
+      return [];
+    }
+
+    const seenContactIds = new Set<string>();
+    return mentionableContacts.value
+      .filter((contact) => {
+        if (seenContactIds.has(contact.id)) {
+          return false;
+        }
+
+        seenContactIds.add(contact.id);
+        if (!match.query) {
+          return true;
+        }
+
+        const normalizedHandle = contact.handle.toLowerCase();
+        const normalizedName = contact.name.toLowerCase();
+        const normalizedSubtitle = contact.subtitle.toLowerCase();
+        return (
+          normalizedHandle.includes(`@${match.query}`) ||
+          normalizedName.includes(match.query) ||
+          normalizedSubtitle.includes(match.query)
+        );
+      })
+      .slice(0, 6);
+  });
+
+  const showMentionSuggestions = computed(() => {
+    return !!activeComposerMentionMatch.value && mentionSuggestions.value.length > 0;
+  });
+
+  const mentionSelectionIndex = ref(0);
 
   const activeMessagePageState = computed<SessionMessagePageState>(() => {
     if (!selectedSession.value) {
@@ -282,6 +471,45 @@ export function useChatShell() {
     }
 
     return contacts.value.find((item) => item.id === page.contactId) ?? null;
+  });
+
+  const activeOverlayMessageSession = computed(() => {
+    const page = activeOverlayPage.value;
+    if (page?.kind !== "message-detail") {
+      return null;
+    }
+
+    return sessions.value.find((session) => session.id === page.sessionId) ?? null;
+  });
+
+  const activeOverlayMessage = computed(() => {
+    const page = activeOverlayPage.value;
+    if (page?.kind !== "message-detail") {
+      return null;
+    }
+
+    return (
+      messageStore.value[page.sessionId]?.find((message) => message.id === page.messageId) ?? null
+    );
+  });
+
+  const activeOverlayMessageReplyTarget = computed(() => {
+    const session = activeOverlayMessageSession.value;
+    const message = activeOverlayMessage.value;
+    if (!session || !message?.replyTo) {
+      return null;
+    }
+
+    const sessionMessages = messageStore.value[session.id] ?? [];
+    return (
+      sessionMessages.find((candidate) => {
+        return (
+          candidate.id === message.replyTo?.messageId ||
+          candidate.remoteId === message.replyTo?.remoteId ||
+          candidate.signedNostrEvent?.eventId === message.replyTo?.remoteId
+        );
+      }) ?? null
+    );
   });
 
   const activeOverlayCircle = computed(() => {
@@ -476,6 +704,42 @@ export function useChatShell() {
     }, durationMs);
   }
 
+  function describeCommandError(error: unknown, fallback: string) {
+    if (typeof error === "string" && error.trim()) {
+      return error.trim();
+    }
+
+    if (error instanceof Error && error.message.trim()) {
+      return error.message.trim();
+    }
+
+    if (error && typeof error === "object") {
+      const message = Reflect.get(error, "message");
+      if (typeof message === "string" && message.trim()) {
+        return message.trim();
+      }
+    }
+
+    return fallback;
+  }
+
+  function sessionActionFailureTitle(action: SessionAction) {
+    switch (action) {
+      case "pin":
+        return "Pin update failed";
+      case "mute":
+        return "Mute update failed";
+      case "archive":
+        return "Archive action failed";
+      case "unarchive":
+        return "Restore chat failed";
+      case "delete":
+        return "Delete chat failed";
+      default:
+        return "Chat action failed";
+    }
+  }
+
   function circleLabelForRuntimeNotice(circleId: string) {
     return circles.value.find((circle) => circle.id === circleId)?.name ?? circleId;
   }
@@ -563,13 +827,23 @@ export function useChatShell() {
     switch (page.kind) {
       case "circle-directory":
       case "settings-detail":
+        return true;
+      case "message-detail":
+        return (
+          advancedPreferences.value.showMessageInfo &&
+          sessions.value.some((session) => session.id === page.sessionId) &&
+          !!messageStore.value[page.sessionId]?.some((message) => message.id === page.messageId)
+        );
       case "new-message":
-      case "find-people":
+      case "self-chat-confirm":
       case "group-select-members":
       case "archived":
-        return true;
+        return !!activeCircle.value;
+      case "find-people":
+        return page.mode === "join-circle" || !!activeCircle.value;
       case "group-create":
         return (
+          !!activeCircle.value &&
           Array.isArray(page.memberContactIds) &&
           page.memberContactIds.length > 0 &&
           page.memberContactIds.every((contactId) => contacts.value.some((contact) => contact.id === contactId))
@@ -702,6 +976,7 @@ export function useChatShell() {
         return;
       }
 
+      replyToMessageId.value = null;
       composerText.value = selectedSession.value?.draft ?? "";
       void ensureSessionMessagesLoaded(sessionId);
     },
@@ -709,7 +984,23 @@ export function useChatShell() {
   );
 
   watch(
-    [isAuthenticated, circles, contacts, sessions, groups],
+    [showMentionSuggestions, mentionSuggestions],
+    () => {
+      if (!showMentionSuggestions.value) {
+        mentionSelectionIndex.value = 0;
+        return;
+      }
+
+      mentionSelectionIndex.value = Math.min(
+        mentionSelectionIndex.value,
+        Math.max(mentionSuggestions.value.length - 1, 0),
+      );
+    },
+    { deep: true },
+  );
+
+  watch(
+    [isAuthenticated, circles, contacts, sessions, groups, advancedPreferences, messageStore],
     () => {
       const nextPages = sanitizeOverlayPages(overlayPages.value);
       if (!overlayPagesMatch(overlayPages.value, nextPages)) {
@@ -723,7 +1014,9 @@ export function useChatShell() {
     [
       isAuthenticated,
       authSession,
+      authRuntime,
       userProfile,
+      restorableCircles,
       circles,
       appPreferences,
       notificationPreferences,
@@ -764,6 +1057,14 @@ export function useChatShell() {
     [isAuthenticated, advancedPreferences],
     () => {
       restartTransportHeartbeat();
+    },
+    { deep: true, immediate: true },
+  );
+
+  watch(
+    [isAuthenticated, authSession, authRuntime, authRuntimeBinding],
+    () => {
+      scheduleAuthRuntimeSync();
     },
     { deep: true, immediate: true },
   );
@@ -839,6 +1140,7 @@ export function useChatShell() {
   onBeforeUnmount(() => {
     flushPendingPersistence("local");
     clearTransportNoticeTimer();
+    clearAuthRuntimeSyncTimer();
 
     if (persistTimer) {
       window.clearTimeout(persistTimer);
@@ -880,13 +1182,43 @@ export function useChatShell() {
   });
 
   onMounted(async () => {
-    try {
-      bootstrapStatus.value = await invoke<BootstrapStatus>("bootstrap_status");
-    } catch {
+    if (!hasTauriRuntime()) {
       bootstrapStatus.value = null;
+    } else {
+      try {
+        bootstrapStatus.value = await invoke<BootstrapStatus>("bootstrap_status");
+      } catch (error) {
+        bootstrapStatus.value = null;
+        showTransportNotice({
+          id: `bootstrap-status-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Bootstrap status unavailable",
+          detail: describeCommandError(
+            error,
+            "Desktop bootstrap metadata could not be loaded. Settings pages may show reduced startup diagnostics.",
+          ),
+        });
+      }
     }
 
-    const snapshot = await loadChatShellSnapshot(createChatSeedFallback());
+    const fallbackState = createChatSeedFallback();
+    let snapshot: ChatShellSnapshot;
+
+    try {
+      snapshot = await loadChatShellSnapshot(fallbackState);
+    } catch (error) {
+      showTransportNotice({
+        id: `load-shell-snapshot-failed-${Date.now()}`,
+        tone: "warn",
+        title: "Desktop shell restore failed",
+        detail: describeCommandError(
+          error,
+          "Desktop startup could not load the native shell snapshot, so the UI fell back to the local cached shell state.",
+        ),
+      });
+      snapshot = loadChatShellSnapshotLocally(fallbackState);
+    }
+
     applyChatShellSnapshot(snapshot);
     initializeOverlayNavigation();
     pagehideHandler = () => {
@@ -900,7 +1232,7 @@ export function useChatShell() {
     window.addEventListener("pagehide", pagehideHandler);
     document.addEventListener("visibilitychange", visibilitychangeHandler);
     isShellStateReady.value = true;
-    await refreshTransportSnapshot();
+    await refreshTransportSnapshot({ showFailureNotice: true });
     schedulePersistence();
 
     window.setTimeout(() => {
@@ -912,7 +1244,10 @@ export function useChatShell() {
     return cloneState({
       isAuthenticated: isAuthenticated.value,
       authSession: authSession.value,
+      authRuntime: authRuntime.value,
+      authRuntimeBinding: authRuntimeBinding.value,
       userProfile: userProfile.value,
+      restorableCircles: restorableCircles.value,
       circles: circles.value,
       appPreferences: appPreferences.value,
       notificationPreferences: notificationPreferences.value,
@@ -930,6 +1265,191 @@ export function useChatShell() {
     return createChatShellSnapshotFromPersistedState(snapshotShellState());
   }
 
+  function clearAuthRuntimeSyncTimer() {
+    if (authRuntimeSyncTimer) {
+      window.clearTimeout(authRuntimeSyncTimer);
+      authRuntimeSyncTimer = null;
+    }
+  }
+
+  function shouldSyncAuthRuntime() {
+    if (!authRuntimeNativeSyncSupported || !isAuthenticated.value) {
+      return false;
+    }
+
+    return effectiveAuthRuntime.value?.state === "pending";
+  }
+
+  function authRuntimeSyncStateKey(
+    state: Pick<ShellStateSnapshot, "isAuthenticated" | "authSession" | "authRuntime" | "authRuntimeBinding">,
+  ) {
+    return JSON.stringify({
+      isAuthenticated: state.isAuthenticated,
+      authSession: state.authSession,
+      authRuntime: state.authRuntime,
+      authRuntimeBinding: state.authRuntimeBinding,
+    });
+  }
+
+  function applySyncedAuthRuntimeState(
+    state: Pick<ShellStateSnapshot, "isAuthenticated" | "authSession" | "authRuntime" | "authRuntimeBinding">,
+  ) {
+    isAuthenticated.value = state.isAuthenticated;
+    authSession.value = state.authSession;
+    authRuntime.value = state.authRuntime;
+    authRuntimeBinding.value = state.authRuntimeBinding;
+  }
+
+  async function syncAuthRuntimeState() {
+    clearAuthRuntimeSyncTimer();
+
+    if (!shouldSyncAuthRuntime()) {
+      return;
+    }
+
+    let runtimeShell: ShellStateSnapshot | null = null;
+
+    try {
+      runtimeShell = await syncAuthRuntimeViaRuntime();
+      authRuntimeBackgroundSyncFailed = false;
+    } catch (error) {
+      if (!authRuntimeBackgroundSyncFailed) {
+        showTransportNotice({
+          id: `background-auth-runtime-sync-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Auth runtime background sync failed",
+          detail: describeCommandError(
+            error,
+            "Desktop auth runtime sync is still failing in the background. The UI will keep retrying automatically.",
+          ),
+        });
+      }
+
+      authRuntimeBackgroundSyncFailed = true;
+      scheduleAuthRuntimeSync();
+      return;
+    }
+
+    if (!runtimeShell) {
+      authRuntimeNativeSyncSupported = false;
+      authRuntimeBackgroundSyncFailed = false;
+      return;
+    }
+
+    if (authRuntimeSyncStateKey(runtimeShell) !== authRuntimeSyncStateKey({
+      isAuthenticated: isAuthenticated.value,
+      authSession: authSession.value,
+      authRuntime: authRuntime.value,
+      authRuntimeBinding: authRuntimeBinding.value,
+    })) {
+      applySyncedAuthRuntimeState(runtimeShell);
+    }
+
+    scheduleAuthRuntimeSync();
+  }
+
+  async function refreshAuthRuntimeStateFromNative(options: { showFailureNotice?: boolean } = {}) {
+    if (!authRuntimeNativeSyncSupported || !isAuthenticated.value) {
+      return;
+    }
+
+    let runtimeShell: ShellStateSnapshot | null = null;
+
+    try {
+      runtimeShell = await syncAuthRuntimeViaRuntime();
+      authRuntimeBackgroundSyncFailed = false;
+    } catch (error) {
+      if (options.showFailureNotice) {
+        showTransportNotice({
+          id: `auth-runtime-sync-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Auth runtime sync failed",
+          detail: describeCommandError(
+            error,
+            "Desktop auth runtime sync did not complete. Try again after the signer or native runtime becomes reachable.",
+          ),
+        });
+      }
+
+      scheduleAuthRuntimeSync();
+      return;
+    }
+
+    if (!runtimeShell) {
+      authRuntimeNativeSyncSupported = false;
+      authRuntimeBackgroundSyncFailed = false;
+      return;
+    }
+
+    if (authRuntimeSyncStateKey(runtimeShell) !== authRuntimeSyncStateKey({
+      isAuthenticated: isAuthenticated.value,
+      authSession: authSession.value,
+      authRuntime: authRuntime.value,
+      authRuntimeBinding: authRuntimeBinding.value,
+    })) {
+      applySyncedAuthRuntimeState(runtimeShell);
+    }
+
+    scheduleAuthRuntimeSync();
+  }
+
+  async function syncAuthRuntimeNow() {
+    await refreshAuthRuntimeStateFromNative({ showFailureNotice: true });
+  }
+
+  async function runFallbackEligibleMutation<T>(
+    mutation: () => Promise<T | null>,
+    desktopErrorNotice?: {
+      title: string;
+      fallbackDetail: string;
+    },
+  ): Promise<{ result: T | null; canFallbackLocally: boolean }> {
+    try {
+      return {
+        result: await mutation(),
+        canFallbackLocally: true,
+      };
+    } catch (error) {
+      if (desktopErrorNotice) {
+        showTransportNotice({
+          id: `desktop-mutation-${Date.now()}-${desktopErrorNotice.title}`,
+          tone: "warn",
+          title: desktopErrorNotice.title,
+          detail: describeCommandError(error, desktopErrorNotice.fallbackDetail),
+        });
+      }
+
+      return {
+        result: null,
+        canFallbackLocally: false,
+      };
+    }
+  }
+
+  function scheduleAuthRuntimeSync() {
+    clearAuthRuntimeSyncTimer();
+
+    if (!shouldSyncAuthRuntime()) {
+      authRuntimeBackgroundSyncFailed = false;
+      return;
+    }
+
+    authRuntimeSyncTimer = window.setTimeout(() => {
+      authRuntimeSyncTimer = null;
+      void syncAuthRuntimeState();
+    }, AUTH_RUNTIME_SYNC_INTERVAL_MS);
+  }
+
+  function resetDesktopFailureFlags() {
+    authRuntimeNativeSyncSupported = true;
+    authRuntimeBackgroundSyncFailed = false;
+    transportSnapshotBackgroundRefreshFailed = false;
+    domainOverviewBackgroundRefreshFailed = false;
+    shellSnapshotPersistenceFailed = false;
+    draftRuntimePersistenceFailed = false;
+    sessionMessageUpdatesFailedSessionId = "";
+  }
+
   function clearDraftPersistenceTimer() {
     if (draftPersistTimer) {
       window.clearTimeout(draftPersistTimer);
@@ -942,7 +1462,28 @@ export function useChatShell() {
     draft: string,
     mutationSerial: number,
   ) {
-    const nextSeed = await updateChatSessionDraft({ sessionId, draft });
+    let nextSeed: ChatDomainSeed | null = null;
+
+    try {
+      nextSeed = await updateChatSessionDraft({ sessionId, draft });
+      draftRuntimePersistenceFailed = false;
+    } catch (error) {
+      if (!draftRuntimePersistenceFailed) {
+        showTransportNotice({
+          id: `save-draft-failed-${sessionId}-${Date.now()}`,
+          tone: "warn",
+          title: "Draft save failed",
+          detail: describeCommandError(
+            error,
+            "Desktop draft state could not be written to native storage, so only the local cached draft was updated.",
+          ),
+        });
+      }
+
+      draftRuntimePersistenceFailed = true;
+      return;
+    }
+
     if (!nextSeed || mutationSerial !== latestDraftMutationSerial) {
       return;
     }
@@ -951,6 +1492,30 @@ export function useChatShell() {
       preferredCircleId: activeCircleId.value,
       preferredSessionId: selectedSessionId.value || sessionId,
     });
+  }
+
+  async function persistShellSnapshotToNative(
+    snapshot: ChatShellSnapshot,
+    options: { showFailureNotice?: boolean } = {},
+  ) {
+    try {
+      await saveChatShellSnapshot(snapshot);
+      shellSnapshotPersistenceFailed = false;
+    } catch (error) {
+      if (options.showFailureNotice !== false && !shellSnapshotPersistenceFailed) {
+        showTransportNotice({
+          id: `save-shell-snapshot-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Desktop shell save failed",
+          detail: describeCommandError(
+            error,
+            "Desktop shell state could not be written to native storage, so only the local cached snapshot was updated.",
+          ),
+        });
+      }
+
+      shellSnapshotPersistenceFailed = true;
+    }
   }
 
   async function flushPendingDraftPersistence() {
@@ -993,13 +1558,13 @@ export function useChatShell() {
     persistChatShellSnapshotLocally(snapshot);
 
     if (mode === "full") {
-      void saveChatShellSnapshot(snapshot);
+      void persistShellSnapshotToNative(snapshot);
     }
   }
 
   async function persistState() {
     await flushPendingDraftPersistence();
-    await saveChatShellSnapshot(snapshotChatShellState());
+    await persistShellSnapshotToNative(snapshotChatShellState());
   }
 
   function setTransportSnapshot(snapshot: TransportSnapshot, options: { suppressNotice?: boolean } = {}) {
@@ -1019,29 +1584,55 @@ export function useChatShell() {
         circleId: string;
         action: TransportCircleAction;
       };
+      showFailureNotice?: boolean;
       suppressNotice?: boolean;
     } = {},
   ) {
-    const result = await loadTransportSnapshot(
-      {
-        activeCircleId: activeCircleId.value || undefined,
-        useTorNetwork: advancedPreferences.value.useTorNetwork,
-        experimentalTransport: advancedPreferences.value.experimentalTransport,
-      },
-      {
-        circles: circles.value,
-        contacts: contacts.value,
-        sessions: sessions.value,
-        groups: groups.value,
-        messageStore: messageStore.value,
-        activeCircleId: activeCircleId.value,
-        advanced: advancedPreferences.value,
-        previousSnapshot: transportSnapshot.value,
-        pendingActivity: options.pendingActivity,
-      },
-    );
+    const input = {
+      activeCircleId: activeCircleId.value || undefined,
+      useTorNetwork: advancedPreferences.value.useTorNetwork,
+      experimentalTransport: advancedPreferences.value.experimentalTransport,
+    };
+    const fallback = {
+      circles: circles.value,
+      contacts: contacts.value,
+      sessions: sessions.value,
+      groups: groups.value,
+      messageStore: messageStore.value,
+      activeCircleId: activeCircleId.value,
+      advanced: advancedPreferences.value,
+      previousSnapshot: transportSnapshot.value,
+      pendingActivity: options.pendingActivity,
+    };
+    let result: Awaited<ReturnType<typeof loadTransportSnapshot>>;
+    let desktopLoadFailed = false;
+
+    try {
+      result = await loadTransportSnapshot(input, fallback);
+      transportSnapshotBackgroundRefreshFailed = false;
+    } catch (error) {
+      desktopLoadFailed = true;
+      if (options.showFailureNotice || !transportSnapshotBackgroundRefreshFailed) {
+        showTransportNotice({
+          id: `load-transport-snapshot-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Transport status refresh failed",
+          detail: describeCommandError(
+            error,
+            "Desktop transport diagnostics could not be refreshed, so the UI fell back to the locally cached transport snapshot.",
+          ),
+        });
+      }
+
+      transportSnapshotBackgroundRefreshFailed = true;
+      result = {
+        snapshot: loadTransportSnapshotLocally(fallback),
+        source: "fallback" as const,
+      };
+    }
+
     setTransportSnapshot(result.snapshot, {
-      suppressNotice: options.suppressNotice,
+      suppressNotice: options.suppressNotice || desktopLoadFailed,
     });
 
     if (result.source === "tauri") {
@@ -1049,7 +1640,7 @@ export function useChatShell() {
       await refreshSessionMessageUpdates(selectedSession.value?.id);
     }
 
-    if (result.source !== "fallback") {
+    if (result.source !== "fallback" || desktopLoadFailed) {
       return;
     }
 
@@ -1217,13 +1808,26 @@ export function useChatShell() {
       nextBeforeMessageId: currentPage?.nextBeforeMessageId,
     });
 
-    const page = await loadChatSessionMessages(
-      {
-        sessionId,
-        limit: SESSION_MESSAGE_PAGE_SIZE,
-      },
-      messageStore.value,
-    );
+    const input = {
+      sessionId,
+      limit: SESSION_MESSAGE_PAGE_SIZE,
+    };
+    let page;
+
+    try {
+      page = await loadChatSessionMessages(input, messageStore.value);
+    } catch (error) {
+      showTransportNotice({
+        id: `load-session-messages-failed-${sessionId}-${Date.now()}`,
+        tone: "warn",
+        title: "Message history load failed",
+        detail: describeCommandError(
+          error,
+          "Desktop message history could not be loaded, so the UI fell back to the locally cached messages.",
+        ),
+      });
+      page = loadChatSessionMessagesLocally(input, messageStore.value);
+    }
 
     mergeSessionMessagePage(sessionId, page.messages, {
       initialized: true,
@@ -1248,17 +1852,36 @@ export function useChatShell() {
     let afterMessageId = existingMessages[existingMessages.length - 1]?.id;
     let hasMore = true;
     let changed = false;
+    let hadDesktopRefreshFailure = false;
     let safety = 0;
 
     while (hasMore && safety < 6) {
-      const updates = await loadChatSessionMessageUpdates(
-        {
-          sessionId,
-          afterMessageId,
-          limit: SESSION_MESSAGE_PAGE_SIZE,
-        },
-        messageStore.value,
-      );
+      const input = {
+        sessionId,
+        afterMessageId,
+        limit: SESSION_MESSAGE_PAGE_SIZE,
+      };
+      let updates;
+
+      try {
+        updates = await loadChatSessionMessageUpdates(input, messageStore.value);
+      } catch (error) {
+        hadDesktopRefreshFailure = true;
+        if (sessionMessageUpdatesFailedSessionId !== sessionId) {
+          showTransportNotice({
+            id: `load-session-message-updates-failed-${sessionId}-${Date.now()}`,
+            tone: "warn",
+            title: "Live message refresh failed",
+            detail: describeCommandError(
+              error,
+              "Desktop live message updates could not be refreshed, so the UI kept using the locally cached message list.",
+            ),
+          });
+        }
+
+        sessionMessageUpdatesFailedSessionId = sessionId;
+        updates = loadChatSessionMessageUpdatesLocally(input, messageStore.value);
+      }
 
       if (!updates.messages.length) {
         break;
@@ -1269,6 +1892,10 @@ export function useChatShell() {
       hasMore = updates.hasMore;
       changed = true;
       safety += 1;
+    }
+
+    if (!hadDesktopRefreshFailure && sessionMessageUpdatesFailedSessionId === sessionId) {
+      sessionMessageUpdatesFailedSessionId = "";
     }
 
     if (!changed) {
@@ -1312,14 +1939,28 @@ export function useChatShell() {
       loading: true,
     });
 
-    const page = await loadChatSessionMessages(
-      {
-        sessionId,
-        beforeMessageId: currentPage.nextBeforeMessageId,
-        limit: SESSION_MESSAGE_PAGE_SIZE,
-      },
-      messageStore.value,
-    );
+    const input = {
+      sessionId,
+      beforeMessageId: currentPage.nextBeforeMessageId,
+      limit: SESSION_MESSAGE_PAGE_SIZE,
+    };
+    let page;
+
+    try {
+      page = await loadChatSessionMessages(input, messageStore.value);
+    } catch (error) {
+      showTransportNotice({
+        id: `load-older-messages-failed-${sessionId}-${Date.now()}`,
+        tone: "warn",
+        title: "Older messages load failed",
+        detail: describeCommandError(
+          error,
+          "Desktop history pagination could not read older messages, so the UI fell back to the locally cached message list.",
+        ),
+      });
+      page = loadChatSessionMessagesLocally(input, messageStore.value);
+    }
+
     const existingMessages = messageStore.value[sessionId] ?? [];
     const existingIds = new Set(existingMessages.map((message) => message.id));
     const olderMessages = page.messages.filter((message) => !existingIds.has(message.id));
@@ -1441,7 +2082,10 @@ export function useChatShell() {
   function applyShellSnapshot(state: ShellStateSnapshot) {
     isAuthenticated.value = state.isAuthenticated;
     authSession.value = state.authSession;
+    authRuntime.value = state.authRuntime;
+    authRuntimeBinding.value = state.authRuntimeBinding;
     userProfile.value = state.userProfile;
+    restorableCircles.value = state.restorableCircles;
     appPreferences.value = state.appPreferences;
     notificationPreferences.value = state.notificationPreferences;
     advancedPreferences.value = state.advancedPreferences;
@@ -1483,14 +2127,35 @@ export function useChatShell() {
     return JSON.stringify(left) === JSON.stringify(right);
   }
 
-  async function refreshDomainOverview() {
+  async function refreshDomainOverview(options: { showFailureNotice?: boolean } = {}) {
     const currentOverview: ChatDomainOverview = {
       circles: circles.value,
       contacts: contacts.value,
       sessions: sessions.value,
       groups: groups.value,
     };
-    const nextOverview = await loadChatDomainOverview(currentOverview);
+    let nextOverview: ChatDomainOverview;
+
+    try {
+      nextOverview = await loadChatDomainOverview(currentOverview);
+      domainOverviewBackgroundRefreshFailed = false;
+    } catch (error) {
+      if (options.showFailureNotice || !domainOverviewBackgroundRefreshFailed) {
+        showTransportNotice({
+          id: `load-domain-overview-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Chat overview refresh failed",
+          detail: describeCommandError(
+            error,
+            "Desktop chat overview could not be refreshed, so the UI kept using the locally cached overview.",
+          ),
+        });
+      }
+
+      domainOverviewBackgroundRefreshFailed = true;
+      nextOverview = loadChatDomainOverviewLocally(currentOverview);
+    }
+
     if (domainOverviewEqual(nextOverview, currentOverview)) {
       return;
     }
@@ -1574,6 +2239,40 @@ export function useChatShell() {
     scheduleDraftPersistence(selectedSession.value.id, value);
   }
 
+  function navigateMentionSuggestions(direction: 1 | -1) {
+    if (!showMentionSuggestions.value) {
+      return;
+    }
+
+    const total = mentionSuggestions.value.length;
+    if (!total) {
+      return;
+    }
+
+    mentionSelectionIndex.value =
+      (mentionSelectionIndex.value + direction + total) % total;
+  }
+
+  function selectMentionSuggestion(contactId?: string) {
+    const match = activeComposerMentionMatch.value;
+    if (!match) {
+      return false;
+    }
+
+    const selectedContact =
+      mentionSuggestions.value.find((contact) => contact.id === contactId) ??
+      mentionSuggestions.value[mentionSelectionIndex.value];
+    if (!selectedContact) {
+      return false;
+    }
+
+    const nextValue =
+      `${composerText.value.slice(0, match.mentionStart)}${selectedContact.handle} `;
+    updateComposerText(nextValue);
+    mentionSelectionIndex.value = 0;
+    return true;
+  }
+
   function selectSession(sessionId: string) {
     selectedSessionId.value = sessionId;
     sessions.value = sessions.value.map((session) => {
@@ -1589,6 +2288,15 @@ export function useChatShell() {
   }
 
   function chooseCircle(circleId: string) {
+    focusCircle(circleId);
+  }
+
+  function focusCircle(
+    circleId: string,
+    options: {
+      nextOverlay?: "new-message";
+    } = {},
+  ) {
     if (!circles.value.some((circle) => circle.id === circleId)) {
       return;
     }
@@ -1596,6 +2304,12 @@ export function useChatShell() {
     activeCircleId.value = circleId;
     searchText.value = "";
     closeTransientChrome();
+
+    if (options.nextOverlay === "new-message") {
+      applyOverlayPages([{ kind: "new-message" }]);
+      return;
+    }
+
     closeAllOverlayPages();
   }
 
@@ -1604,11 +2318,48 @@ export function useChatShell() {
   }
 
   function openNewMessage() {
+    if (!activeCircle.value) {
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
     pushOverlayPage({ kind: "new-message" });
   }
 
+  function openSelfChatConfirmPage() {
+    if (!activeCircle.value) {
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
+    pushOverlayPage({ kind: "self-chat-confirm" });
+  }
+
   function openFindPeoplePage(mode: "chat" | "join-circle" = "chat") {
-    pushOverlayPage({ kind: "find-people", mode });
+    pushOverlayPage({
+      kind: "find-people",
+      mode: !activeCircle.value && mode === "chat" ? "join-circle" : mode,
+    });
+  }
+
+  function redirectToCircleSetup(detail = "Add or restore a circle before starting chats.") {
+    showTransportNotice({
+      id: "missing-active-circle",
+      tone: "warn",
+      title: "No active circle",
+      detail,
+    });
+
+    if (activeOverlayPage.value?.kind === "find-people" && activeOverlayPage.value.mode === "join-circle") {
+      return;
+    }
+
+    if (activeOverlayPage.value) {
+      replaceTopOverlayPage({ kind: "find-people", mode: "join-circle" });
+      return;
+    }
+
+    pushOverlayPage({ kind: "find-people", mode: "join-circle" });
   }
 
   function openCircleManagement() {
@@ -1639,6 +2390,14 @@ export function useChatShell() {
     pushOverlayPage({ kind: "contact", contactId });
   }
 
+  function openMessageDetailPage(messageId: string, sessionId = selectedSession.value?.id) {
+    if (!sessionId || !advancedPreferences.value.showMessageInfo) {
+      return;
+    }
+
+    pushOverlayPage({ kind: "message-detail", sessionId, messageId });
+  }
+
   function openGroupProfilePage(sessionId: string) {
     if (
       !sessions.value.some((session) => session.id === sessionId) ||
@@ -1651,10 +2410,20 @@ export function useChatShell() {
   }
 
   function openGroupSelectMembersPage() {
+    if (!activeCircle.value) {
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
     pushOverlayPage({ kind: "group-select-members" });
   }
 
   function openGroupCreatePage(memberContactIds: string[]) {
+    if (!activeCircle.value) {
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
     const nextMemberContactIds = Array.from(new Set(memberContactIds.filter(Boolean))).filter((contactId) => {
       return contacts.value.some((contact) => contact.id === contactId);
     });
@@ -1765,14 +2534,40 @@ export function useChatShell() {
       access: {
         kind: input.access.kind,
         label: accessLabel,
+        pubkey:
+          input.access.kind === "npub" && input.access.value?.trim()
+            ? input.access.value.trim()
+            : undefined,
       },
       circleSelectionMode: input.circleSelection.mode,
-      loggedInAt: new Date().toISOString(),
+      loggedInAt: input.loggedInAt ?? new Date().toISOString(),
     };
+  }
+
+  function buildAuthRuntimeSummary(
+    input: LoginCompletionInput,
+    sessionSummary: AuthSessionSummary = buildAuthSessionSummary(input),
+  ): AuthRuntimeSummary {
+    return (
+      deriveAuthRuntimeFromAuthSession(sessionSummary) ?? {
+        state: "failed",
+        loginMethod: input.method,
+        accessKind: input.access.kind,
+        label: sessionSummary.access.label,
+        pubkey: sessionSummary.access.pubkey,
+        error: "Unable to derive auth runtime state from the current session summary.",
+        canSendMessages: false,
+        sendBlockedReason: "Unable to derive auth runtime state from the current session summary.",
+        persistedInNativeStore: false,
+        credentialPersistedInNativeStore: false,
+        updatedAt: sessionSummary.loggedInAt,
+      }
+    );
   }
 
   function buildLoggedOutShellSnapshot(): ChatShellSnapshot {
     const loggedOutState = createLoggedOutShellState({
+      restorableCircles: cloneState(restorableCircles.value),
       appPreferences: cloneState(appPreferences.value),
       notificationPreferences: cloneState(notificationPreferences.value),
       advancedPreferences: cloneState(advancedPreferences.value),
@@ -1781,13 +2576,141 @@ export function useChatShell() {
     return createChatShellSnapshotFromPersistedState(loggedOutState);
   }
 
-  async function resolveLoginCircle(selection: LoginCircleSelectionInput) {
+  function buildRestorableCircleEntry(circle: {
+    name: string;
+    relay: string;
+    type: RestorableCircleEntry["type"];
+    description: string;
+  }): RestorableCircleEntry {
+    return {
+      name: circle.name.trim() || "Restored Circle",
+      relay: circle.relay.trim(),
+      type: circle.type,
+      description: circle.description.trim(),
+      archivedAt: new Date().toISOString(),
+    };
+  }
+
+  function sameRelay(left: string, right: string) {
+    return left.trim().toLowerCase() === right.trim().toLowerCase();
+  }
+
+  function upsertRestorableCircle(entry: RestorableCircleEntry) {
+    restorableCircles.value = [
+      cloneState(entry),
+      ...restorableCircles.value.filter((item) => !sameRelay(item.relay, entry.relay)),
+    ];
+  }
+
+  function forgetRestorableCircle(relay: string) {
+    restorableCircles.value = restorableCircles.value.filter((entry) => {
+      return !sameRelay(entry.relay, relay);
+    });
+  }
+
+  function forgetRestorableCircleByCircleId(circleId: string) {
+    const circle = circles.value.find((item) => item.id === circleId);
+    if (!circle) {
+      return;
+    }
+
+    forgetRestorableCircle(circle.relay);
+  }
+
+  function applyLocalRestoreCircle(entry: RestorableCircleEntry) {
+    const existing = circles.value.find((circle) => sameRelay(circle.relay, entry.relay));
+    if (existing) {
+      return existing.id;
+    }
+
+    const nextCircle = {
+      id: buildUniqueCircleId(entry.name),
+      name: entry.name.trim() || "Restored Circle",
+      relay: entry.relay.trim(),
+      type: entry.type,
+      status: "connecting",
+      latency: "--",
+      description: entry.description.trim(),
+    } as const;
+
+    circles.value = [nextCircle, ...circles.value];
+    return nextCircle.id;
+  }
+
+  async function restoreRestorableCircle(entry: RestorableCircleEntry) {
+    const mutation = await runFallbackEligibleMutation(() => restoreChatCircle({
+      name: entry.name,
+      relay: entry.relay,
+      type: entry.type,
+      description: entry.description,
+    }), {
+      title: "Restore circle failed",
+      fallbackDetail: "Desktop restore could not rehydrate the native circle entry.",
+    });
+
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
+        preferredCircleId: mutation.result.circleId,
+        preferredSessionId: selectedSessionId.value,
+      });
+      forgetRestorableCircleByCircleId(mutation.result.circleId);
+      return mutation.result.circleId;
+    }
+
+    if (!mutation.canFallbackLocally) {
+      return null;
+    }
+
+    const circleId = applyLocalRestoreCircle(entry);
+    if (circleId) {
+      forgetRestorableCircle(entry.relay);
+    }
+    return circleId;
+  }
+
+  async function restoreCircleAccess(entry: RestorableCircleEntry) {
+    const circleId = await restoreRestorableCircle(entry);
+    if (circleId) {
+      chooseCircle(circleId);
+    }
+  }
+
+  async function resolveLoginCircle(selection: LoginCircleSelectionInput): Promise<{
+    circleId: string;
+    canFallbackToExistingCircle: boolean;
+  }> {
     if (selection.mode === "restore") {
-      return circles.value[0]?.id ?? activeCircleId.value;
+      const catalogEntry =
+        restorableCircles.value.find((entry) => {
+          if (!selection.relay?.trim()) {
+            return false;
+          }
+
+          return sameRelay(entry.relay, selection.relay);
+        }) ?? restorableCircles.value[0];
+      if (catalogEntry) {
+        const circleId = await restoreRestorableCircle(catalogEntry);
+        return {
+          circleId: circleId ?? "",
+          canFallbackToExistingCircle: !!circleId,
+        };
+      }
+
+      return {
+        circleId: circles.value[0]?.id ?? activeCircleId.value,
+        canFallbackToExistingCircle: true,
+      };
     }
 
     if (selection.mode === "existing") {
-      return selection.circleId ?? circles.value[0]?.id ?? "";
+      const preferredCircleId = selection.circleId?.trim() ?? "";
+      return {
+        circleId:
+          circles.value.find((circle) => circle.id === preferredCircleId)?.id ??
+          circles.value[0]?.id ??
+          activeCircleId.value,
+        canFallbackToExistingCircle: true,
+      };
     }
 
     const addInput: AddCircleInput =
@@ -1803,39 +2726,149 @@ export function useChatShell() {
             inviteCode: selection.inviteCode?.trim() || "",
           };
 
-    const result = await addChatCircle(addInput);
-    if (result) {
-      applyDomainSeed(result.seed, {
-        preferredCircleId: result.circleId,
+    const mutation = await runFallbackEligibleMutation(() => addChatCircle(addInput), {
+      title: "Circle setup failed",
+      fallbackDetail: "Desktop login could not persist the selected circle in native state.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
+        preferredCircleId: mutation.result.circleId,
         preferredSessionId: selectedSessionId.value,
       });
-      return result.circleId;
+      forgetRestorableCircleByCircleId(mutation.result.circleId);
+      return {
+        circleId: mutation.result.circleId,
+        canFallbackToExistingCircle: true,
+      };
     }
 
-    return applyLocalAddCircleFromDirectory(addInput);
+    if (!mutation.canFallbackLocally) {
+      return {
+        circleId: "",
+        canFallbackToExistingCircle: false,
+      };
+    }
+
+    const circleId = applyLocalAddCircleFromDirectory(addInput);
+    forgetRestorableCircleByCircleId(circleId);
+    return {
+      circleId,
+      canFallbackToExistingCircle: true,
+    };
   }
 
   async function completeLogin(input: LoginCompletionInput) {
-    isAuthenticated.value = true;
-    authSession.value = buildAuthSessionSummary(input);
-    userProfile.value = cloneState(input.userProfile) as UserProfile;
-    closeTransientChrome();
-    closeAllOverlayPages();
-    await refreshDomainOverview();
-    const nextCircleId = await resolveLoginCircle(input.circleSelection);
+    const nextInput = cloneState({
+      ...input,
+      loggedInAt: input.loggedInAt ?? new Date().toISOString(),
+    }) as LoginCompletionInput;
+    let completedSnapshot: ChatShellSnapshot | null = null;
 
-    if (nextCircleId) {
-      chooseCircle(nextCircleId);
+    try {
+      completedSnapshot = await completeLoginViaRuntime(nextInput);
+    } catch (error) {
+      showTransportNotice({
+        id: `complete-login-failed-${Date.now()}`,
+        tone: "warn",
+        title: "Login failed",
+        detail: describeCommandError(
+          error,
+          "Desktop login could not finish the native shell bootstrap.",
+        ),
+      });
       return;
     }
 
-    if (circles.value[0]?.id) {
-      chooseCircle(circles.value[0].id);
+    if (completedSnapshot) {
+      resetDesktopFailureFlags();
+      closeTransientChrome();
+      closeAllOverlayPages();
+      applyChatShellSnapshot(completedSnapshot);
+      searchText.value = "";
+      composerText.value = "";
+      return;
     }
+
+    let bootstrappedShell: ShellStateSnapshot | null = null;
+
+    try {
+      bootstrappedShell = await bootstrapAuthSession(nextInput);
+    } catch (error) {
+      showTransportNotice({
+        id: `bootstrap-login-failed-${Date.now()}`,
+        tone: "warn",
+        title: "Login bootstrap failed",
+        detail: describeCommandError(
+          error,
+          "Desktop login could not persist the auth session bootstrap state.",
+        ),
+      });
+      return;
+    }
+
+    if (bootstrappedShell) {
+      resetDesktopFailureFlags();
+      applyShellSnapshot(bootstrappedShell);
+      isAuthenticated.value = true;
+    } else {
+      const nextAuthSession = buildAuthSessionSummary(nextInput);
+      resetDesktopFailureFlags();
+      isAuthenticated.value = true;
+      authSession.value = nextAuthSession;
+      authRuntime.value = buildAuthRuntimeSummary(nextInput, nextAuthSession);
+      authRuntimeBinding.value = buildAuthRuntimeBindingSummary(nextInput, false);
+      userProfile.value = cloneState(nextInput.userProfile) as UserProfile;
+    }
+
+    dismissTransportNotice();
+    closeTransientChrome();
+    closeAllOverlayPages();
+    await refreshDomainOverview({ showFailureNotice: true });
+    const circleResolution = await resolveLoginCircle(nextInput.circleSelection);
+
+    if (circleResolution.circleId) {
+      chooseCircle(circleResolution.circleId);
+      return;
+    }
+
+    if (circleResolution.canFallbackToExistingCircle && circles.value[0]?.id) {
+      chooseCircle(circles.value[0].id);
+      return;
+    }
+
+    activeCircleId.value = "";
+    selectedSessionId.value = "";
+    showTransportNotice({
+      id: `login-without-circle-${Date.now()}`,
+      tone: "warn",
+      title: "Logged in without a circle",
+      detail:
+        "Desktop auth completed, but the selected circle could not be restored or added. Add or restore a circle before starting chats.",
+    });
   }
 
-  function logout() {
+  async function logout() {
+    const snapshot = buildLoggedOutShellSnapshot();
+    let runtimeSnapshot: ChatShellSnapshot | null = null;
+
+    try {
+      runtimeSnapshot = await logoutChatSession();
+    } catch (error) {
+      showTransportNotice({
+        id: `logout-failed-${Date.now()}`,
+        tone: "warn",
+        title: "Logout failed",
+        detail: describeCommandError(
+          error,
+          "Desktop logout did not clear the native shell state. Try again before closing the app.",
+        ),
+      });
+      return;
+    }
+
     cancelPendingDraftPersistence();
+    clearAuthRuntimeSyncTimer();
+    resetDesktopFailureFlags();
     if (persistTimer) {
       window.clearTimeout(persistTimer);
       persistTimer = null;
@@ -1846,12 +2879,59 @@ export function useChatShell() {
     transportSnapshot.value = null;
     closeTransientChrome();
     closeAllOverlayPages();
-    applyChatShellSnapshot(buildLoggedOutShellSnapshot());
     composerText.value = "";
     searchText.value = "";
-    const snapshot = snapshotChatShellState();
+
+    if (runtimeSnapshot) {
+      applyChatShellSnapshot(runtimeSnapshot);
+      persistChatShellSnapshotLocally(runtimeSnapshot);
+      return;
+    }
+
+    applyChatShellSnapshot(snapshot);
     persistChatShellSnapshotLocally(snapshot);
-    void saveChatShellSnapshot(snapshot);
+    void persistShellSnapshotToNative(snapshot);
+  }
+
+  async function updateAuthRuntime(input: UpdateAuthRuntimeInput) {
+    const nextInput = cloneState({
+      ...input,
+      updatedAt: input.updatedAt ?? new Date().toISOString(),
+    }) as UpdateAuthRuntimeInput;
+    let runtimeShell: ShellStateSnapshot | null = null;
+
+    try {
+      runtimeShell = await updateAuthRuntimeViaRuntime(nextInput);
+    } catch (error) {
+      showTransportNotice({
+        id: `update-auth-runtime-failed-${Date.now()}`,
+        tone: "warn",
+        title: "Auth runtime update failed",
+        detail: describeCommandError(
+          error,
+          "Desktop auth runtime state could not be updated in native storage.",
+        ),
+      });
+      return;
+    }
+
+    if (runtimeShell) {
+      applyShellSnapshot(runtimeShell);
+      persistChatShellSnapshotLocally(snapshotChatShellState());
+      return;
+    }
+
+    const nextRuntime = buildUpdatedAuthRuntime(
+      authSession.value,
+      effectiveAuthRuntime.value,
+      nextInput,
+    );
+    if (!nextRuntime) {
+      return;
+    }
+
+    authRuntime.value = nextRuntime;
+    schedulePersistence();
   }
 
   function deleteSession(sessionId: string) {
@@ -1920,12 +3000,7 @@ export function useChatShell() {
 
   function inferCircleInputFromQuery(query: string): AddCircleInput {
     const trimmed = query.trim();
-    const isRelayUrl =
-      /^wss?:\/\//i.test(trimmed) ||
-      /^mesh:\/\//i.test(trimmed) ||
-      /^invite:\/\//i.test(trimmed);
-
-    if (isRelayUrl && !/^invite:\/\//i.test(trimmed)) {
+    if (classifyChatQuery(trimmed) === "relay") {
       let relayLabel = "Custom Relay";
       try {
         const url = new URL(trimmed);
@@ -1948,7 +3023,561 @@ export function useChatShell() {
     };
   }
 
-  function applyLocalSendPreviewMessage(content: string, sessionId: string) {
+  function shouldReturnToNewMessageAfterCircleJoin() {
+    const activePage = overlayPages.value[overlayPages.value.length - 1];
+    const previousPage = overlayPages.value[overlayPages.value.length - 2];
+
+    return activePage?.kind === "find-people" && previousPage?.kind === "new-message";
+  }
+
+  function messagePreviewSnippet(message: MessageItem) {
+    switch (message.kind) {
+      case "image":
+        return `Shared image: ${message.body}`;
+      case "video":
+        return `Shared video: ${message.body}`;
+      case "file":
+        return `Shared file: ${message.body}`;
+      case "audio":
+        return `Audio: ${message.meta ?? "Voice note"}`;
+      default:
+        return message.body || "Empty message";
+    }
+  }
+
+  function messageReplyAuthorLabel(message: MessageItem) {
+    switch (message.author) {
+      case "me":
+        return "You";
+      case "peer":
+        return selectedSession.value?.kind === "direct" ? selectedSession.value.name : "Peer";
+      default:
+        return "System";
+    }
+  }
+
+  function buildLocalReplyPreview(message: MessageItem) {
+    return {
+      messageId: message.id,
+      remoteId: message.remoteId,
+      author: message.author,
+      authorLabel: messageReplyAuthorLabel(message),
+      kind: message.kind,
+      snippet: messagePreviewSnippet(message),
+    };
+  }
+
+  function startReplyToMessage(messageId: string) {
+    if (!selectedSession.value) {
+      return;
+    }
+
+    const message = (messageStore.value[selectedSession.value.id] ?? []).find(
+      (item) => item.id === messageId,
+    );
+    if (!message || message.kind === "system") {
+      return;
+    }
+
+    replyToMessageId.value = messageId;
+  }
+
+  function cancelReplyToMessage() {
+    replyToMessageId.value = null;
+  }
+
+  function sessionMessageById(sessionId: string | null | undefined, messageId: string) {
+    const normalizedSessionId = sessionId?.trim() ?? "";
+    if (!normalizedSessionId) {
+      return null;
+    }
+
+    const session = sessions.value.find((candidate) => candidate.id === normalizedSessionId) ?? null;
+    if (!session) {
+      return null;
+    }
+
+    const message = (messageStore.value[normalizedSessionId] ?? []).find((item) => item.id === messageId) ?? null;
+    return message ? { session, message } : null;
+  }
+
+  function selectedSessionMessageById(messageId: string) {
+    return sessionMessageById(selectedSession.value?.id, messageId);
+  }
+
+  function messageAttachmentLocalPath(message: MessageItem) {
+    switch (message.kind) {
+      case "file":
+        return fileMessageLocalPath(message);
+      case "image":
+        return imageMessageLocalPath(message);
+      case "video":
+        return videoMessageLocalPath(message);
+      default:
+        return "";
+    }
+  }
+
+  function messageAttachmentRemoteUrl(message: MessageItem) {
+    switch (message.kind) {
+      case "file":
+        return fileMessageRemoteUrl(message);
+      case "image":
+        return imageMessageRemoteUrl(message);
+      case "video":
+        return videoMessageRemoteUrl(message);
+      default:
+        return "";
+    }
+  }
+
+  async function ensureMessageAttachmentLocalPath(messageId: string, sessionId?: string) {
+    const selected = sessionMessageById(sessionId ?? selectedSession.value?.id, messageId);
+    if (!selected) {
+      return "";
+    }
+
+    const existingLocalPath = messageAttachmentLocalPath(selected.message);
+    if (existingLocalPath) {
+      return existingLocalPath;
+    }
+
+    const remoteUrl = messageAttachmentRemoteUrl(selected.message);
+    if (!remoteUrl) {
+      return "";
+    }
+
+    try {
+      const result = await cacheChatMessageMedia({
+        sessionId: selected.session.id,
+        messageId: selected.message.id,
+      });
+      if (!result) {
+        return "";
+      }
+
+      applyDomainSeed(result.seed, {
+        preferredCircleId: activeCircleId.value,
+        preferredSessionId: selectedSession.value?.id ?? selected.session.id,
+      });
+      return result.localPath;
+    } catch (error) {
+      showTransportNotice({
+        id: `cache-attachment-failed-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Attachment cache failed",
+        detail: describeCommandError(
+          error,
+          `The remote attachment for message ${selected.message.id} could not be cached locally.`,
+        ),
+        circleId: selected.session.circleId,
+      });
+      return "";
+    }
+  }
+
+  function messageAttachmentLabel(message: MessageItem) {
+    switch (message.kind) {
+      case "file":
+        return "attachment";
+      case "image":
+        return "image";
+      case "video":
+        return "video";
+      default:
+        return "media";
+    }
+  }
+
+  function clipboardMessageContent(message: MessageItem) {
+    switch (message.kind) {
+      case "image":
+        return imageMessageMetaLabel(message)
+          ? `${message.body}\n${imageMessageMetaLabel(message)}`
+          : message.body;
+      case "video":
+        return videoMessageMetaLabel(message)
+          ? `${message.body}\n${videoMessageMetaLabel(message)}`
+          : message.body;
+      case "file":
+        return fileMessageMetaLabel(message)
+          ? `${message.body}\n${fileMessageMetaLabel(message)}`
+          : message.body;
+      case "audio":
+        return message.meta ?? message.body;
+      default:
+        return message.body;
+    }
+  }
+
+  function clipboardCopyLabel(message: MessageItem) {
+    switch (message.kind) {
+      case "image":
+        return "Image name";
+      case "video":
+        return "Video name";
+      case "file":
+        return "File name";
+      case "audio":
+        return "Audio label";
+      default:
+        return "Message";
+    }
+  }
+
+  async function writeClipboardText(value: string) {
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      throw new Error("Clipboard unavailable");
+    }
+
+    await navigator.clipboard.writeText(value);
+  }
+
+  async function copyMessageContent(messageId: string) {
+    const selected = selectedSessionMessageById(messageId);
+    if (!selected) {
+      return;
+    }
+
+    try {
+      await writeClipboardText(clipboardMessageContent(selected.message));
+      showTransportNotice({
+        id: `copy-message-${selected.session.id}-${selected.message.id}`,
+        tone: "info",
+        title: `${clipboardCopyLabel(selected.message)} copied`,
+        detail: `The selected ${selected.message.kind} content is now on your clipboard.`,
+        circleId: selected.session.circleId,
+      });
+    } catch (error) {
+      showTransportNotice({
+        id: `copy-message-failed-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Copy failed",
+        detail: describeCommandError(
+          error,
+          `Clipboard write did not complete for message ${selected.message.id}.`,
+        ),
+        circleId: selected.session.circleId,
+      });
+    }
+  }
+
+  async function reportMessage(messageId: string, reason: string) {
+    const selected = selectedSessionMessageById(messageId);
+    if (!selected || selected.message.author !== "peer") {
+      return;
+    }
+
+    const reportPackage = {
+      reportedAt: new Date().toISOString(),
+      reason,
+      sessionId: selected.session.id,
+      sessionName: selected.session.name,
+      circleId: selected.session.circleId,
+      messageId: selected.message.id,
+      remoteId: selected.message.remoteId ?? null,
+      author: selected.message.author,
+      kind: selected.message.kind,
+      body: selected.message.body,
+      meta: selected.message.meta ?? null,
+      localAttachmentPath: messageAttachmentLocalPath(selected.message) || null,
+      remoteAttachmentUrl: messageAttachmentRemoteUrl(selected.message) || null,
+      syncSource: selected.message.syncSource ?? null,
+      ackedAt: selected.message.ackedAt ?? null,
+      signedNostrEvent: selected.message.signedNostrEvent ?? null,
+      replyTo: selected.message.replyTo ?? null,
+    };
+
+    try {
+      await writeClipboardText(JSON.stringify(reportPackage, null, 2));
+      showTransportNotice({
+        id: `report-message-${selected.session.id}-${selected.message.id}-${reason}`,
+        tone: "info",
+        title: "Report package copied",
+        detail:
+          "A moderation handoff JSON package was copied to your clipboard. Remote report submission is not wired yet.",
+        circleId: selected.session.circleId,
+      });
+    } catch (error) {
+      showTransportNotice({
+        id: `report-message-failed-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Report copy failed",
+        detail: describeCommandError(
+          error,
+          "The report package could not be copied to clipboard.",
+        ),
+        circleId: selected.session.circleId,
+      });
+    }
+  }
+
+  async function openMessageAttachment(messageId: string, sessionId?: string) {
+    const selected = sessionMessageById(sessionId ?? selectedSession.value?.id, messageId);
+    if (!selected) {
+      return;
+    }
+
+    const localPath = await ensureMessageAttachmentLocalPath(messageId, selected.session.id);
+    if (!localPath) {
+      showTransportNotice({
+        id: `open-attachment-missing-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Attachment unavailable",
+        detail: "This message does not have a local attachment path yet.",
+        circleId: selected.session.circleId,
+      });
+      return;
+    }
+
+    try {
+      await openPath(localPath);
+      showTransportNotice({
+        id: `open-attachment-${selected.session.id}-${selected.message.id}`,
+        tone: "info",
+        title: `${messageAttachmentLabel(selected.message)} opened`,
+        detail: `Opened ${selected.message.body} using the system default application.`,
+        circleId: selected.session.circleId,
+      });
+    } catch (error) {
+      showTransportNotice({
+        id: `open-attachment-failed-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Attachment open failed",
+        detail: describeCommandError(
+          error,
+          `The local attachment for message ${selected.message.id} could not be opened.`,
+        ),
+        circleId: selected.session.circleId,
+      });
+    }
+  }
+
+  async function revealMessageAttachment(messageId: string, sessionId?: string) {
+    const selected = sessionMessageById(sessionId ?? selectedSession.value?.id, messageId);
+    if (!selected) {
+      return;
+    }
+
+    const localPath = await ensureMessageAttachmentLocalPath(messageId, selected.session.id);
+    if (!localPath) {
+      showTransportNotice({
+        id: `reveal-attachment-missing-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Attachment unavailable",
+        detail: "This message does not have a local attachment path yet.",
+        circleId: selected.session.circleId,
+      });
+      return;
+    }
+
+    try {
+      await revealItemInDir(localPath);
+      showTransportNotice({
+        id: `reveal-attachment-${selected.session.id}-${selected.message.id}`,
+        tone: "info",
+        title: "Attachment revealed",
+        detail: `Revealed ${selected.message.body} in the local file browser.`,
+        circleId: selected.session.circleId,
+      });
+    } catch (error) {
+      showTransportNotice({
+        id: `reveal-attachment-failed-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Reveal in folder failed",
+        detail: describeCommandError(
+          error,
+          `The local attachment for message ${selected.message.id} could not be revealed.`,
+        ),
+        circleId: selected.session.circleId,
+      });
+    }
+  }
+
+  async function copyMessageAttachmentPath(messageId: string, sessionId?: string) {
+    const selected = sessionMessageById(sessionId ?? selectedSession.value?.id, messageId);
+    if (!selected) {
+      return;
+    }
+
+    const localPath = await ensureMessageAttachmentLocalPath(messageId, selected.session.id);
+    if (!localPath) {
+      showTransportNotice({
+        id: `copy-attachment-path-missing-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Attachment path unavailable",
+        detail: "This message does not have a local attachment path yet.",
+        circleId: selected.session.circleId,
+      });
+      return;
+    }
+
+    try {
+      await writeClipboardText(localPath);
+      showTransportNotice({
+        id: `copy-attachment-path-${selected.session.id}-${selected.message.id}`,
+        tone: "info",
+        title: "Attachment path copied",
+        detail: `The local path for ${selected.message.body} is now on your clipboard.`,
+        circleId: selected.session.circleId,
+      });
+    } catch (error) {
+      showTransportNotice({
+        id: `copy-attachment-path-failed-${selected.session.id}-${selected.message.id}`,
+        tone: "warn",
+        title: "Copy path failed",
+        detail: describeCommandError(
+          error,
+          `Clipboard write did not complete for attachment path ${selected.message.id}.`,
+        ),
+        circleId: selected.session.circleId,
+      });
+    }
+  }
+
+  function localOutgoingSessionPreview(
+    kind: MessageItem["kind"],
+    body: string,
+    meta?: string,
+  ) {
+    switch (kind) {
+      case "image":
+        return `Shared image: ${body}`;
+      case "video":
+        return `Shared video: ${body}`;
+      case "file":
+        return `Shared file: ${body}`;
+      case "audio":
+        return `Audio: ${meta ?? "Voice note"}`;
+      default:
+        return body;
+    }
+  }
+
+  function formatAttachmentSize(bytes: number) {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      return "Unknown size";
+    }
+
+    if (bytes >= 1024 * 1024 * 1024) {
+      return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    }
+
+    if (bytes >= 1024 * 1024) {
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
+    if (bytes >= 1024) {
+      return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    }
+
+    return `${bytes} B`;
+  }
+
+  function formatAttachmentMeta(file: File) {
+    const typeLabel = file.type.split("/")[1]
+      ? file.type.split("/")[1].replace(/[-_]+/g, " ").toUpperCase()
+      : "File";
+    return `${typeLabel} · ${formatAttachmentSize(file.size)}`;
+  }
+
+  function formatImageAttachmentMeta(file: File, width?: number, height?: number) {
+    const formatLabel = file.type.split("/")[1]
+      ? file.type.split("/")[1].replace(/[-_]+/g, " ").toUpperCase()
+      : "Image";
+    const dimensionLabel = width && height ? `${width} x ${height}` : "Unknown size";
+    return `${formatLabel} · ${dimensionLabel} · ${formatAttachmentSize(file.size)}`;
+  }
+
+  function formatVideoDuration(durationSeconds?: number) {
+    if (!Number.isFinite(durationSeconds) || !durationSeconds || durationSeconds <= 0) {
+      return "Unknown duration";
+    }
+
+    const totalSeconds = Math.max(1, Math.round(durationSeconds));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function formatVideoAttachmentMeta(
+    file: File,
+    durationSeconds?: number,
+    width?: number,
+    height?: number,
+  ) {
+    const formatLabel = file.type.split("/")[1]
+      ? file.type.split("/")[1].replace(/[-_]+/g, " ").toUpperCase()
+      : "Video";
+    const dimensionLabel = width && height ? `${width} x ${height}` : "Unknown resolution";
+    return `${formatLabel} · ${dimensionLabel} · ${formatVideoDuration(durationSeconds)} · ${formatAttachmentSize(file.size)}`;
+  }
+
+  async function persistNativeMediaAsset(
+    input: StoreChatMediaAssetInput,
+  ): Promise<StoredChatMediaAsset | null> {
+    return storeChatMediaAsset(input);
+  }
+
+  async function cleanupOrphanedMediaAssets() {
+    try {
+      await cleanupChatMediaAssets();
+    } catch {
+      // Best-effort cleanup. Media GC failures should not block the main user action.
+    }
+  }
+
+  function readFileAsDataUrl(file: File) {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string" && reader.result) {
+          resolve(reader.result);
+          return;
+        }
+
+        reject(new Error("Could not read the selected file."));
+      };
+      reader.onerror = () => reject(reader.error ?? new Error("Could not read the selected file."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function resolveImageDimensions(dataUrl: string) {
+    return new Promise<{ width?: number; height?: number }>((resolve) => {
+      const image = new Image();
+      image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+      image.onerror = () => resolve({});
+      image.src = dataUrl;
+    });
+  }
+
+  function resolveVideoMetadata(dataUrl: string) {
+    return new Promise<{ width?: number; height?: number; durationSeconds?: number }>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.onloadedmetadata = () =>
+        resolve({
+          width: video.videoWidth || undefined,
+          height: video.videoHeight || undefined,
+          durationSeconds: Number.isFinite(video.duration) ? video.duration : undefined,
+        });
+      video.onerror = () => resolve({});
+      video.src = dataUrl;
+    });
+  }
+
+  function applyLocalSendPreviewMessage(
+    content: string,
+    sessionId: string,
+    replyToMessage: MessageItem | null,
+  ) {
     const session = sessions.value.find((item) => item.id === sessionId);
     const message: MessageItem = {
       id: `local-${Date.now()}`,
@@ -1957,6 +3586,8 @@ export function useChatShell() {
       body: content,
       time: "now",
       deliveryStatus: messageDeliveryStatusForCircle(session?.circleId ?? activeCircleId.value),
+      syncSource: "local",
+      replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
     };
 
     messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
@@ -1979,41 +3610,436 @@ export function useChatShell() {
     sessions.value = nextSessions;
   }
 
+  function applyLocalSendPreviewFileMessage(
+    file: File,
+    sessionId: string,
+    replyToMessage: MessageItem | null,
+  ) {
+    const session = sessions.value.find((item) => item.id === sessionId);
+    const normalizedName = file.name.trim() || "Untitled file";
+    const meta = formatAttachmentMeta(file);
+    const message: MessageItem = {
+      id: `local-${Date.now()}`,
+      kind: "file",
+      author: "me",
+      body: normalizedName,
+      time: "now",
+      meta,
+      deliveryStatus: messageDeliveryStatusForCircle(session?.circleId ?? activeCircleId.value),
+      syncSource: "local",
+      replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
+    };
+
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+
+    const targetIndex = sessions.value.findIndex((currentSession) => currentSession.id === sessionId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const updatedSession = {
+      ...sessions.value[targetIndex],
+      subtitle: localOutgoingSessionPreview("file", normalizedName, meta),
+      time: "now",
+      draft: undefined,
+    };
+
+    const nextSessions = [...sessions.value];
+    nextSessions.splice(targetIndex, 1);
+    nextSessions.unshift(updatedSession);
+    sessions.value = nextSessions;
+  }
+
+  function applyLocalSendPreviewImageMessage(
+    input: SendImageMessageInput,
+    sessionId: string,
+    replyToMessage: MessageItem | null,
+  ) {
+    const session = sessions.value.find((item) => item.id === sessionId);
+    const message: MessageItem = {
+      id: `local-${Date.now()}`,
+      kind: "image",
+      author: "me",
+      body: input.name,
+      time: "now",
+      meta: input.meta,
+      deliveryStatus: messageDeliveryStatusForCircle(session?.circleId ?? activeCircleId.value),
+      syncSource: "local",
+      replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
+    };
+
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+
+    const targetIndex = sessions.value.findIndex((currentSession) => currentSession.id === sessionId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const updatedSession = {
+      ...sessions.value[targetIndex],
+      subtitle: localOutgoingSessionPreview("image", input.name),
+      time: "now",
+      draft: undefined,
+    };
+
+    const nextSessions = [...sessions.value];
+    nextSessions.splice(targetIndex, 1);
+    nextSessions.unshift(updatedSession);
+    sessions.value = nextSessions;
+  }
+
+  function applyLocalSendPreviewVideoMessage(
+    input: SendVideoMessageInput,
+    sessionId: string,
+    replyToMessage: MessageItem | null,
+  ) {
+    const session = sessions.value.find((item) => item.id === sessionId);
+    const message: MessageItem = {
+      id: `local-${Date.now()}`,
+      kind: "video",
+      author: "me",
+      body: input.name,
+      time: "now",
+      meta: input.meta,
+      deliveryStatus: messageDeliveryStatusForCircle(session?.circleId ?? activeCircleId.value),
+      syncSource: "local",
+      replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
+    };
+
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+
+    const targetIndex = sessions.value.findIndex((currentSession) => currentSession.id === sessionId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const updatedSession = {
+      ...sessions.value[targetIndex],
+      subtitle: localOutgoingSessionPreview("video", input.name),
+      time: "now",
+      draft: undefined,
+    };
+
+    const nextSessions = [...sessions.value];
+    nextSessions.splice(targetIndex, 1);
+    nextSessions.unshift(updatedSession);
+    sessions.value = nextSessions;
+  }
+
   async function sendPreviewMessage() {
     const content = composerText.value.trim();
-    if (!content || !selectedSession.value) {
+    if (!content || !selectedSession.value || !canSendMessages.value) {
       return;
     }
 
     const sessionId = selectedSession.value.id;
+    const currentReplyToMessage = replyingToMessage.value;
+    const currentReplyToMessageId = currentReplyToMessage?.id;
     cancelPendingDraftPersistence();
     composerText.value = "";
     applyLocalSessionDraft(sessionId, "");
-    const nextSeed = await sendChatMessage({ sessionId, body: content });
+    let nextSeed: ChatDomainSeed | null = null;
+
+    try {
+      nextSeed = await sendChatMessage({
+        sessionId,
+        body: content,
+        replyToMessageId: currentReplyToMessageId ?? undefined,
+      });
+    } catch (error) {
+      composerText.value = content;
+      applyLocalSessionDraft(sessionId, content);
+      showTransportNotice({
+        id: `send-message-failed-${sessionId}-${Date.now()}`,
+        tone: "warn",
+        title: "Send failed",
+        detail: describeCommandError(
+          error,
+          "Desktop send did not complete. The composer text was restored and the runtime state will be refreshed.",
+        ),
+      });
+      await refreshAuthRuntimeStateFromNative();
+      return;
+    }
 
     if (nextSeed) {
+      replyToMessageId.value = null;
       applyDomainSeed(nextSeed, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: sessionId,
       });
+      await refreshAuthRuntimeStateFromNative();
       return;
     }
 
-    applyLocalSendPreviewMessage(content, sessionId);
+    applyLocalSendPreviewMessage(content, sessionId, currentReplyToMessage);
+    replyToMessageId.value = null;
   }
 
-  async function retryMessageDelivery(messageId: string) {
-    if (!selectedSession.value) {
+  async function sendAttachmentMessage(file: File) {
+    if (!selectedSession.value || !canSendMessages.value) {
       return;
     }
 
     const sessionId = selectedSession.value.id;
-    const nextSeed = await retryChatMessageDelivery({ sessionId, messageId });
+    const normalizedName = file.name.trim();
+    if (!normalizedName) {
+      showTransportNotice({
+        id: `send-file-empty-${sessionId}-${Date.now()}`,
+        tone: "warn",
+        title: "Attachment failed",
+        detail: "The selected file does not have a usable name.",
+      });
+      return;
+    }
+
+    const currentReplyToMessage = replyingToMessage.value;
+    const currentReplyToMessageId = currentReplyToMessage?.id;
+    let nextSeed: ChatDomainSeed | null = null;
+
+    if (file.type.startsWith("image/")) {
+      let imageInput: SendImageMessageInput;
+      try {
+        const previewDataUrl = await readFileAsDataUrl(file);
+        const dimensions = await resolveImageDimensions(previewDataUrl);
+        const storedAsset = await persistNativeMediaAsset({
+          kind: "image",
+          name: normalizedName,
+          dataUrl: previewDataUrl,
+        });
+        imageInput = {
+          sessionId,
+          name: normalizedName,
+          meta: storedAsset
+            ? encodeImageMessageMeta({
+                label: formatImageAttachmentMeta(file, dimensions.width, dimensions.height),
+                localPath: storedAsset.localPath,
+              })
+            : encodeImageMessageMeta({
+                label: formatImageAttachmentMeta(file, dimensions.width, dimensions.height),
+                localPath: previewDataUrl,
+              }),
+          replyToMessageId: currentReplyToMessageId ?? undefined,
+        };
+      } catch (error) {
+        showTransportNotice({
+          id: `send-image-read-failed-${sessionId}-${Date.now()}`,
+          tone: "warn",
+          title: "Image attachment failed",
+          detail: describeCommandError(
+            error,
+            "The selected image could not be prepared for preview and persistence.",
+          ),
+        });
+        return;
+      }
+
+      try {
+        nextSeed = await sendChatImageMessage(imageInput);
+      } catch (error) {
+        await cleanupOrphanedMediaAssets();
+        showTransportNotice({
+          id: `send-image-failed-${sessionId}-${Date.now()}`,
+          tone: "warn",
+          title: "Image attachment failed",
+          detail: describeCommandError(
+            error,
+            "Desktop image send did not complete. The runtime state will be refreshed before the next attempt.",
+          ),
+        });
+        await refreshAuthRuntimeStateFromNative();
+        return;
+      }
+
+      if (nextSeed) {
+        replyToMessageId.value = null;
+        applyDomainSeed(nextSeed, {
+          preferredCircleId: activeCircleId.value,
+          preferredSessionId: sessionId,
+        });
+        await refreshAuthRuntimeStateFromNative();
+        return;
+      }
+
+      applyLocalSendPreviewImageMessage(imageInput, sessionId, currentReplyToMessage);
+      replyToMessageId.value = null;
+      return;
+    }
+
+    if (file.type.startsWith("video/")) {
+      let videoInput: SendVideoMessageInput;
+      try {
+        const previewDataUrl = await readFileAsDataUrl(file);
+        const metadata = await resolveVideoMetadata(previewDataUrl);
+        const storedAsset = await persistNativeMediaAsset({
+          kind: "video",
+          name: normalizedName,
+          dataUrl: previewDataUrl,
+        });
+        videoInput = {
+          sessionId,
+          name: normalizedName,
+          meta: storedAsset
+            ? encodeVideoMessageMeta({
+                label: formatVideoAttachmentMeta(
+                  file,
+                  metadata.durationSeconds,
+                  metadata.width,
+                  metadata.height,
+                ),
+                localPath: storedAsset.localPath,
+              })
+            : encodeVideoMessageMeta({
+                label: formatVideoAttachmentMeta(
+                  file,
+                  metadata.durationSeconds,
+                  metadata.width,
+                  metadata.height,
+                ),
+                localPath: previewDataUrl,
+              }),
+          replyToMessageId: currentReplyToMessageId ?? undefined,
+        };
+      } catch (error) {
+        showTransportNotice({
+          id: `send-video-read-failed-${sessionId}-${Date.now()}`,
+          tone: "warn",
+          title: "Video attachment failed",
+          detail: describeCommandError(
+            error,
+            "The selected video could not be prepared for preview and persistence.",
+          ),
+        });
+        return;
+      }
+
+      try {
+        nextSeed = await sendChatVideoMessage(videoInput);
+      } catch (error) {
+        await cleanupOrphanedMediaAssets();
+        showTransportNotice({
+          id: `send-video-failed-${sessionId}-${Date.now()}`,
+          tone: "warn",
+          title: "Video attachment failed",
+          detail: describeCommandError(
+            error,
+            "Desktop video send did not complete. The runtime state will be refreshed before the next attempt.",
+          ),
+        });
+        await refreshAuthRuntimeStateFromNative();
+        return;
+      }
+
+      if (nextSeed) {
+        replyToMessageId.value = null;
+        applyDomainSeed(nextSeed, {
+          preferredCircleId: activeCircleId.value,
+          preferredSessionId: sessionId,
+        });
+        await refreshAuthRuntimeStateFromNative();
+        return;
+      }
+
+      applyLocalSendPreviewVideoMessage(videoInput, sessionId, currentReplyToMessage);
+      replyToMessageId.value = null;
+      return;
+    }
+
+    const label = formatAttachmentMeta(file);
+    let meta = label;
+
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const storedAsset = await persistNativeMediaAsset({
+        kind: "file",
+        name: normalizedName,
+        dataUrl,
+      });
+      if (storedAsset) {
+        meta = encodeFileMessageMeta({
+          label,
+          localPath: storedAsset.localPath,
+        });
+      }
+    } catch (error) {
+      showTransportNotice({
+        id: `store-file-media-failed-${sessionId}-${Date.now()}`,
+        tone: "warn",
+        title: "Attachment storage failed",
+        detail: describeCommandError(
+          error,
+          "The selected file could not be copied into the native media store.",
+        ),
+      });
+      return;
+    }
+
+    try {
+      nextSeed = await sendChatFileMessage({
+        sessionId,
+        name: normalizedName,
+        meta,
+        replyToMessageId: currentReplyToMessageId ?? undefined,
+      });
+    } catch (error) {
+      await cleanupOrphanedMediaAssets();
+      showTransportNotice({
+        id: `send-file-failed-${sessionId}-${Date.now()}`,
+        tone: "warn",
+        title: "Attachment failed",
+        detail: describeCommandError(
+          error,
+          "Desktop file send did not complete. The runtime state will be refreshed before the next attempt.",
+        ),
+      });
+      await refreshAuthRuntimeStateFromNative();
+      return;
+    }
+
+    if (nextSeed) {
+      replyToMessageId.value = null;
+      applyDomainSeed(nextSeed, {
+        preferredCircleId: activeCircleId.value,
+        preferredSessionId: sessionId,
+      });
+      await refreshAuthRuntimeStateFromNative();
+      return;
+    }
+
+    applyLocalSendPreviewFileMessage(file, sessionId, currentReplyToMessage);
+    replyToMessageId.value = null;
+  }
+
+  async function retryMessageDelivery(messageId: string) {
+    if (!selectedSession.value || !canSendMessages.value) {
+      return;
+    }
+
+    const sessionId = selectedSession.value.id;
+    let nextSeed: ChatDomainSeed | null = null;
+
+    try {
+      nextSeed = await retryChatMessageDelivery({ sessionId, messageId });
+    } catch (error) {
+      showTransportNotice({
+        id: `retry-message-failed-${sessionId}-${messageId}-${Date.now()}`,
+        tone: "warn",
+        title: "Retry failed",
+        detail: describeCommandError(
+          error,
+          "Desktop retry did not complete. The runtime state will be refreshed before the next attempt.",
+        ),
+      });
+      await refreshAuthRuntimeStateFromNative();
+      return;
+    }
+
     if (nextSeed) {
       applyDomainSeed(nextSeed, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: sessionId,
       });
+      await refreshAuthRuntimeStateFromNative();
       return;
     }
 
@@ -2311,20 +4337,28 @@ export function useChatShell() {
 
   async function startConversation(contactId: string) {
     if (!activeCircleId.value) {
+      redirectToCircleSetup();
       return;
     }
 
-    const result = await startDirectConversation({
+    const mutation = await runFallbackEligibleMutation(() => startDirectConversation({
       circleId: activeCircleId.value,
       contactId,
+    }), {
+      title: "Open conversation failed",
+      fallbackDetail: "Desktop chat state could not create this direct conversation.",
     });
 
-    if (result) {
-      applyDomainSeed(result.seed, {
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
         preferredCircleId: activeCircleId.value,
-        preferredSessionId: result.sessionId,
+        preferredSessionId: mutation.result.sessionId,
       });
       closeAllOverlayPages();
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2336,19 +4370,27 @@ export function useChatShell() {
 
   async function startSelfChat() {
     if (!activeCircleId.value) {
+      redirectToCircleSetup();
       return;
     }
 
-    const result = await startSelfConversation({
+    const mutation = await runFallbackEligibleMutation(() => startSelfConversation({
       circleId: activeCircleId.value,
+    }), {
+      title: "Open self chat failed",
+      fallbackDetail: "Desktop chat state could not open the self-note session.",
     });
 
-    if (result) {
-      applyDomainSeed(result.seed, {
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
         preferredCircleId: activeCircleId.value,
-        preferredSessionId: result.sessionId,
+        preferredSessionId: mutation.result.sessionId,
       });
       closeAllOverlayPages();
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2360,21 +4402,29 @@ export function useChatShell() {
 
   async function createGroupChat(input: Omit<CreateGroupConversationInput, "circleId">) {
     if (!activeCircleId.value) {
+      redirectToCircleSetup();
       return;
     }
 
-    const result = await createGroupConversation({
+    const mutation = await runFallbackEligibleMutation(() => createGroupConversation({
       circleId: activeCircleId.value,
       name: input.name,
       memberContactIds: input.memberContactIds,
+    }), {
+      title: "Create group failed",
+      fallbackDetail: "Desktop chat state could not create this group conversation.",
     });
 
-    if (result) {
-      applyDomainSeed(result.seed, {
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
         preferredCircleId: activeCircleId.value,
-        preferredSessionId: result.sessionId,
+        preferredSessionId: mutation.result.sessionId,
       });
       closeAllOverlayPages();
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2388,26 +4438,40 @@ export function useChatShell() {
     }
   }
 
-  async function joinCircleFromLookup(query: string) {
+  async function joinCircleFromLookup(
+    query: string,
+    options: {
+      nextOverlay?: "new-message";
+    } = {},
+  ) {
     const normalizedQuery = query.trim();
     if (!normalizedQuery) {
       return;
     }
 
     const input = inferCircleInputFromQuery(normalizedQuery);
-    const result = await addChatCircle(input);
-    if (result) {
-      applyDomainSeed(result.seed, {
-        preferredCircleId: result.circleId,
+    const mutation = await runFallbackEligibleMutation(() => addChatCircle(input), {
+      title: "Join circle failed",
+      fallbackDetail: "Desktop shell could not add this circle to native state.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
+        preferredCircleId: mutation.result.circleId,
         preferredSessionId: selectedSessionId.value,
       });
-      chooseCircle(result.circleId);
+      forgetRestorableCircleByCircleId(mutation.result.circleId);
+      focusCircle(mutation.result.circleId, options);
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
     const circleId = applyLocalAddCircleFromDirectory(input);
     if (circleId) {
-      chooseCircle(circleId);
+      forgetRestorableCircleByCircleId(circleId);
+      focusCircle(circleId, options);
     }
   }
 
@@ -2417,17 +4481,24 @@ export function useChatShell() {
       return;
     }
 
-    const nextSeed = await updateChatGroupName({
+    const mutation = await runFallbackEligibleMutation(() => updateChatGroupName({
       sessionId: payload.sessionId,
       name: nextName,
+    }), {
+      title: "Rename group failed",
+      fallbackDetail: "Desktop chat state could not save the updated group name.",
     });
 
-    if (nextSeed) {
-      applyDomainSeed(nextSeed, {
+    if (mutation.result) {
+      applyDomainSeed(mutation.result, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: payload.sessionId,
       });
       closeTopOverlayPage();
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2446,17 +4517,24 @@ export function useChatShell() {
       return;
     }
 
-    const nextSeed = await updateChatGroupMembers({
+    const mutation = await runFallbackEligibleMutation(() => updateChatGroupMembers({
       sessionId: payload.sessionId,
       memberContactIds,
+    }), {
+      title: "Group member update failed",
+      fallbackDetail: "Desktop chat state could not save the updated member list.",
     });
 
-    if (nextSeed) {
-      applyDomainSeed(nextSeed, {
+    if (mutation.result) {
+      applyDomainSeed(mutation.result, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: payload.sessionId,
       });
       closeTopOverlayPage();
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2468,26 +4546,42 @@ export function useChatShell() {
   }
 
   async function startLookupChat(query: string) {
-    if (!activeCircleId.value) {
-      return;
-    }
-
     const normalizedQuery = query.trim();
     if (!normalizedQuery) {
       return;
     }
 
-    const result = await startLookupConversation({
+    if (isCircleQuery(normalizedQuery)) {
+      await joinCircleFromLookup(
+        normalizedQuery,
+        shouldReturnToNewMessageAfterCircleJoin() ? { nextOverlay: "new-message" } : {},
+      );
+      return;
+    }
+
+    if (!activeCircleId.value) {
+      redirectToCircleSetup();
+      return;
+    }
+
+    const mutation = await runFallbackEligibleMutation(() => startLookupConversation({
       circleId: activeCircleId.value,
       query: normalizedQuery,
+    }), {
+      title: "Lookup chat failed",
+      fallbackDetail: "Desktop chat state could not create a conversation from this lookup query.",
     });
 
-    if (result) {
-      applyDomainSeed(result.seed, {
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
         preferredCircleId: activeCircleId.value,
-        preferredSessionId: result.sessionId,
+        preferredSessionId: mutation.result.sessionId,
       });
       closeAllOverlayPages();
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2540,21 +4634,31 @@ export function useChatShell() {
   }
 
   async function handleSessionAction(payload: { sessionId: string; action: SessionAction }) {
-    const nextSeed = await applyChatSessionAction(payload);
-    if (nextSeed) {
-      applyDomainSeed(nextSeed, {
+    const mutation = await runFallbackEligibleMutation(() => applyChatSessionAction(payload), {
+      title: sessionActionFailureTitle(payload.action),
+      fallbackDetail: "Desktop chat state rejected this session action.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: payload.action === "unarchive" ? payload.sessionId : selectedSessionId.value,
       });
-      return;
+      return true;
+    }
+
+    if (!mutation.canFallbackLocally) {
+      return false;
     }
 
     applyLocalSessionAction(payload);
+    return true;
   }
 
   async function openArchivedSession(sessionId: string) {
-    await handleSessionAction({ sessionId, action: "unarchive" });
-    closeTopOverlayPage();
+    const restored = await handleSessionAction({ sessionId, action: "unarchive" });
+    if (restored) {
+      closeTopOverlayPage();
+    }
   }
 
   function applyLocalToggleContactBlock(contactId: string) {
@@ -2570,17 +4674,61 @@ export function useChatShell() {
     });
   }
 
+  function applyLocalUpdateContactRemark(payload: UpdateContactRemarkInput) {
+    const nextRemark = payload.remark.trim();
+    contacts.value = contacts.value.map((contact) => {
+      if (contact.id !== payload.contactId) {
+        return contact;
+      }
+
+      return {
+        ...contact,
+        subtitle: nextRemark,
+      };
+    });
+  }
+
   async function toggleContactBlock(contactId: string) {
-    const nextSeed = await toggleChatContactBlock(contactId);
-    if (nextSeed) {
-      applyDomainSeed(nextSeed, {
+    const mutation = await runFallbackEligibleMutation(() => toggleChatContactBlock(contactId), {
+      title: "Contact block update failed",
+      fallbackDetail: "Desktop chat state could not save the contact block change.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: selectedSessionId.value,
       });
       return;
     }
 
+    if (!mutation.canFallbackLocally) {
+      return;
+    }
+
     applyLocalToggleContactBlock(contactId);
+  }
+
+  async function updateContactRemark(payload: UpdateContactRemarkInput) {
+    const mutation = await runFallbackEligibleMutation(() => updateChatContactRemark({
+      contactId: payload.contactId,
+      remark: payload.remark.trim(),
+    }), {
+      title: "Save remark failed",
+      fallbackDetail: "Desktop chat state could not save the updated contact remark.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result, {
+        preferredCircleId: activeCircleId.value,
+        preferredSessionId: selectedSessionId.value,
+      });
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
+      return;
+    }
+
+    applyLocalUpdateContactRemark(payload);
   }
 
   function toggleGroupMute(sessionId: string) {
@@ -2588,7 +4736,11 @@ export function useChatShell() {
   }
 
   async function leaveGroup(sessionId: string) {
-    await handleSessionAction({ sessionId, action: "delete" });
+    const removed = await handleSessionAction({ sessionId, action: "delete" });
+    if (!removed) {
+      return;
+    }
+
     showDetailsDrawer.value = false;
     closeAllOverlayPages();
   }
@@ -2599,7 +4751,6 @@ export function useChatShell() {
 
   async function sendMessageFromProfile(contactId: string) {
     await startConversation(contactId);
-    closeAllOverlayPages();
   }
 
   function openArchivedPage() {
@@ -2674,18 +4825,27 @@ export function useChatShell() {
   }
 
   async function addCircleFromDirectory(payload: AddCircleInput) {
-    const result = await addChatCircle(payload);
-    if (result) {
-      applyDomainSeed(result.seed, {
-        preferredCircleId: result.circleId,
+    const mutation = await runFallbackEligibleMutation(() => addChatCircle(payload), {
+      title: "Add circle failed",
+      fallbackDetail: "Desktop shell could not add this circle to native state.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
+        preferredCircleId: mutation.result.circleId,
         preferredSessionId: selectedSessionId.value,
       });
-      chooseCircle(result.circleId);
+      forgetRestorableCircleByCircleId(mutation.result.circleId);
+      chooseCircle(mutation.result.circleId);
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
     const circleId = applyLocalAddCircleFromDirectory(payload);
     if (circleId) {
+      forgetRestorableCircleByCircleId(circleId);
       chooseCircle(circleId);
     }
   }
@@ -2714,12 +4874,19 @@ export function useChatShell() {
   }
 
   async function updateCircle(payload: UpdateCircleInput) {
-    const nextSeed = await updateChatCircle(payload);
-    if (nextSeed) {
-      applyDomainSeed(nextSeed, {
+    const mutation = await runFallbackEligibleMutation(() => updateChatCircle(payload), {
+      title: "Update circle failed",
+      fallbackDetail: "Desktop shell could not save the updated circle settings.",
+    });
+    if (mutation.result) {
+      applyDomainSeed(mutation.result, {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: selectedSessionId.value,
       });
+      return;
+    }
+
+    if (!mutation.canFallbackLocally) {
       return;
     }
 
@@ -2778,7 +4945,8 @@ export function useChatShell() {
   }
 
   async function removeCircle(circleId: string) {
-    if (!circles.value.some((circle) => circle.id === circleId) || circles.value.length <= 1) {
+    const removedCircle = circles.value.find((circle) => circle.id === circleId);
+    if (!removedCircle || circles.value.length <= 1) {
       return;
     }
 
@@ -2788,11 +4956,15 @@ export function useChatShell() {
         .map((session) => session.id),
     );
     const removedActiveCircle = activeCircleId.value === circleId;
-    const nextSeed = await removeChatCircle(circleId);
+    const mutation = await runFallbackEligibleMutation(() => removeChatCircle(circleId), {
+      title: "Remove circle failed",
+      fallbackDetail: "Desktop shell could not remove this circle from native state.",
+    });
 
-    if (nextSeed) {
-      applyDomainSeed(nextSeed, {
-        preferredCircleId: removedActiveCircle ? nextSeed.circles[0]?.id : activeCircleId.value,
+    if (mutation.result) {
+      upsertRestorableCircle(buildRestorableCircleEntry(removedCircle));
+      applyDomainSeed(mutation.result, {
+        preferredCircleId: removedActiveCircle ? mutation.result.circles[0]?.id : activeCircleId.value,
         preferredSessionId: selectedSessionId.value,
       });
 
@@ -2817,6 +4989,11 @@ export function useChatShell() {
       return;
     }
 
+    if (!mutation.canFallbackLocally) {
+      return;
+    }
+
+    upsertRestorableCircle(buildRestorableCircleEntry(removedCircle));
     applyLocalRemoveCircle(circleId);
   }
 
@@ -2971,13 +5148,30 @@ export function useChatShell() {
     transportBusyCircleId.value = circleId;
 
     try {
-      const result = await applyTransportCircleAction({
-        circleId,
-        action,
-        activeCircleId: activeCircleId.value || undefined,
-        useTorNetwork: advancedPreferences.value.useTorNetwork,
-        experimentalTransport: advancedPreferences.value.experimentalTransport,
-      });
+      let result: Awaited<ReturnType<typeof applyTransportCircleAction>>;
+
+      try {
+        result = await applyTransportCircleAction({
+          circleId,
+          action,
+          activeCircleId: activeCircleId.value || undefined,
+          useTorNetwork: advancedPreferences.value.useTorNetwork,
+          experimentalTransport: advancedPreferences.value.experimentalTransport,
+        });
+      } catch (error) {
+        showTransportNotice({
+          id: `runtime-action-failed-${circleId}-${action}-${Date.now()}`,
+          tone: "warn",
+          title: `${circleLabelForRuntimeNotice(circleId)} runtime action failed`,
+          detail: describeCommandError(
+            error,
+            "Desktop transport command did not complete, so the UI kept the previous runtime state.",
+          ),
+          circleId,
+        });
+        await refreshTransportSnapshot({ suppressNotice: true });
+        return;
+      }
 
       if (result.kind === "applied") {
         applyTransportMutationResult(result.result, {
@@ -3036,10 +5230,18 @@ export function useChatShell() {
   }
 
   function pushOverlayPage(page: OverlayPage) {
+    if (!overlayPageExists(page)) {
+      return;
+    }
+
     applyOverlayPages([...overlayPages.value, page], { mode: "push" });
   }
 
   function replaceTopOverlayPage(page: OverlayPage) {
+    if (!overlayPageExists(page)) {
+      return;
+    }
+
     applyOverlayPages([...overlayPages.value.slice(0, -1), page]);
   }
 
@@ -3073,7 +5275,11 @@ export function useChatShell() {
     searchText,
     composerText,
     isAuthenticated,
+    authSession,
+    authRuntime,
+    authRuntimeBinding,
     userProfile,
+    restorableCircles,
     showLaunch,
     showCircleSwitcher,
     showSettingsDrawer,
@@ -3093,6 +5299,10 @@ export function useChatShell() {
     filteredSessions,
     selectedSession,
     activeMessages,
+    replyingToMessage,
+    mentionSuggestions,
+    showMentionSuggestions,
+    mentionSelectionIndex,
     canLoadOlderMessages,
     loadingOlderMessages,
     selectedContact,
@@ -3100,9 +5310,15 @@ export function useChatShell() {
     selectedGroupMembers,
     transportSnapshot,
     transportNotice,
+    canSendMessages,
+    sendBlockedReason,
+    runtimeDiagnosticError,
     activeTransportDiagnostic,
     activeOverlayPage,
     activeOverlayContact,
+    activeOverlayMessageSession,
+    activeOverlayMessage,
+    activeOverlayMessageReplyTarget,
     activeOverlayCircle,
     activeOverlayTransportDiagnostic,
     activeOverlayDiscoveredPeers,
@@ -3124,16 +5340,28 @@ export function useChatShell() {
     chooseCircle,
     toggleCircleSwitcher,
     openNewMessage,
+    openSelfChatConfirmPage,
     openFindPeoplePage,
     openCircleManagement,
     openCircleDetail,
     openDetailsDrawer,
     openContactProfile,
+    openMessageDetailPage,
     openGroupSelectMembersPage,
     openGroupCreatePage,
     openProfilePage,
     updateComposerText,
+    navigateMentionSuggestions,
+    selectMentionSuggestion,
+    startReplyToMessage,
+    cancelReplyToMessage,
+    copyMessageContent,
+    copyMessageAttachmentPath,
+    openMessageAttachment,
+    revealMessageAttachment,
+    reportMessage,
     loadOlderMessages,
+    sendAttachmentMessage,
     sendPreviewMessage,
     retryMessageDelivery,
     startConversation,
@@ -3145,9 +5373,12 @@ export function useChatShell() {
     closeCircleOverlay,
     completeLogin,
     logout,
+    updateAuthRuntime,
+    syncAuthRuntimeNow,
     handleSessionAction,
     openArchivedSession,
     toggleContactBlock,
+    updateContactRemark,
     toggleGroupMute,
     leaveGroup,
     openMemberProfile,
@@ -3162,6 +5393,8 @@ export function useChatShell() {
     addCircleFromDirectory,
     updateCircle,
     removeCircle,
+    restoreCircleAccess,
+    forgetRestorableCircle,
     runTransportCircleAction,
     updateAppPreferences,
     updateNotificationPreferences,

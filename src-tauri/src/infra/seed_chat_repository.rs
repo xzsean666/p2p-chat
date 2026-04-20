@@ -470,6 +470,8 @@ fn system_message(id: &str, body: &str) -> MessageItem {
         remote_id: None,
         sync_source: Some(MessageSyncSource::System),
         acked_at: None,
+        signed_nostr_event: None,
+        reply_to: None,
     }
 }
 
@@ -490,6 +492,8 @@ fn text_message(id: &str, author: MessageAuthor, body: &str, time: &str) -> Mess
             MessageSyncSource::Relay
         }),
         acked_at: is_local.then(|| time.into()),
+        signed_nostr_event: None,
+        reply_to: None,
     }
 }
 
@@ -505,6 +509,8 @@ fn file_message(id: &str, body: &str, meta: &str, time: &str) -> MessageItem {
         remote_id: Some(seed_remote_message_id(id)),
         sync_source: Some(MessageSyncSource::Relay),
         acked_at: None,
+        signed_nostr_event: None,
+        reply_to: None,
     }
 }
 
@@ -520,6 +526,8 @@ fn audio_message(id: &str, body: &str, meta: &str, time: &str) -> MessageItem {
         remote_id: Some(seed_remote_message_id(id)),
         sync_source: Some(MessageSyncSource::Local),
         acked_at: Some(time.into()),
+        signed_nostr_event: None,
+        reply_to: None,
     }
 }
 

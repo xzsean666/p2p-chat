@@ -29,7 +29,15 @@ function preview(session: SessionItem) {
 }
 
 function emptyCta(circle: CircleItem | null) {
+  if (!circle) {
+    return "Add or Restore Circle";
+  }
+
   return circle?.type === "paid" ? "Invite to Circle" : "Add Friends to Chat";
+}
+
+function emptyDescription(circle: CircleItem | null) {
+  return circle?.description ?? "No circle selected yet. Add or restore a circle before starting chats.";
 }
 </script>
 
@@ -134,7 +142,7 @@ function emptyCta(circle: CircleItem | null) {
         <div class="empty-graphic"></div>
         <h3>Welcome to XChat</h3>
         <p>
-          {{ activeCircle?.description ?? "No circle selected yet." }}
+          {{ emptyDescription(activeCircle) }}
         </p>
         <Button
           icon="pi pi-user-plus"

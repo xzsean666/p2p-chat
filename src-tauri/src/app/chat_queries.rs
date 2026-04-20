@@ -1,32 +1,25 @@
+use crate::app::{auth_access, chat_mutations, shell_auth};
 use crate::domain::chat::{
-    default_message_page_size, ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates,
-    ChatSessionMessagesPage, ChatShellSnapshot, LoadSessionMessageUpdatesInput,
-    LoadSessionMessagesInput, PersistedShellState, ShellStateSnapshot,
+    default_message_page_size, AddCircleInput, ChatDomainOverview, ChatDomainSeed,
+    ChatSessionMessageUpdates, ChatSessionMessagesPage, ChatShellSnapshot,
+    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCircleSelectionMode,
+    LoginCompletionInput, LoginMethod, RestorableCircleEntry, RestoreCircleInput,
+    ShellStateSnapshot, UpdateAuthRuntimeInput,
 };
+use crate::domain::chat_repository::ChatRepository;
 use crate::infra::shell_state_store;
 use crate::infra::sqlite_chat_repository::SqliteChatRepository;
-use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn load_chat_shell_snapshot<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<ChatShellSnapshot, String> {
     let repository = SqliteChatRepository::new(app_handle);
-    let persisted_shell = shell_state_store::load(app_handle)?
-        .and_then(deserialize_shell_state_snapshot)
-        .map(|shell| {
-            let selected_session_id = shell.selected_session_id.clone();
-            (shell, Some(selected_session_id))
-        });
+    let shell = load_saved_shell_snapshot(app_handle)?;
     let domain = repository.load_domain_seed_preview(
-        persisted_shell
-            .as_ref()
-            .and_then(|(_, selected_session_id)| selected_session_id.as_deref()),
+        normalized_non_empty(Some(&shell.selected_session_id)),
         default_message_page_size(),
     )?;
-    let default_shell = ShellStateSnapshot::from(ChatDomainSeed::default());
-    let shell = persisted_shell
-        .map(|(shell, _)| shell)
-        .unwrap_or(default_shell);
     let domain = if shell.is_authenticated {
         domain
     } else {
@@ -36,12 +29,130 @@ pub fn load_chat_shell_snapshot<R: tauri::Runtime>(
     Ok(ChatShellSnapshot { domain, shell })
 }
 
+pub fn sync_auth_runtime<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<ShellStateSnapshot, String> {
+    shell_auth::sync_saved_shell_snapshot(app_handle)
+}
+
 pub fn save_chat_shell_snapshot<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     snapshot: ChatShellSnapshot,
 ) -> Result<(), String> {
     let shell_state = serde_json::to_value(snapshot.shell).map_err(|error| error.to_string())?;
     shell_state_store::save(app_handle, shell_state)
+}
+
+pub fn bootstrap_auth_session<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    input: LoginCompletionInput,
+) -> Result<ShellStateSnapshot, String> {
+    let previous_shell = load_saved_shell_snapshot(app_handle)?;
+    let mut shell = build_authenticated_shell(previous_shell, &input)?;
+    let auth_session = shell
+        .auth_session
+        .clone()
+        .ok_or_else(|| "authenticated shell is missing auth session summary".to_string())?;
+    shell_auth::persist_auth_runtime_credential(app_handle, &auth_session, &input.access)?;
+    shell.auth_runtime_binding =
+        shell_auth::persist_auth_runtime_binding(app_handle, &auth_session, &input.access)?;
+    if let Some(runtime) = shell.auth_runtime.clone() {
+        shell.auth_runtime = Some(shell_auth::persist_auth_runtime(
+            app_handle,
+            &auth_session,
+            &runtime,
+        )?);
+    }
+
+    if matches!(
+        input.circle_selection.mode,
+        LoginCircleSelectionMode::Existing
+    ) {
+        if let Some(circle_id) = normalized_non_empty(input.circle_selection.circle_id.as_deref()) {
+            shell.active_circle_id = circle_id.to_string();
+        }
+    }
+
+    let shell_state = serde_json::to_value(&shell).map_err(|error| error.to_string())?;
+    shell_state_store::save(app_handle, shell_state)?;
+    Ok(shell)
+}
+
+pub fn complete_login<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    input: LoginCompletionInput,
+) -> Result<ChatShellSnapshot, String> {
+    let previous_shell = load_saved_shell_snapshot(app_handle)?;
+    let mut shell = build_authenticated_shell(previous_shell, &input)?;
+    let auth_session = shell
+        .auth_session
+        .clone()
+        .ok_or_else(|| "authenticated shell is missing auth session summary".to_string())?;
+    shell_auth::persist_auth_runtime_credential(app_handle, &auth_session, &input.access)?;
+    shell.auth_runtime_binding =
+        shell_auth::persist_auth_runtime_binding(app_handle, &auth_session, &input.access)?;
+    if let Some(runtime) = shell.auth_runtime.clone() {
+        shell.auth_runtime = Some(shell_auth::persist_auth_runtime(
+            app_handle,
+            &auth_session,
+            &runtime,
+        )?);
+    }
+    let (domain_seed, resolved_circle_id, next_restorable_circles) =
+        resolve_login_circle_selection(app_handle, &input, &shell.restorable_circles)?;
+
+    shell.restorable_circles = next_restorable_circles;
+    shell.active_circle_id = resolve_active_circle_id(&domain_seed, resolved_circle_id.as_deref());
+    shell.selected_session_id = resolve_selected_session_id(
+        &domain_seed,
+        &shell.active_circle_id,
+        normalized_non_empty(Some(&shell.selected_session_id)),
+    );
+
+    let shell_state = serde_json::to_value(&shell).map_err(|error| error.to_string())?;
+    shell_state_store::save(app_handle, shell_state)?;
+
+    let repository = SqliteChatRepository::new(app_handle);
+    let domain = repository.load_domain_seed_preview(
+        normalized_non_empty(Some(&shell.selected_session_id)),
+        default_message_page_size(),
+    )?;
+
+    Ok(ChatShellSnapshot { domain, shell })
+}
+
+pub fn logout_chat_session<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<ChatShellSnapshot, String> {
+    let previous_shell = load_saved_shell_snapshot(app_handle)?;
+    shell_auth::clear_auth_runtime(app_handle)?;
+    shell_auth::clear_auth_runtime_client(app_handle)?;
+    shell_auth::clear_auth_runtime_credential(app_handle)?;
+    shell_auth::clear_auth_runtime_binding(app_handle)?;
+    let shell = build_logged_out_shell(previous_shell);
+    let shell_state = serde_json::to_value(&shell).map_err(|error| error.to_string())?;
+    shell_state_store::save(app_handle, shell_state)?;
+
+    Ok(ChatShellSnapshot {
+        domain: ChatDomainSeed::default(),
+        shell,
+    })
+}
+
+pub fn update_auth_runtime<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    input: UpdateAuthRuntimeInput,
+) -> Result<ShellStateSnapshot, String> {
+    let mut shell = load_saved_shell_snapshot(app_handle)?;
+    let auth_session = shell.auth_session.clone().ok_or_else(|| {
+        "auth runtime update requires an authenticated session summary".to_string()
+    })?;
+    let runtime = shell_auth::update_auth_runtime(&shell, &input)?;
+    let runtime = shell_auth::persist_auth_runtime(app_handle, &auth_session, &runtime)?;
+    shell.auth_runtime = Some(runtime);
+    let shell_state = serde_json::to_value(&shell).map_err(|error| error.to_string())?;
+    shell_state_store::save(app_handle, shell_state)?;
+    Ok(shell)
 }
 
 pub fn load_chat_session_messages<R: tauri::Runtime>(
@@ -74,28 +185,415 @@ pub fn load_chat_domain_overview<R: tauri::Runtime>(
     repository.load_domain_overview()
 }
 
-fn deserialize_shell_state_snapshot(value: Value) -> Option<ShellStateSnapshot> {
-    serde_json::from_value::<ShellStateSnapshot>(value.clone())
-        .ok()
-        .or_else(|| {
-            serde_json::from_value::<PersistedShellState>(value)
-                .ok()
-                .map(ShellStateSnapshot::from)
+fn load_saved_shell_snapshot<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<ShellStateSnapshot, String> {
+    shell_auth::load_saved_shell_snapshot(app_handle)
+}
+
+fn build_authenticated_shell(
+    previous_shell: ShellStateSnapshot,
+    input: &LoginCompletionInput,
+) -> Result<ShellStateSnapshot, String> {
+    let user_profile = normalize_user_profile(&input.user_profile)?;
+    validate_access_input(input)?;
+    validate_circle_selection(input, &previous_shell.restorable_circles)?;
+
+    let mut shell = previous_shell;
+    shell.is_authenticated = true;
+    let auth_session = build_auth_session_summary(input)?;
+    shell.auth_session = Some(auth_session.clone());
+    shell.auth_runtime = Some(build_auth_runtime_summary(&auth_session));
+    shell.user_profile = user_profile;
+    Ok(shell)
+}
+
+fn build_logged_out_shell(previous_shell: ShellStateSnapshot) -> ShellStateSnapshot {
+    ShellStateSnapshot {
+        is_authenticated: false,
+        auth_session: None,
+        auth_runtime: None,
+        auth_runtime_binding: None,
+        user_profile: crate::domain::chat::default_user_profile(),
+        restorable_circles: previous_shell.restorable_circles,
+        app_preferences: previous_shell.app_preferences,
+        notification_preferences: previous_shell.notification_preferences,
+        advanced_preferences: previous_shell.advanced_preferences,
+        active_circle_id: String::new(),
+        selected_session_id: String::new(),
+    }
+}
+
+fn validate_access_input(input: &LoginCompletionInput) -> Result<(), String> {
+    auth_access::resolve_login_access_summary(input).map(|_| ())
+}
+
+fn validate_circle_selection(
+    input: &LoginCompletionInput,
+    restorable_circles: &[RestorableCircleEntry],
+) -> Result<(), String> {
+    match input.circle_selection.mode {
+        LoginCircleSelectionMode::Existing => {
+            if normalized_non_empty(input.circle_selection.circle_id.as_deref()).is_none() {
+                return Err("existing circle selection requires a circle id".into());
+            }
+        }
+        LoginCircleSelectionMode::Invite => {
+            let invite_code = normalized_non_empty(input.circle_selection.invite_code.as_deref())
+                .unwrap_or_default();
+            if invite_code.len() < 6 {
+                return Err(
+                    "invite selection requires an invite code with at least 6 characters".into(),
+                );
+            }
+        }
+        LoginCircleSelectionMode::Custom => {
+            let name =
+                normalized_non_empty(input.circle_selection.name.as_deref()).unwrap_or_default();
+            if name.len() < 2 {
+                return Err("custom circle selection requires a name".into());
+            }
+
+            let relay =
+                normalized_non_empty(input.circle_selection.relay.as_deref()).unwrap_or_default();
+            if !relay_looks_valid(relay) {
+                return Err("custom circle selection requires a relay-like endpoint".into());
+            }
+        }
+        LoginCircleSelectionMode::Restore => {
+            if matches!(input.method, LoginMethod::QuickStart) {
+                return Err("quick start cannot use restore catalog selection".into());
+            }
+
+            if restorable_circles.is_empty() {
+                return Err("restore selection requires at least one archived circle".into());
+            }
+
+            if let Some(relay) = normalized_non_empty(input.circle_selection.relay.as_deref()) {
+                if !restorable_circles
+                    .iter()
+                    .any(|entry| same_relay(&entry.relay, relay))
+                {
+                    return Err(
+                        "restore selection relay is not present in the local restore catalog"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_login_circle_selection<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    input: &LoginCompletionInput,
+    restorable_circles: &[RestorableCircleEntry],
+) -> Result<(ChatDomainSeed, Option<String>, Vec<RestorableCircleEntry>), String> {
+    let repository = SqliteChatRepository::new(app_handle);
+
+    match input.circle_selection.mode {
+        LoginCircleSelectionMode::Existing => {
+            let domain_seed = repository.load_domain_seed()?;
+            let circle_id = normalized_non_empty(input.circle_selection.circle_id.as_deref())
+                .ok_or_else(|| "existing circle selection requires a circle id".to_string())?;
+
+            if !domain_seed
+                .circles
+                .iter()
+                .any(|circle| circle.id == circle_id)
+            {
+                return Err(format!("existing circle not found: {circle_id}"));
+            }
+
+            Ok((
+                domain_seed,
+                Some(circle_id.to_string()),
+                restorable_circles.to_vec(),
+            ))
+        }
+        LoginCircleSelectionMode::Invite => {
+            let result = chat_mutations::add_circle(
+                app_handle,
+                AddCircleInput {
+                    mode: crate::domain::chat::CircleCreateMode::Invite,
+                    name: input
+                        .circle_selection
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "Invite Circle".into()),
+                    relay: None,
+                    invite_code: Some(
+                        input
+                            .circle_selection
+                            .invite_code
+                            .clone()
+                            .unwrap_or_default(),
+                    ),
+                },
+            )?;
+            let next_restorable_circles = remove_restorable_circle_for_circle(
+                restorable_circles,
+                &result.seed,
+                &result.circle_id,
+            );
+            Ok((result.seed, Some(result.circle_id), next_restorable_circles))
+        }
+        LoginCircleSelectionMode::Custom => {
+            let result = chat_mutations::add_circle(
+                app_handle,
+                AddCircleInput {
+                    mode: crate::domain::chat::CircleCreateMode::Custom,
+                    name: input
+                        .circle_selection
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "Custom Relay".into()),
+                    relay: Some(input.circle_selection.relay.clone().unwrap_or_default()),
+                    invite_code: None,
+                },
+            )?;
+            let next_restorable_circles = remove_restorable_circle_for_circle(
+                restorable_circles,
+                &result.seed,
+                &result.circle_id,
+            );
+            Ok((result.seed, Some(result.circle_id), next_restorable_circles))
+        }
+        LoginCircleSelectionMode::Restore => {
+            let selected_entry = if let Some(relay) =
+                normalized_non_empty(input.circle_selection.relay.as_deref())
+            {
+                restorable_circles
+                    .iter()
+                    .find(|entry| same_relay(&entry.relay, relay))
+            } else {
+                restorable_circles.first()
+            }
+            .cloned()
+            .ok_or_else(|| "restore selection requires a local catalog entry".to_string())?;
+
+            let result = chat_mutations::restore_circle(
+                app_handle,
+                RestoreCircleInput {
+                    name: selected_entry.name.clone(),
+                    relay: selected_entry.relay.clone(),
+                    circle_type: selected_entry.circle_type.clone(),
+                    description: selected_entry.description.clone(),
+                },
+            )?;
+
+            Ok((
+                result.seed,
+                Some(result.circle_id),
+                remove_restorable_circle_by_relay(restorable_circles, &selected_entry.relay),
+            ))
+        }
+    }
+}
+
+fn build_auth_session_summary(
+    input: &LoginCompletionInput,
+) -> Result<crate::domain::chat::AuthSessionSummary, String> {
+    Ok(crate::domain::chat::AuthSessionSummary {
+        login_method: input.method.clone(),
+        access: auth_access::resolve_login_access_summary(input)?,
+        circle_selection_mode: input.circle_selection.mode.clone(),
+        logged_in_at: input
+            .logged_in_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(current_login_timestamp),
+    })
+}
+
+fn build_auth_runtime_summary(
+    auth_session: &crate::domain::chat::AuthSessionSummary,
+) -> crate::domain::chat::AuthRuntimeSummary {
+    shell_auth::derive_auth_runtime_from_session(auth_session)
+}
+
+fn normalize_user_profile(
+    user_profile: &crate::domain::chat::UserProfile,
+) -> Result<crate::domain::chat::UserProfile, String> {
+    let name = user_profile.name.trim();
+    if name.chars().count() < 2 {
+        return Err("user profile name must contain at least 2 characters".into());
+    }
+
+    let handle_body = user_profile
+        .handle
+        .trim()
+        .trim_start_matches('@')
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric() || matches!(char, '.' | '_' | '-'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if handle_body.len() < 3 {
+        return Err("user profile handle must contain at least 3 normalized characters".into());
+    }
+
+    let initials = normalize_initials(&user_profile.initials, name);
+    let status = normalized_non_empty(Some(&user_profile.status))
+        .unwrap_or("Circle member")
+        .to_string();
+
+    Ok(crate::domain::chat::UserProfile {
+        name: name.to_string(),
+        handle: format!("@{handle_body}"),
+        initials,
+        status,
+    })
+}
+
+fn normalize_initials(initials: &str, name: &str) -> String {
+    let normalized = initials
+        .trim()
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if !normalized.is_empty() {
+        return normalized;
+    }
+
+    let derived = name
+        .split_whitespace()
+        .filter_map(|token| token.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if !derived.is_empty() {
+        return derived;
+    }
+
+    "XC".into()
+}
+
+fn normalized_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn relay_looks_valid(value: &str) -> bool {
+    let normalized = value.trim();
+    !normalized.is_empty() && (normalized.contains("://") || normalized.contains('.'))
+}
+
+fn same_relay(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn current_login_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".into())
+}
+
+fn remove_restorable_circle_for_circle(
+    restorable_circles: &[RestorableCircleEntry],
+    domain_seed: &ChatDomainSeed,
+    circle_id: &str,
+) -> Vec<RestorableCircleEntry> {
+    let relay = domain_seed
+        .circles
+        .iter()
+        .find(|circle| circle.id == circle_id)
+        .map(|circle| circle.relay.as_str());
+
+    if let Some(relay) = relay {
+        return remove_restorable_circle_by_relay(restorable_circles, relay);
+    }
+
+    restorable_circles.to_vec()
+}
+
+fn remove_restorable_circle_by_relay(
+    restorable_circles: &[RestorableCircleEntry],
+    relay: &str,
+) -> Vec<RestorableCircleEntry> {
+    restorable_circles
+        .iter()
+        .filter(|entry| !same_relay(&entry.relay, relay))
+        .cloned()
+        .collect()
+}
+
+fn resolve_active_circle_id(
+    domain_seed: &ChatDomainSeed,
+    preferred_circle_id: Option<&str>,
+) -> String {
+    preferred_circle_id
+        .filter(|circle_id| {
+            domain_seed
+                .circles
+                .iter()
+                .any(|circle| circle.id == *circle_id)
         })
+        .map(ToOwned::to_owned)
+        .or_else(|| domain_seed.circles.first().map(|circle| circle.id.clone()))
+        .unwrap_or_default()
+}
+
+fn resolve_selected_session_id(
+    domain_seed: &ChatDomainSeed,
+    active_circle_id: &str,
+    preferred_session_id: Option<&str>,
+) -> String {
+    if active_circle_id.trim().is_empty() {
+        return String::new();
+    }
+
+    let visible_sessions = domain_seed
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.circle_id == active_circle_id && !session.archived.unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    preferred_session_id
+        .filter(|session_id| {
+            visible_sessions
+                .iter()
+                .any(|session| session.id == *session_id)
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| visible_sessions.first().map(|session| session.id.clone()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::chat::{
-        AdvancedPreferences, AppPreferences, AuthSessionSummary, LanguagePreference,
-        LoginAccessKind, LoginAccessSummary, LoginCircleSelectionMode, LoginMethod, MessageItem,
-        NotificationPreferences, PersistedShellState, TextSizePreference, ThemePreference,
-        UserProfile,
+        AdvancedPreferences, AppPreferences, AuthRuntimeBindingSummary, AuthRuntimeState,
+        AuthRuntimeSummary, AuthSessionSummary, LanguagePreference, LoginAccessInput,
+        LoginAccessKind, LoginAccessSummary, LoginCircleSelectionInput, LoginCircleSelectionMode,
+        LoginCompletionInput, LoginMethod, MessageItem, NotificationPreferences,
+        PersistedShellState, RestorableCircleEntry, TextSizePreference, ThemePreference,
+        UpdateAuthRuntimeInput, UserProfile,
     };
+    use crate::infra::{
+        auth_runtime_binding_store, auth_runtime_client_store, auth_runtime_credential_store,
+        auth_runtime_state_store,
+    };
+    use nostr_connect::prelude::{
+        nip44, EventBuilder as NostrEventBuilder, JsonUtil, Keys as NostrKeys, NostrConnectMessage,
+        NostrConnectRequest, NostrConnectResponse, PublicKey as NostrPublicKey, ResponseResult,
+        ToBech32,
+    };
+    use secp256k1::{Secp256k1, SecretKey};
+    use serde_json::json;
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::sync::MutexGuard;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tungstenite::Message as WebSocketMessage;
 
     struct TestAppGuard {
         _env_guard: MutexGuard<'static, ()>,
@@ -139,6 +637,236 @@ mod tests {
         }
     }
 
+    const VALID_HEX_SECRET_KEY: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const VALID_TEST_NPUB: &str = "npub1fu64hh9hes90w2808n8tjc2ajp5yhddjef0ctx4s7zmsgp6cwx4qgy4eg9";
+    const VALID_TEST_NPUB_LABEL: &str = "npub1fu64h...gy4eg9";
+    const TEST_BUNKER_SIGNER_SECRET_KEY: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const TEST_BUNKER_USER_SECRET_KEY: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+    const TEST_BUNKER_SHARED_SECRET: &str = "shared-secret";
+
+    fn valid_binding_pubkey_hex() -> String {
+        let secret_key =
+            SecretKey::from_str(VALID_HEX_SECRET_KEY).expect("valid test secret key should parse");
+        let secp = Secp256k1::new();
+        let (pubkey, _) = secret_key.x_only_public_key(&secp);
+        pubkey
+            .serialize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn seed_auth_runtime_binding(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        login_method: LoginMethod,
+        access_kind: LoginAccessKind,
+        stored_at: &str,
+    ) {
+        let pubkey = valid_binding_pubkey_hex();
+        let value = match access_kind {
+            LoginAccessKind::Bunker => {
+                format!("bunker://{pubkey}?relay=wss://relay.example.com")
+            }
+            LoginAccessKind::NostrConnect => format!(
+                "nostrconnect://{pubkey}?relay=wss://relay.example.com&secret=shared-secret"
+            ),
+            _ => return,
+        };
+
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method,
+                access_kind,
+                value,
+                stored_at: stored_at.into(),
+            },
+        )
+        .expect("failed to seed auth runtime binding store");
+    }
+
+    fn bunker_signer_public_key_hex() -> String {
+        NostrKeys::parse(TEST_BUNKER_SIGNER_SECRET_KEY)
+            .expect("test bunker signer secret should parse")
+            .public_key()
+            .to_hex()
+    }
+
+    fn bunker_user_public_key_npub() -> String {
+        NostrKeys::parse(TEST_BUNKER_USER_SECRET_KEY)
+            .expect("test bunker user secret should parse")
+            .public_key()
+            .to_bech32()
+            .expect("test bunker user pubkey should encode")
+    }
+
+    fn spawn_bunker_handshake_relay_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test relay listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test relay listener address should resolve");
+        let handle = std::thread::spawn(move || {
+            let signer_keys = NostrKeys::parse(TEST_BUNKER_SIGNER_SECRET_KEY)
+                .expect("test bunker signer secret should parse");
+            let user_public_key = NostrKeys::parse(TEST_BUNKER_USER_SECRET_KEY)
+                .expect("test bunker user secret should parse")
+                .public_key();
+            let (stream, _) = listener
+                .accept()
+                .expect("relay should accept one connection");
+            let mut socket = tungstenite::accept(stream).expect("relay websocket handshake");
+            socket
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("relay read timeout should be configurable");
+            let mut subscription_id = None::<String>;
+
+            loop {
+                match socket.read() {
+                    Ok(WebSocketMessage::Text(payload)) => {
+                        let message: serde_json::Value =
+                            serde_json::from_str(&payload).expect("relay payload should be json");
+                        let Some(kind) = message.get(0).and_then(|value| value.as_str()) else {
+                            continue;
+                        };
+
+                        match kind {
+                            "REQ" => {
+                                let req_id = message
+                                    .get(1)
+                                    .and_then(|value| value.as_str())
+                                    .expect("REQ should include subscription id")
+                                    .to_string();
+                                subscription_id = Some(req_id.clone());
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!(["EOSE", req_id]).to_string().into(),
+                                    ))
+                                    .expect("relay should acknowledge subscription");
+                            }
+                            "EVENT" => {
+                                let event = message
+                                    .get(1)
+                                    .cloned()
+                                    .expect("EVENT should include event payload");
+                                let sender_pubkey = NostrPublicKey::parse(
+                                    event
+                                        .get("pubkey")
+                                        .and_then(|value| value.as_str())
+                                        .expect("event should include sender pubkey"),
+                                )
+                                .expect("event pubkey should parse");
+                                let plaintext = nip44::decrypt(
+                                    signer_keys.secret_key(),
+                                    &sender_pubkey,
+                                    event["content"]
+                                        .as_str()
+                                        .expect("event content should be a string"),
+                                )
+                                .expect("relay should decrypt nip46 payload");
+                                let message = NostrConnectMessage::from_json(plaintext)
+                                    .expect("nip46 message should parse");
+                                let request_id = message.id().to_string();
+                                let request = message
+                                    .to_request()
+                                    .expect("relay should receive a request");
+                                let should_close =
+                                    matches!(request, NostrConnectRequest::GetPublicKey);
+                                let response = match request {
+                                    NostrConnectRequest::Connect {
+                                        remote_signer_public_key,
+                                        secret,
+                                    } => {
+                                        assert_eq!(
+                                            remote_signer_public_key,
+                                            signer_keys.public_key()
+                                        );
+                                        assert_eq!(
+                                            secret.as_deref(),
+                                            Some(TEST_BUNKER_SHARED_SECRET)
+                                        );
+                                        NostrConnectResponse::with_result(ResponseResult::Ack)
+                                    }
+                                    NostrConnectRequest::GetPublicKey => {
+                                        NostrConnectResponse::with_result(
+                                            ResponseResult::GetPublicKey(user_public_key),
+                                        )
+                                    }
+                                    _ => NostrConnectResponse::with_error(
+                                        "unsupported test bunker request",
+                                    ),
+                                };
+                                let response_event = NostrEventBuilder::nostr_connect(
+                                    &signer_keys,
+                                    sender_pubkey,
+                                    NostrConnectMessage::response(request_id, response),
+                                )
+                                .expect("relay response event should build")
+                                .sign_with_keys(&signer_keys)
+                                .expect("relay response event should sign");
+                                let event_id = event
+                                    .get("id")
+                                    .and_then(|value| value.as_str())
+                                    .expect("event should include id");
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!(["OK", event_id, true, ""]).to_string().into(),
+                                    ))
+                                    .expect("relay should ack client EVENT");
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!([
+                                            "EVENT",
+                                            subscription_id
+                                                .clone()
+                                                .expect("subscription should be registered"),
+                                            serde_json::to_value(response_event)
+                                                .expect("response event should serialize"),
+                                        ])
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .expect("relay should forward signer response");
+
+                                if should_close {
+                                    socket
+                                        .close(None)
+                                        .expect("relay should close the websocket");
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(WebSocketMessage::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("test bunker relay should not error: {error}"),
+                }
+            }
+        });
+
+        (format!("ws://{}", address), handle)
+    }
+
+    fn unreachable_test_relay_url() -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test relay listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test relay listener address should resolve");
+        drop(listener);
+        format!("ws://{}", address)
+    }
+
     #[test]
     fn save_chat_shell_snapshot_persists_shell_state_without_overwriting_domain() {
         let guard = test_app();
@@ -149,7 +877,10 @@ mod tests {
             serde_json::to_value(ShellStateSnapshot {
                 is_authenticated: true,
                 auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
                 user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
                 app_preferences: crate::domain::chat::default_app_preferences(),
                 notification_preferences: crate::domain::chat::default_notification_preferences(),
                 advanced_preferences: crate::domain::chat::default_advanced_preferences(),
@@ -184,6 +915,8 @@ mod tests {
                 remote_id: None,
                 sync_source: Some(crate::domain::chat::MessageSyncSource::System),
                 acked_at: None,
+                signed_nostr_event: None,
+                reply_to: None,
             });
         snapshot.shell.is_authenticated = true;
         snapshot.shell.auth_session = Some(AuthSessionSummary {
@@ -191,10 +924,48 @@ mod tests {
             access: LoginAccessSummary {
                 kind: LoginAccessKind::Nsec,
                 label: "nsec1...runner".into(),
+                pubkey: None,
             },
             circle_selection_mode: LoginCircleSelectionMode::Existing,
             logged_in_at: "2026-04-18T10:00:00Z".into(),
         });
+        snapshot.shell.auth_runtime = Some(AuthRuntimeSummary {
+            state: AuthRuntimeState::Pending,
+            login_method: LoginMethod::ExistingAccount,
+            access_kind: LoginAccessKind::Nsec,
+            label: "nsec1...runner".into(),
+            pubkey: None,
+            error: None,
+            can_send_messages: false,
+            send_blocked_reason: Some(
+                "Account runtime is still waiting for a signer handshake.".into(),
+            ),
+            persisted_in_native_store: false,
+            credential_persisted_in_native_store: false,
+            updated_at: "2026-04-18T10:00:00Z".into(),
+        });
+        snapshot.shell.auth_runtime_binding = Some(AuthRuntimeBindingSummary {
+            access_kind: LoginAccessKind::Bunker,
+            endpoint: "wss://relay.example.com".into(),
+            connection_pubkey: None,
+            relay_count: 1,
+            has_secret: false,
+            requested_permissions: vec![],
+            client_name: None,
+            persisted_in_native_store: true,
+            updated_at: "2026-04-18T10:00:00Z".into(),
+        });
+        auth_runtime_credential_store::save(
+            app_handle,
+            &auth_runtime_credential_store::StoredAuthRuntimeCredential {
+                login_method: LoginMethod::ExistingAccount,
+                access_kind: LoginAccessKind::Nsec,
+                secret_key_hex: VALID_HEX_SECRET_KEY.into(),
+                pubkey: VALID_TEST_NPUB.into(),
+                stored_at: "2026-04-18T10:00:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime credential store");
         snapshot.shell.user_profile = UserProfile {
             name: "Audit Runner".into(),
             handle: "@auditrunner".into(),
@@ -245,6 +1016,14 @@ mod tests {
                 .map(|session| &session.login_method),
             Some(LoginMethod::ExistingAccount)
         ));
+        assert!(matches!(
+            reloaded
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Pending)
+        ));
         assert_eq!(reloaded.shell.user_profile.handle, "@auditrunner");
         assert!(matches!(
             reloaded.shell.app_preferences.theme,
@@ -267,6 +1046,795 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_auth_session_persists_validated_shell_state() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: false,
+                auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![RestorableCircleEntry {
+                    name: "Archive Relay".into(),
+                    relay: "wss://archive.example.local".into(),
+                    circle_type: crate::domain::chat::CircleType::Paid,
+                    description: "Recovered paid relay".into(),
+                    archived_at: "2026-04-18T10:00:00Z".into(),
+                }],
+                app_preferences: AppPreferences {
+                    theme: ThemePreference::Ink,
+                    language: LanguagePreference::ZhCn,
+                    text_size: TextSizePreference::Large,
+                },
+                notification_preferences: NotificationPreferences {
+                    allow_send: false,
+                    allow_receive: true,
+                    show_badge: false,
+                    archive_summary: false,
+                    mentions_only: true,
+                },
+                advanced_preferences: AdvancedPreferences {
+                    show_message_info: true,
+                    use_tor_network: true,
+                    relay_diagnostics: false,
+                    experimental_transport: true,
+                },
+                active_circle_id: "".into(),
+                selected_session_id: "".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+
+        let shell = bootstrap_auth_session(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::ExistingAccount,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::HexKey,
+                    value: Some(VALID_HEX_SECRET_KEY.into()),
+                },
+                user_profile: UserProfile {
+                    name: "  Nora Blake  ".into(),
+                    handle: "@@Nora.Blake".into(),
+                    initials: "nb".into(),
+                    status: "Research lead".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Restore,
+                    circle_id: None,
+                    invite_code: None,
+                    name: None,
+                    relay: Some("wss://archive.example.local".into()),
+                },
+                logged_in_at: Some("2026-04-19T08:00:00Z".into()),
+            },
+        )
+        .expect("failed to bootstrap auth session");
+
+        assert!(shell.is_authenticated);
+        assert_eq!(shell.user_profile.name, "Nora Blake");
+        assert_eq!(shell.user_profile.handle, "@nora.blake");
+        assert_eq!(shell.user_profile.initials, "NB");
+        assert_eq!(shell.user_profile.status, "Research lead");
+        assert!(matches!(
+            shell
+                .auth_session
+                .as_ref()
+                .map(|session| &session.circle_selection_mode),
+            Some(LoginCircleSelectionMode::Restore)
+        ));
+        assert_eq!(
+            shell
+                .auth_session
+                .as_ref()
+                .map(|session| session.logged_in_at.as_str()),
+            Some("2026-04-19T08:00:00Z")
+        );
+        assert_eq!(
+            shell
+                .auth_session
+                .as_ref()
+                .map(|session| session.access.label.as_str()),
+            Some(VALID_TEST_NPUB_LABEL)
+        );
+        assert!(matches!(
+            shell.auth_runtime.as_ref().map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Connected)
+        ));
+        assert_eq!(
+            shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| runtime.persisted_in_native_store),
+            Some(true)
+        );
+        assert_eq!(
+            shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| runtime.credential_persisted_in_native_store),
+            Some(true)
+        );
+        assert!(shell.auth_runtime_binding.is_none());
+        assert!(matches!(shell.app_preferences.theme, ThemePreference::Ink));
+        assert!(shell.advanced_preferences.experimental_transport);
+        assert_eq!(shell.restorable_circles.len(), 1);
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing stored auth runtime");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(stored_runtime.logged_in_at, "2026-04-19T08:00:00Z");
+        assert_eq!(stored_runtime.label, VALID_TEST_NPUB_LABEL);
+
+        let stored_credential = auth_runtime_credential_store::load(app_handle)
+            .expect("failed to load auth runtime credential store")
+            .expect("missing stored auth runtime credential");
+        assert!(matches!(
+            stored_credential.access_kind,
+            LoginAccessKind::HexKey
+        ));
+        assert_eq!(stored_credential.secret_key_hex, VALID_HEX_SECRET_KEY);
+        assert_eq!(stored_credential.pubkey, VALID_TEST_NPUB);
+        assert_eq!(stored_credential.stored_at, "2026-04-19T08:00:00Z");
+
+        let reloaded =
+            load_chat_shell_snapshot(app_handle).expect("failed to reload chat shell snapshot");
+        assert!(reloaded.shell.is_authenticated);
+        assert_eq!(reloaded.shell.user_profile.handle, "@nora.blake");
+        assert_eq!(reloaded.shell.restorable_circles.len(), 1);
+        assert_eq!(
+            reloaded
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| runtime.credential_persisted_in_native_store),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn bootstrap_auth_session_rejects_restore_selection_outside_catalog() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: false,
+                auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![RestorableCircleEntry {
+                    name: "Archive Relay".into(),
+                    relay: "wss://archive.example.local".into(),
+                    circle_type: crate::domain::chat::CircleType::Paid,
+                    description: "Recovered paid relay".into(),
+                    archived_at: "2026-04-18T10:00:00Z".into(),
+                }],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "".into(),
+                selected_session_id: "".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+
+        let error = bootstrap_auth_session(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::ExistingAccount,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::HexKey,
+                    value: Some(VALID_HEX_SECRET_KEY.into()),
+                },
+                user_profile: UserProfile {
+                    name: "Nora Blake".into(),
+                    handle: "@nora".into(),
+                    initials: "NB".into(),
+                    status: "Research".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Restore,
+                    circle_id: None,
+                    invite_code: None,
+                    name: None,
+                    relay: Some("wss://missing.example.local".into()),
+                },
+                logged_in_at: Some("2026-04-19T08:00:00Z".into()),
+            },
+        )
+        .expect_err("restore selection should reject relay outside the local catalog");
+
+        assert!(error.contains("restore selection relay is not present"));
+    }
+
+    #[test]
+    fn bootstrap_auth_session_marks_npub_import_as_failed_auth_runtime() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let shell = bootstrap_auth_session(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::ExistingAccount,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::Npub,
+                    value: Some(VALID_TEST_NPUB.into()),
+                },
+                user_profile: UserProfile {
+                    name: "Nora Blake".into(),
+                    handle: "@nora".into(),
+                    initials: "NB".into(),
+                    status: "Research".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Existing,
+                    circle_id: Some("main-circle".into()),
+                    invite_code: None,
+                    name: None,
+                    relay: None,
+                },
+                logged_in_at: Some("2026-04-19T08:30:00Z".into()),
+            },
+        )
+        .expect("failed to bootstrap npub auth session");
+
+        assert!(matches!(
+            shell.auth_runtime.as_ref().map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Failed)
+        ));
+        assert_eq!(
+            shell
+                .auth_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.error.as_deref()),
+            Some("Read-only npub import cannot sign messages yet.")
+        );
+        assert!(shell.auth_runtime_binding.is_none());
+    }
+
+    #[test]
+    fn bootstrap_auth_session_persists_remote_auth_runtime_binding() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let pubkey = valid_binding_pubkey_hex();
+
+        let shell = bootstrap_auth_session(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::Signer,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::NostrConnect,
+                    value: Some(format!(
+                        "nostrconnect://{pubkey}?relay=wss://relay.example.com&secret=shared-secret&perms=sign_event,get_public_key&name=Desk%20Client"
+                    )),
+                },
+                user_profile: UserProfile {
+                    name: "Nora Blake".into(),
+                    handle: "@nora".into(),
+                    initials: "NB".into(),
+                    status: "Research".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Existing,
+                    circle_id: Some("main-circle".into()),
+                    invite_code: None,
+                    name: None,
+                    relay: None,
+                },
+                logged_in_at: Some("2026-04-19T08:30:00Z".into()),
+            },
+        )
+        .expect("failed to bootstrap signer auth session");
+
+        let binding = shell
+            .auth_runtime_binding
+            .expect("missing auth runtime binding summary");
+        assert!(matches!(binding.access_kind, LoginAccessKind::NostrConnect));
+        assert_eq!(binding.endpoint, "wss://relay.example.com");
+        assert_eq!(binding.connection_pubkey.as_deref(), Some(pubkey.as_str()));
+        assert_eq!(binding.relay_count, 1);
+        assert!(binding.has_secret);
+        assert_eq!(
+            binding.requested_permissions,
+            vec!["sign_event", "get_public_key"]
+        );
+        assert_eq!(binding.client_name.as_deref(), Some("Desk Client"));
+        assert!(binding.persisted_in_native_store);
+
+        let stored_binding = auth_runtime_binding_store::load(app_handle)
+            .expect("failed to load stored auth runtime binding")
+            .expect("missing stored auth runtime binding");
+        assert!(matches!(
+            stored_binding.access_kind,
+            LoginAccessKind::NostrConnect
+        ));
+        assert_eq!(
+            stored_binding.value,
+            format!(
+                "nostrconnect://{pubkey}?relay=wss://relay.example.com&secret=shared-secret&perms=sign_event,get_public_key&name=Desk%20Client"
+            )
+        );
+    }
+
+    #[test]
+    fn complete_login_selects_existing_circle_and_first_visible_session() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let snapshot = complete_login(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::QuickStart,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::LocalProfile,
+                    value: None,
+                },
+                user_profile: UserProfile {
+                    name: "Sean Chen".into(),
+                    handle: "@seanchen".into(),
+                    initials: "SC".into(),
+                    status: "Circle owner".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Existing,
+                    circle_id: Some("main-circle".into()),
+                    invite_code: None,
+                    name: None,
+                    relay: None,
+                },
+                logged_in_at: Some("2026-04-19T08:00:00Z".into()),
+            },
+        )
+        .expect("failed to complete login");
+
+        assert!(snapshot.shell.is_authenticated);
+        assert_eq!(snapshot.shell.active_circle_id, "main-circle");
+        assert_eq!(snapshot.shell.selected_session_id, "alice");
+        assert_eq!(snapshot.shell.user_profile.handle, "@seanchen");
+        assert!(matches!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::LocalProfile)
+        ));
+        assert!(snapshot.domain.message_store.contains_key("alice"));
+    }
+
+    #[test]
+    fn complete_login_restores_circle_and_removes_catalog_entry() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: false,
+                auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![RestorableCircleEntry {
+                    name: "Archive Relay".into(),
+                    relay: "wss://archive.example.local".into(),
+                    circle_type: crate::domain::chat::CircleType::Paid,
+                    description: "Recovered paid relay".into(),
+                    archived_at: "2026-04-18T10:00:00Z".into(),
+                }],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "".into(),
+                selected_session_id: "".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+
+        let snapshot = complete_login(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::ExistingAccount,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::HexKey,
+                    value: Some(VALID_HEX_SECRET_KEY.into()),
+                },
+                user_profile: UserProfile {
+                    name: "Nora Blake".into(),
+                    handle: "@nora".into(),
+                    initials: "NB".into(),
+                    status: "Research".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Restore,
+                    circle_id: None,
+                    invite_code: None,
+                    name: None,
+                    relay: Some("wss://archive.example.local".into()),
+                },
+                logged_in_at: Some("2026-04-19T08:00:00Z".into()),
+            },
+        )
+        .expect("failed to complete login with restored circle");
+
+        let restored_circle = snapshot
+            .domain
+            .circles
+            .iter()
+            .find(|circle| circle.relay == "wss://archive.example.local")
+            .expect("missing restored circle");
+        assert_eq!(snapshot.shell.active_circle_id, restored_circle.id);
+        assert!(snapshot.shell.selected_session_id.is_empty());
+        assert!(snapshot.shell.restorable_circles.is_empty());
+        assert!(matches!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Connected)
+        ));
+    }
+
+    #[test]
+    fn logout_chat_session_clears_auth_state_but_preserves_local_preferences() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::ExistingAccount,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::Nsec,
+                        label: "nsec1sup...hell".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Restore,
+                    logged_in_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::ExistingAccount,
+                    access_kind: LoginAccessKind::Nsec,
+                    label: "nsec1sup...hell".into(),
+                    pubkey: None,
+                    error: None,
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Account runtime is still waiting for a signer handshake.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::Bunker,
+                    endpoint: "wss://archive.example.local".into(),
+                    connection_pubkey: None,
+                    relay_count: 1,
+                    has_secret: false,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: true,
+                    updated_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                user_profile: UserProfile {
+                    name: "Nora Blake".into(),
+                    handle: "@nora".into(),
+                    initials: "NB".into(),
+                    status: "Research".into(),
+                },
+                restorable_circles: vec![RestorableCircleEntry {
+                    name: "Archive Relay".into(),
+                    relay: "wss://archive.example.local".into(),
+                    circle_type: crate::domain::chat::CircleType::Paid,
+                    description: "Recovered paid relay".into(),
+                    archived_at: "2026-04-18T10:00:00Z".into(),
+                }],
+                app_preferences: AppPreferences {
+                    theme: ThemePreference::Ink,
+                    language: LanguagePreference::ZhCn,
+                    text_size: TextSizePreference::Large,
+                },
+                notification_preferences: NotificationPreferences {
+                    allow_send: false,
+                    allow_receive: true,
+                    show_badge: false,
+                    archive_summary: false,
+                    mentions_only: true,
+                },
+                advanced_preferences: AdvancedPreferences {
+                    show_message_info: true,
+                    use_tor_network: true,
+                    relay_diagnostics: false,
+                    experimental_transport: true,
+                },
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        let pubkey = valid_binding_pubkey_hex();
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::Bunker,
+                value: format!("bunker://{pubkey}?relay=wss://archive.example.local"),
+                stored_at: "2026-04-19T08:00:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime binding store");
+        auth_runtime_credential_store::save(
+            app_handle,
+            &auth_runtime_credential_store::StoredAuthRuntimeCredential {
+                login_method: LoginMethod::ExistingAccount,
+                access_kind: LoginAccessKind::Nsec,
+                secret_key_hex: VALID_HEX_SECRET_KEY.into(),
+                pubkey: VALID_TEST_NPUB.into(),
+                stored_at: "2026-04-19T08:00:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime credential store");
+        auth_runtime_client_store::save(
+            app_handle,
+            &auth_runtime_client_store::StoredAuthRuntimeClient {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::Bunker,
+                public_key: "3b7d3f7041e4675456f5f3d32d8f7d91a196e4d9576cb0b9f8430d48cae2f0d6"
+                    .into(),
+                secret_key_hex: "4444444444444444444444444444444444444444444444444444444444444444"
+                    .into(),
+                stored_at: "2026-04-19T08:00:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime client store");
+        auth_runtime_state_store::save(
+            app_handle,
+            &auth_runtime_state_store::StoredAuthRuntimeState {
+                login_method: LoginMethod::ExistingAccount,
+                access_kind: LoginAccessKind::Nsec,
+                label: "nsec1sup...hell".into(),
+                logged_in_at: "2026-04-19T08:00:00Z".into(),
+                state: AuthRuntimeState::Pending,
+                pubkey: None,
+                error: Some("waiting for signer".into()),
+                updated_at: "2026-04-19T08:15:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime state store");
+
+        let snapshot = logout_chat_session(app_handle).expect("failed to logout chat session");
+
+        assert!(!snapshot.shell.is_authenticated);
+        assert!(snapshot.shell.auth_session.is_none());
+        assert!(snapshot.shell.auth_runtime.is_none());
+        assert!(snapshot.shell.auth_runtime_binding.is_none());
+        assert_eq!(
+            snapshot.shell.user_profile.handle,
+            crate::domain::chat::default_user_profile().handle
+        );
+        assert_eq!(snapshot.shell.restorable_circles.len(), 1);
+        assert!(matches!(
+            snapshot.shell.app_preferences.theme,
+            ThemePreference::Ink
+        ));
+        assert!(snapshot.shell.advanced_preferences.experimental_transport);
+        assert!(snapshot.shell.active_circle_id.is_empty());
+        assert!(snapshot.shell.selected_session_id.is_empty());
+        assert!(snapshot.domain.circles.is_empty());
+        assert!(snapshot.domain.sessions.is_empty());
+
+        let reloaded =
+            load_chat_shell_snapshot(app_handle).expect("failed to reload chat shell snapshot");
+        assert!(!reloaded.shell.is_authenticated);
+        assert!(reloaded.shell.auth_session.is_none());
+        assert!(reloaded.shell.auth_runtime_binding.is_none());
+        assert_eq!(reloaded.shell.restorable_circles.len(), 1);
+        assert!(matches!(
+            reloaded.shell.app_preferences.language,
+            LanguagePreference::ZhCn
+        ));
+        assert!(reloaded.domain.circles.is_empty());
+        assert!(reloaded.domain.sessions.is_empty());
+        assert!(auth_runtime_binding_store::load(app_handle)
+            .expect("failed to load auth runtime binding store")
+            .is_none());
+        assert!(auth_runtime_credential_store::load(app_handle)
+            .expect("failed to load auth runtime credential store")
+            .is_none());
+        assert!(auth_runtime_client_store::load(app_handle)
+            .expect("failed to load auth runtime client store")
+            .is_none());
+        assert!(auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .is_none());
+    }
+
+    #[test]
+    fn update_auth_runtime_promotes_pending_signer_to_connected_and_persists() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::NostrConnect,
+                        label: "nostrconnect://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::NostrConnect,
+                    label: "nostrconnect://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Remote signer handshake is not implemented yet.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::NostrConnect,
+                    endpoint: "wss://relay.example.com".into(),
+                    connection_pubkey: None,
+                    relay_count: 1,
+                    has_secret: false,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: true,
+                    updated_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        seed_auth_runtime_binding(
+            app_handle,
+            LoginMethod::Signer,
+            LoginAccessKind::NostrConnect,
+            "2026-04-19T08:00:00Z",
+        );
+
+        let shell = update_auth_runtime(
+            app_handle,
+            UpdateAuthRuntimeInput {
+                state: AuthRuntimeState::Connected,
+                error: None,
+                updated_at: Some("2026-04-19T09:30:00Z".into()),
+                label: Some("Remote Signer A".into()),
+            },
+        )
+        .expect("failed to update auth runtime");
+
+        let runtime = shell.auth_runtime.expect("missing updated auth runtime");
+        assert!(matches!(runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(runtime.label, "Remote Signer A");
+        assert!(runtime.error.is_none());
+        assert!(!runtime.can_send_messages);
+        assert_eq!(
+            runtime.send_blocked_reason.as_deref(),
+            Some(
+                "Remote signer is connected, but message send still requires remote event-signing support."
+            )
+        );
+        assert!(runtime.persisted_in_native_store);
+        assert_eq!(runtime.updated_at, "2026-04-19T09:30:00Z");
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing stored auth runtime state");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(stored_runtime.label, "Remote Signer A");
+        assert_eq!(stored_runtime.updated_at, "2026-04-19T09:30:00Z");
+
+        let reloaded =
+            load_chat_shell_snapshot(app_handle).expect("failed to reload chat shell snapshot");
+        let reloaded_runtime = reloaded
+            .shell
+            .auth_runtime
+            .expect("missing reloaded updated auth runtime");
+        assert!(matches!(
+            reloaded_runtime.state,
+            AuthRuntimeState::Connected
+        ));
+        assert_eq!(reloaded_runtime.label, "Remote Signer A");
+        assert!(reloaded_runtime.error.is_none());
+    }
+
+    #[test]
+    fn update_auth_runtime_rejects_invalid_quick_start_transition() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::QuickStart,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::LocalProfile,
+                        label: "Quick Start".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::LocalProfile,
+                    login_method: LoginMethod::QuickStart,
+                    access_kind: LoginAccessKind::LocalProfile,
+                    label: "Quick Start".into(),
+                    pubkey: None,
+                    error: None,
+                    can_send_messages: true,
+                    send_blocked_reason: None,
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T08:00:00Z".into(),
+                }),
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+
+        let error = update_auth_runtime(
+            app_handle,
+            UpdateAuthRuntimeInput {
+                state: AuthRuntimeState::Failed,
+                error: Some("force failure".into()),
+                updated_at: Some("2026-04-19T09:30:00Z".into()),
+                label: None,
+            },
+        )
+        .expect_err("quick start runtime should reject non-local profile state");
+
+        assert!(error.contains("quick start auth runtime is fixed"));
+    }
+
+    #[test]
     fn load_chat_shell_snapshot_accepts_legacy_persisted_shell_state_shape() {
         let guard = test_app();
         let app_handle = guard.app.handle();
@@ -274,12 +1842,15 @@ mod tests {
         let persisted_state = PersistedShellState {
             is_authenticated: true,
             auth_session: None,
+            auth_runtime: None,
+            auth_runtime_binding: None,
             user_profile: UserProfile {
                 name: "Legacy User".into(),
                 handle: "@legacy".into(),
                 initials: "LU".into(),
                 status: "Legacy".into(),
             },
+            restorable_circles: vec![],
             circles: vec![],
             app_preferences: AppPreferences {
                 theme: ThemePreference::Light,
@@ -336,6 +1907,816 @@ mod tests {
     }
 
     #[test]
+    fn load_chat_shell_snapshot_backfills_auth_runtime_from_auth_session_when_missing() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::ExistingAccount,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::Npub,
+                        label: VALID_TEST_NPUB_LABEL.into(),
+                        pubkey: Some(VALID_TEST_NPUB.into()),
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:00:00Z".into(),
+                }),
+                auth_runtime: None,
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+
+        let snapshot =
+            load_chat_shell_snapshot(app_handle).expect("failed to load chat shell snapshot");
+
+        assert!(matches!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Failed)
+        ));
+        assert_eq!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| runtime.persisted_in_native_store),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| runtime.credential_persisted_in_native_store),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.error.as_deref()),
+            Some("Read-only npub import cannot sign messages yet.")
+        );
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing bootstrapped auth runtime");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(stored_runtime.logged_in_at, "2026-04-19T11:00:00Z");
+        assert_eq!(
+            stored_runtime.error.as_deref(),
+            Some("Read-only npub import cannot sign messages yet.")
+        );
+    }
+
+    #[test]
+    fn load_chat_shell_snapshot_marks_local_secret_runtime_failed_when_native_credential_is_missing(
+    ) {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::ExistingAccount,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::HexKey,
+                        label: VALID_TEST_NPUB_LABEL.into(),
+                        pubkey: Some(VALID_TEST_NPUB.into()),
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:30:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Connected,
+                    login_method: LoginMethod::ExistingAccount,
+                    access_kind: LoginAccessKind::HexKey,
+                    label: VALID_TEST_NPUB_LABEL.into(),
+                    pubkey: Some(VALID_TEST_NPUB.into()),
+                    error: None,
+                    can_send_messages: true,
+                    send_blocked_reason: None,
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:30:00Z".into(),
+                }),
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        auth_runtime_state_store::save(
+            app_handle,
+            &auth_runtime_state_store::StoredAuthRuntimeState {
+                login_method: LoginMethod::ExistingAccount,
+                access_kind: LoginAccessKind::HexKey,
+                label: VALID_TEST_NPUB_LABEL.into(),
+                logged_in_at: "2026-04-19T11:30:00Z".into(),
+                state: AuthRuntimeState::Connected,
+                pubkey: Some(VALID_TEST_NPUB.into()),
+                error: None,
+                updated_at: "2026-04-19T11:30:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime state store");
+
+        let snapshot =
+            load_chat_shell_snapshot(app_handle).expect("failed to load chat shell snapshot");
+        let runtime = snapshot
+            .shell
+            .auth_runtime
+            .expect("missing auth runtime summary");
+
+        assert!(matches!(runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("Validated local account key is missing from native credential store.")
+        );
+        assert!(!runtime.can_send_messages);
+        assert_eq!(
+            runtime.send_blocked_reason.as_deref(),
+            Some("Validated local account key is missing from native credential store.")
+        );
+        assert!(runtime.persisted_in_native_store);
+        assert!(!runtime.credential_persisted_in_native_store);
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing corrected auth runtime state");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(
+            stored_runtime.error.as_deref(),
+            Some("Validated local account key is missing from native credential store.")
+        );
+    }
+
+    #[test]
+    fn load_chat_shell_snapshot_marks_remote_signer_runtime_failed_when_native_binding_is_missing()
+    {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::NostrConnect,
+                        label: "nostrconnect://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:40:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Connected,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::NostrConnect,
+                    label: "Remote Signer A".into(),
+                    pubkey: None,
+                    error: None,
+                    can_send_messages: true,
+                    send_blocked_reason: None,
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:42:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::NostrConnect,
+                    endpoint: "wss://relay.example.com".into(),
+                    connection_pubkey: None,
+                    relay_count: 1,
+                    has_secret: false,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:40:00Z".into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        auth_runtime_state_store::save(
+            app_handle,
+            &auth_runtime_state_store::StoredAuthRuntimeState {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::NostrConnect,
+                label: "Remote Signer A".into(),
+                logged_in_at: "2026-04-19T11:40:00Z".into(),
+                state: AuthRuntimeState::Connected,
+                pubkey: None,
+                error: None,
+                updated_at: "2026-04-19T11:42:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime state store");
+
+        let snapshot =
+            load_chat_shell_snapshot(app_handle).expect("failed to load chat shell snapshot");
+        let runtime = snapshot
+            .shell
+            .auth_runtime
+            .expect("missing auth runtime summary");
+
+        assert!(matches!(runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("Stored remote signer binding is missing from native binding store.")
+        );
+        assert!(!runtime.can_send_messages);
+        assert_eq!(
+            runtime.send_blocked_reason.as_deref(),
+            Some("Stored remote signer binding is missing from native binding store.")
+        );
+        assert!(runtime.persisted_in_native_store);
+
+        let binding = snapshot
+            .shell
+            .auth_runtime_binding
+            .expect("missing auth runtime binding summary");
+        assert_eq!(binding.endpoint, "wss://relay.example.com");
+        assert!(!binding.persisted_in_native_store);
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing corrected auth runtime state");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(
+            stored_runtime.error.as_deref(),
+            Some("Stored remote signer binding is missing from native binding store.")
+        );
+    }
+
+    #[test]
+    fn load_chat_shell_snapshot_prefers_native_auth_runtime_state_for_current_session() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::NostrConnect,
+                        label: "nostrconnect://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:45:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::NostrConnect,
+                    label: "nostrconnect://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Remote signer handshake is not implemented yet.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:45:00Z".into(),
+                }),
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        seed_auth_runtime_binding(
+            app_handle,
+            LoginMethod::Signer,
+            LoginAccessKind::NostrConnect,
+            "2026-04-19T11:45:00Z",
+        );
+        auth_runtime_state_store::save(
+            app_handle,
+            &auth_runtime_state_store::StoredAuthRuntimeState {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::NostrConnect,
+                label: "Remote Signer A".into(),
+                logged_in_at: "2026-04-19T11:45:00Z".into(),
+                state: AuthRuntimeState::Connected,
+                pubkey: None,
+                error: None,
+                updated_at: "2026-04-19T11:50:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime state store");
+
+        let snapshot =
+            load_chat_shell_snapshot(app_handle).expect("failed to load chat shell snapshot");
+
+        let runtime = snapshot
+            .shell
+            .auth_runtime
+            .expect("missing auth runtime summary");
+        assert!(matches!(runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(runtime.label, "Remote Signer A");
+        assert!(runtime.error.is_none());
+        assert!(!runtime.can_send_messages);
+        assert_eq!(
+            runtime.send_blocked_reason.as_deref(),
+            Some(
+                "Remote signer is connected, but message send still requires remote event-signing support."
+            )
+        );
+        assert!(runtime.persisted_in_native_store);
+        assert_eq!(runtime.updated_at, "2026-04-19T11:50:00Z");
+    }
+
+    #[test]
+    fn sync_auth_runtime_promotes_pending_bunker_signer_when_handshake_succeeds() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let (relay_url, relay_handle) = spawn_bunker_handshake_relay_server();
+        let signer_pubkey = bunker_signer_public_key_hex();
+        let user_npub = bunker_user_public_key_npub();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::Bunker,
+                        label: "bunker://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:46:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::Bunker,
+                    label: "bunker://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Remote signer handshake is not implemented yet.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:46:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::Bunker,
+                    endpoint: relay_url.clone(),
+                    connection_pubkey: Some(signer_pubkey.clone()),
+                    relay_count: 1,
+                    has_secret: true,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:46:00Z".into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::Bunker,
+                value: format!(
+                    "bunker://{signer_pubkey}?relay={relay_url}&secret={TEST_BUNKER_SHARED_SECRET}"
+                ),
+                stored_at: "2026-04-19T11:46:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime binding store");
+
+        let shell = sync_auth_runtime(app_handle).expect("failed to sync auth runtime");
+        let runtime = shell.auth_runtime.expect("missing synced auth runtime");
+        assert!(matches!(runtime.state, AuthRuntimeState::Connected));
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.pubkey.as_deref(), Some(user_npub.as_str()));
+        assert!(runtime.can_send_messages);
+        assert_eq!(runtime.send_blocked_reason, None);
+        assert!(runtime.persisted_in_native_store);
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing stored auth runtime state");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(stored_runtime.pubkey.as_deref(), Some(user_npub.as_str()));
+        assert!(stored_runtime.error.is_none());
+
+        let stored_client = auth_runtime_client_store::load(app_handle)
+            .expect("failed to load auth runtime client store")
+            .expect("missing stored auth runtime client");
+        assert!(matches!(stored_client.access_kind, LoginAccessKind::Bunker));
+        assert_eq!(stored_client.stored_at, "2026-04-19T11:46:00Z");
+
+        let reloaded =
+            load_chat_shell_snapshot(app_handle).expect("failed to reload synced auth runtime");
+        assert_eq!(
+            reloaded
+                .shell
+                .auth_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.pubkey.as_deref()),
+            Some(user_npub.as_str())
+        );
+
+        relay_handle
+            .join()
+            .expect("test relay thread should finish cleanly");
+    }
+
+    #[test]
+    fn sync_auth_runtime_marks_pasted_nostrconnect_failed_until_client_uri_support_exists() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let relay_url = unreachable_test_relay_url();
+        let pubkey = valid_binding_pubkey_hex();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::NostrConnect,
+                        label: "nostrconnect://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:47:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::NostrConnect,
+                    label: "nostrconnect://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Remote signer handshake is not implemented yet.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:47:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::NostrConnect,
+                    endpoint: relay_url.clone(),
+                    connection_pubkey: Some(pubkey.clone()),
+                    relay_count: 1,
+                    has_secret: true,
+                    requested_permissions: vec!["sign_event".into()],
+                    client_name: Some("Desk Client".into()),
+                    persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:47:00Z".into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::NostrConnect,
+                value: format!(
+                    "nostrconnect://{pubkey}?relay={relay_url}&secret=shared-secret&perms=sign_event&name=Desk%20Client"
+                ),
+                stored_at: "2026-04-19T11:47:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime binding store");
+
+        let shell = sync_auth_runtime(app_handle).expect("failed to sync auth runtime");
+        let runtime = shell.auth_runtime.expect("missing synced auth runtime");
+        assert!(matches!(runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(
+                "Pasted nostrConnect client URIs are not supported yet; use a bunker:// handoff until desktop-generated client URIs are implemented."
+            )
+        );
+        assert_eq!(
+            runtime.send_blocked_reason.as_deref(),
+            runtime.error.as_deref()
+        );
+        assert!(!runtime.can_send_messages);
+        assert!(runtime.persisted_in_native_store);
+
+        let stored_runtime = auth_runtime_state_store::load(app_handle)
+            .expect("failed to load auth runtime state store")
+            .expect("missing stored auth runtime state");
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Failed));
+        assert_eq!(stored_runtime.error, runtime.error);
+        assert!(auth_runtime_client_store::load(app_handle)
+            .expect("failed to load auth runtime client store")
+            .is_none());
+    }
+
+    #[test]
+    fn sync_auth_runtime_reuses_persisted_bunker_client_keys_across_retries() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let relay_url = unreachable_test_relay_url();
+        let signer_pubkey = bunker_signer_public_key_hex();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::Bunker,
+                        label: "bunker://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:48:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::Bunker,
+                    label: "bunker://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Remote signer handshake is not implemented yet.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:48:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::Bunker,
+                    endpoint: relay_url.clone(),
+                    connection_pubkey: Some(signer_pubkey.clone()),
+                    relay_count: 1,
+                    has_secret: true,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:48:00Z".into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::Bunker,
+                value: format!(
+                    "bunker://{signer_pubkey}?relay={relay_url}&secret={TEST_BUNKER_SHARED_SECRET}"
+                ),
+                stored_at: "2026-04-19T11:48:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime binding store");
+
+        let first_shell = sync_auth_runtime(app_handle).expect("failed to sync auth runtime");
+        assert!(matches!(
+            first_shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Failed)
+        ));
+        let first_client = auth_runtime_client_store::load(app_handle)
+            .expect("failed to load auth runtime client store")
+            .expect("missing stored auth runtime client");
+
+        let pending_shell = update_auth_runtime(
+            app_handle,
+            UpdateAuthRuntimeInput {
+                state: AuthRuntimeState::Pending,
+                error: Some("retry bunker handshake".into()),
+                updated_at: Some("2026-04-19T11:49:00Z".into()),
+                label: None,
+            },
+        )
+        .expect("failed to restore pending auth runtime");
+        assert!(matches!(
+            pending_shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Pending)
+        ));
+
+        let second_shell = sync_auth_runtime(app_handle).expect("failed to resync auth runtime");
+        assert!(matches!(
+            second_shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Failed)
+        ));
+        let second_client = auth_runtime_client_store::load(app_handle)
+            .expect("failed to reload auth runtime client store")
+            .expect("missing reloaded auth runtime client");
+
+        assert_eq!(second_client.public_key, first_client.public_key);
+        assert_eq!(second_client.secret_key_hex, first_client.secret_key_hex);
+        assert_eq!(second_client.stored_at, first_client.stored_at);
+    }
+
+    #[test]
+    fn sync_auth_runtime_persists_rehydrated_runtime_into_shell_state_store() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::NostrConnect,
+                        label: "nostrconnect://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: "2026-04-19T11:55:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::NostrConnect,
+                    label: "nostrconnect://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some(
+                        "Remote signer handshake is not implemented yet.".into(),
+                    ),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:55:00Z".into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::NostrConnect,
+                    endpoint: "wss://relay.example.com".into(),
+                    connection_pubkey: None,
+                    relay_count: 1,
+                    has_secret: false,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: false,
+                    updated_at: "2026-04-19T11:55:00Z".into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        let pubkey = valid_binding_pubkey_hex();
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::NostrConnect,
+                value: format!(
+                    "nostrconnect://{pubkey}?relay=wss://relay.example.com&secret=shared-secret"
+                ),
+                stored_at: "2026-04-19T11:55:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime binding store");
+        auth_runtime_state_store::save(
+            app_handle,
+            &auth_runtime_state_store::StoredAuthRuntimeState {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::NostrConnect,
+                label: "Remote Signer A".into(),
+                logged_in_at: "2026-04-19T11:55:00Z".into(),
+                state: AuthRuntimeState::Connected,
+                pubkey: None,
+                error: None,
+                updated_at: "2026-04-19T11:58:00Z".into(),
+            },
+        )
+        .expect("failed to seed auth runtime state store");
+
+        let shell = sync_auth_runtime(app_handle).expect("failed to sync auth runtime");
+        let runtime = shell.auth_runtime.expect("missing synced auth runtime");
+        assert!(matches!(runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(runtime.label, "Remote Signer A");
+        assert!(runtime.error.is_none());
+        assert!(!runtime.can_send_messages);
+        assert_eq!(
+            runtime.send_blocked_reason.as_deref(),
+            Some(
+                "Remote signer is connected, but message send still requires remote event-signing support."
+            )
+        );
+        assert!(runtime.persisted_in_native_store);
+        assert_eq!(runtime.updated_at, "2026-04-19T11:58:00Z");
+
+        let persisted_shell = shell_state_store::load(app_handle)
+            .expect("failed to load persisted shell state")
+            .and_then(crate::app::shell_auth::deserialize_shell_state_snapshot)
+            .expect("missing persisted shell snapshot");
+        let persisted_runtime = persisted_shell
+            .auth_runtime
+            .expect("missing persisted auth runtime");
+        assert!(matches!(
+            persisted_runtime.state,
+            AuthRuntimeState::Connected
+        ));
+        assert_eq!(persisted_runtime.label, "Remote Signer A");
+        assert!(!persisted_runtime.can_send_messages);
+        assert!(persisted_runtime.persisted_in_native_store);
+
+        let persisted_binding = persisted_shell
+            .auth_runtime_binding
+            .expect("missing persisted auth runtime binding");
+        assert!(persisted_binding.persisted_in_native_store);
+        assert_eq!(persisted_binding.endpoint, "wss://relay.example.com");
+    }
+
+    #[test]
     fn load_chat_shell_snapshot_only_preloads_selected_session_messages() {
         let guard = test_app();
         let app_handle = guard.app.handle();
@@ -345,7 +2726,10 @@ mod tests {
             serde_json::to_value(ShellStateSnapshot {
                 is_authenticated: true,
                 auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
                 user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
                 app_preferences: crate::domain::chat::default_app_preferences(),
                 notification_preferences: crate::domain::chat::default_notification_preferences(),
                 advanced_preferences: crate::domain::chat::default_advanced_preferences(),
@@ -374,7 +2758,10 @@ mod tests {
             serde_json::to_value(ShellStateSnapshot {
                 is_authenticated: false,
                 auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
                 user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
                 app_preferences: crate::domain::chat::default_app_preferences(),
                 notification_preferences: crate::domain::chat::default_notification_preferences(),
                 advanced_preferences: crate::domain::chat::default_advanced_preferences(),
@@ -529,6 +2916,7 @@ mod tests {
             crate::domain::chat::SendMessageInput {
                 session_id: "mika".into(),
                 body: "Bring this thread to the top".into(),
+                reply_to_message_id: None,
             },
         )
         .expect("failed to send message");

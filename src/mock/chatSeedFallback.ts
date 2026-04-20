@@ -403,7 +403,10 @@ export function createChatSeedFallback(): PersistedShellState {
   return {
     isAuthenticated: false,
     authSession: null,
+    authRuntime: null,
+    authRuntimeBinding: null,
     userProfile: cloneSeed(defaultUserProfile),
+    restorableCircles: [],
     circles: cloneSeed(circleItems),
     appPreferences: cloneSeed(defaultAppPreferences),
     notificationPreferences: cloneSeed(defaultNotificationPreferences),

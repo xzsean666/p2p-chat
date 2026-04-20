@@ -45,7 +45,10 @@ export function createEmptyShellState(): PersistedShellState {
   return cloneState({
     isAuthenticated: false,
     authSession: null,
+    authRuntime: null,
+    authRuntimeBinding: null,
     userProfile: defaultUserProfile,
+    restorableCircles: [],
     circles: [],
     appPreferences: defaultAppPreferences,
     notificationPreferences: defaultNotificationPreferences,
@@ -77,7 +80,10 @@ export function shellStateSnapshotFromPersistedState(
   return cloneState({
     isAuthenticated: state.isAuthenticated,
     authSession: state.authSession,
+    authRuntime: state.authRuntime,
+    authRuntimeBinding: state.authRuntimeBinding,
     userProfile: state.userProfile,
+    restorableCircles: state.restorableCircles,
     appPreferences: state.appPreferences,
     notificationPreferences: state.notificationPreferences,
     advancedPreferences: state.advancedPreferences,
@@ -108,7 +114,10 @@ export function createPersistedShellStateFromChatShellSnapshot(
     ...createShellStateFromDomainSeed(snapshot.domain),
     isAuthenticated: snapshot.shell.isAuthenticated,
     authSession: snapshot.shell.authSession,
+    authRuntime: snapshot.shell.authRuntime,
+    authRuntimeBinding: snapshot.shell.authRuntimeBinding,
     userProfile: snapshot.shell.userProfile,
+    restorableCircles: snapshot.shell.restorableCircles,
     appPreferences: snapshot.shell.appPreferences,
     notificationPreferences: snapshot.shell.notificationPreferences,
     advancedPreferences: snapshot.shell.advancedPreferences,
@@ -120,11 +129,12 @@ export function createPersistedShellStateFromChatShellSnapshot(
 export function createLoggedOutShellState(
   state: Pick<
     PersistedShellState,
-    "appPreferences" | "notificationPreferences" | "advancedPreferences"
+    "restorableCircles" | "appPreferences" | "notificationPreferences" | "advancedPreferences"
   >,
 ): PersistedShellState {
   return cloneState({
     ...createEmptyShellState(),
+    restorableCircles: state.restorableCircles,
     appPreferences: state.appPreferences,
     notificationPreferences: state.notificationPreferences,
     advancedPreferences: state.advancedPreferences,

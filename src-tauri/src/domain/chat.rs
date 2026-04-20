@@ -16,9 +16,19 @@ pub enum SessionKind {
 #[serde(rename_all = "lowercase")]
 pub enum MessageKind {
     Text,
+    Image,
+    Video,
     File,
     Audio,
     System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatMediaKind {
+    File,
+    Image,
+    Video,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +165,41 @@ pub struct UserProfile {
 pub struct LoginAccessSummary {
     pub kind: LoginAccessKind,
     pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginCircleSelectionInput {
+    pub mode: LoginCircleSelectionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circle_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginAccessInput {
+    pub kind: LoginAccessKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginCompletionInput {
+    pub method: LoginMethod,
+    pub access: LoginAccessInput,
+    pub user_profile: UserProfile,
+    pub circle_selection: LoginCircleSelectionInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logged_in_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +213,68 @@ pub struct AuthSessionSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum AuthRuntimeState {
+    LocalProfile,
+    Pending,
+    Connected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRuntimeSummary {
+    pub state: AuthRuntimeState,
+    pub login_method: LoginMethod,
+    pub access_kind: LoginAccessKind,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub can_send_messages: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_blocked_reason: Option<String>,
+    #[serde(default)]
+    pub persisted_in_native_store: bool,
+    #[serde(default)]
+    pub credential_persisted_in_native_store: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRuntimeBindingSummary {
+    pub access_kind: LoginAccessKind,
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_pubkey: Option<String>,
+    #[serde(default)]
+    pub relay_count: u32,
+    #[serde(default)]
+    pub has_secret: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_permissions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    pub persisted_in_native_store: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAuthRuntimeInput {
+    pub state: AuthRuntimeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CircleItem {
     pub id: String,
     pub name: String,
@@ -177,6 +284,34 @@ pub struct CircleItem {
     pub status: CircleStatus,
     pub latency: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreCircleInput {
+    pub name: String,
+    pub relay: String,
+    #[serde(rename = "type")]
+    pub circle_type: CircleType,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateContactRemarkInput {
+    pub contact_id: String,
+    pub remark: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorableCircleEntry {
+    pub name: String,
+    pub relay: String,
+    #[serde(rename = "type")]
+    pub circle_type: CircleType,
+    pub description: String,
+    pub archived_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +357,31 @@ pub struct SessionItem {
     pub archived: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedNostrEvent {
+    pub event_id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub kind: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReplyPreview {
+    pub message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
+    pub author: MessageAuthor,
+    pub author_label: String,
+    pub kind: MessageKind,
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageItem {
@@ -240,6 +400,10 @@ pub struct MessageItem {
     pub sync_source: Option<MessageSyncSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_nostr_event: Option<SignedNostrEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<MessageReplyPreview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +449,73 @@ pub struct ChatDomainOverview {
 pub struct SendMessageInput {
     pub session_id: String,
     pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendFileMessageInput {
+    pub session_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendImageMessageInput {
+    pub session_id: String,
+    pub name: String,
+    pub meta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendVideoMessageInput {
+    pub session_id: String,
+    pub name: String,
+    pub meta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreChatMediaAssetInput {
+    pub kind: ChatMediaKind,
+    pub name: String,
+    pub data_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredChatMediaAsset {
+    pub local_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupChatMediaAssetsResult {
+    pub removed_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheChatMessageMediaInput {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedChatMessageMediaResult {
+    pub seed: ChatDomainSeed,
+    pub local_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,8 +680,14 @@ pub struct ShellStateSnapshot {
     pub is_authenticated: bool,
     #[serde(default)]
     pub auth_session: Option<AuthSessionSummary>,
+    #[serde(default)]
+    pub auth_runtime: Option<AuthRuntimeSummary>,
+    #[serde(default)]
+    pub auth_runtime_binding: Option<AuthRuntimeBindingSummary>,
     #[serde(default = "default_user_profile")]
     pub user_profile: UserProfile,
+    #[serde(default)]
+    pub restorable_circles: Vec<RestorableCircleEntry>,
     pub app_preferences: AppPreferences,
     pub notification_preferences: NotificationPreferences,
     pub advanced_preferences: AdvancedPreferences,
@@ -519,8 +756,14 @@ pub struct PersistedShellState {
     pub is_authenticated: bool,
     #[serde(default)]
     pub auth_session: Option<AuthSessionSummary>,
+    #[serde(default)]
+    pub auth_runtime: Option<AuthRuntimeSummary>,
+    #[serde(default)]
+    pub auth_runtime_binding: Option<AuthRuntimeBindingSummary>,
     #[serde(default = "default_user_profile")]
     pub user_profile: UserProfile,
+    #[serde(default)]
+    pub restorable_circles: Vec<RestorableCircleEntry>,
     pub circles: Vec<CircleItem>,
     pub app_preferences: AppPreferences,
     pub notification_preferences: NotificationPreferences,
@@ -585,7 +828,10 @@ impl From<ChatDomainSeed> for PersistedShellState {
         Self {
             is_authenticated: false,
             auth_session: None,
+            auth_runtime: None,
+            auth_runtime_binding: None,
             user_profile: default_user_profile(),
+            restorable_circles: vec![],
             circles: seed.circles,
             app_preferences: default_app_preferences(),
             notification_preferences: default_notification_preferences(),
@@ -605,7 +851,10 @@ impl From<PersistedShellState> for ShellStateSnapshot {
         Self {
             is_authenticated: state.is_authenticated,
             auth_session: state.auth_session,
+            auth_runtime: state.auth_runtime,
+            auth_runtime_binding: state.auth_runtime_binding,
             user_profile: state.user_profile,
+            restorable_circles: state.restorable_circles,
             app_preferences: state.app_preferences,
             notification_preferences: state.notification_preferences,
             advanced_preferences: state.advanced_preferences,

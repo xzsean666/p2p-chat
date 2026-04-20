@@ -1,27 +1,37 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import Button from "primevue/button";
+import InputText from "primevue/inputtext";
 import Tag from "primevue/tag";
 import ToggleSwitch from "primevue/toggleswitch";
 import OverlayPageShell from "./OverlayPageShell.vue";
 import type {
   AdvancedPreferences,
-  CircleTransportDiagnostic,
+  AuthRuntimeBindingSummary,
+  AuthRuntimeSummary,
+  AuthSessionSummary,
   AppPreferences,
+  CircleTransportDiagnostic,
   CircleItem,
   NotificationPreferences,
+  RestorableCircleEntry,
   SettingPageId,
   TransportActivityItem,
   TransportRuntimeSession,
   TransportSnapshot,
+  UpdateAuthRuntimeInput,
 } from "../types/chat";
 
 const props = defineProps<{
   settingId: SettingPageId;
   phase?: string;
   version: string;
+  authSession: AuthSessionSummary | null;
+  authRuntime: AuthRuntimeSummary | null;
+  authRuntimeBinding: AuthRuntimeBindingSummary | null;
   activeCircle: CircleItem | null;
   circlesCount: number;
+  restorableCircles: RestorableCircleEntry[];
   sessionCount: number;
   preferences: AppPreferences;
   notifications: NotificationPreferences;
@@ -37,9 +47,14 @@ const emit = defineEmits<{
   (event: "update-preferences", patch: Partial<AppPreferences>): void;
   (event: "update-notifications", patch: Partial<NotificationPreferences>): void;
   (event: "update-advanced", patch: Partial<AdvancedPreferences>): void;
+  (event: "update-auth-runtime", input: UpdateAuthRuntimeInput): void;
+  (event: "sync-auth-runtime"): void;
+  (event: "restore-circle", entry: RestorableCircleEntry): void;
+  (event: "forget-restorable-circle", relay: string): void;
 }>();
 
 const copyFeedback = ref("");
+const authRuntimeErrorDraft = ref("");
 
 const transportMetrics = computed(() => {
   if (!props.transportSnapshot) {
@@ -127,6 +142,10 @@ const visibleRuntimeSessions = computed(() => {
   return runtimeSessions.value.slice(0, 4);
 });
 
+const restorableCircleCount = computed(() => {
+  return props.restorableCircles.length;
+});
+
 const activeRuntimeSession = computed(() => {
   const focusCircleId = props.activeCircle?.id ?? props.transportSnapshot?.activeCircleId;
   return (
@@ -138,6 +157,31 @@ const activeRuntimeSession = computed(() => {
 
 const latestTransportActivity = computed(() => {
   return recentTransportActivities.value[0] ?? null;
+});
+
+const canUpdateAuthRuntime = computed(() => {
+  return !!props.authSession && props.authSession.loginMethod !== "quickStart";
+});
+
+const canSyncAuthRuntime = computed(() => {
+  return !!props.authSession && props.authSession.loginMethod !== "quickStart";
+});
+
+const authRuntimeSyncLabel = computed(() => {
+  const accessKind = props.authRuntime?.accessKind ?? props.authSession?.access.kind;
+  if (accessKind === "bunker" || accessKind === "nostrConnect") {
+    if (props.authRuntime?.state === "pending") {
+      return "Retry Handshake";
+    }
+
+    if (props.authRuntime?.state === "failed") {
+      return "Retry Runtime Sync";
+    }
+
+    return "Refresh Signer Runtime";
+  }
+
+  return "Refresh Runtime";
 });
 
 const metadata = computed(() => {
@@ -274,6 +318,63 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
   const timeCopy = session.lastLaunchAt ? ` · ${session.lastLaunchAt}` : "";
   return `${session.lastLaunchResult}${pidCopy}${timeCopy}`;
 }
+
+function typeLabel(type: CircleItem["type"]) {
+  switch (type) {
+    case "paid":
+      return "Private";
+    case "bitchat":
+      return "Offline";
+    case "custom":
+      return "Custom";
+    default:
+      return "Invite";
+  }
+}
+
+function typeTone(type: CircleItem["type"]) {
+  switch (type) {
+    case "paid":
+      return "warn";
+    case "bitchat":
+      return "secondary";
+    case "custom":
+      return "contrast";
+    default:
+      return "success";
+  }
+}
+
+function archivedAtCopy(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString();
+}
+
+function emitAuthRuntimeUpdate(state: UpdateAuthRuntimeInput["state"]) {
+  if (!props.authSession) {
+    return;
+  }
+
+  emit("update-auth-runtime", {
+    state,
+    error:
+      state === "connected" || state === "localProfile"
+        ? undefined
+        : authRuntimeErrorDraft.value.trim() || undefined,
+  });
+}
+
+watch(
+  () => props.authRuntime?.error ?? "",
+  (value) => {
+    authRuntimeErrorDraft.value = value;
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
@@ -628,9 +729,12 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
         <section class="hero-card">
           <div class="hero-copy">
             <h3>Restore Circle Access</h3>
-            <p>Use the circle directory to reconnect invite-based and private relay contexts. New circle entries are stored in the local shell snapshot immediately.</p>
+            <p>Removed circles are archived into a local restore catalog. You can bring them back with the original relay, type and description intact.</p>
           </div>
-          <Tag value="Circle Restore" severity="warn" rounded />
+          <div class="hero-tags">
+            <Tag value="Circle Restore" severity="warn" rounded />
+            <Tag :value="`${restorableCircleCount} saved`" severity="contrast" rounded />
+          </div>
         </section>
 
         <section class="section-card">
@@ -646,6 +750,43 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
             <strong>Saved Circles</strong>
             <p>{{ circlesCount }}</p>
           </div>
+          <div class="info-row">
+            <strong>Restorable Catalog</strong>
+            <p>{{ restorableCircleCount }}</p>
+          </div>
+        </section>
+
+        <section class="section-card">
+          <div class="section-title">Saved Restore Entries</div>
+          <div v-if="restorableCircles.length" class="list-card">
+            <div v-for="entry in restorableCircles" :key="entry.relay" class="list-row restore-row">
+              <div class="list-copy">
+                <strong>{{ entry.name }}</strong>
+                <p>{{ entry.relay }}</p>
+                <p>{{ entry.description || "No description archived for this circle." }}</p>
+                <p>Archived {{ archivedAtCopy(entry.archivedAt) }}</p>
+              </div>
+              <div class="restore-actions">
+                <Tag :value="typeLabel(entry.type)" :severity="typeTone(entry.type)" rounded />
+                <Button
+                  icon="pi pi-refresh"
+                  label="Restore"
+                  severity="contrast"
+                  @click="emit('restore-circle', entry)"
+                />
+                <Button
+                  icon="pi pi-trash"
+                  label="Forget"
+                  text
+                  severity="secondary"
+                  @click="emit('forget-restorable-circle', entry.relay)"
+                />
+              </div>
+            </div>
+          </div>
+          <p v-else class="empty-state">
+            No archived circles yet. When you remove a circle from the shell, it will appear here for later restore.
+          </p>
         </section>
       </template>
 
@@ -662,6 +803,144 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
         </section>
 
         <section class="section-card">
+          <div class="info-row">
+            <strong>Account Session</strong>
+            <p v-if="authSession">
+              {{ authSession.loginMethod }} · {{ authSession.circleSelectionMode }}
+            </p>
+            <p v-else>No authenticated account bootstrapped in the local shell.</p>
+          </div>
+          <div v-if="authSession" class="info-row">
+            <strong>Access Summary</strong>
+            <p>{{ authSession.access.kind }} · {{ authSession.access.label }}</p>
+          </div>
+          <div v-if="authRuntime?.pubkey || authSession?.access.pubkey" class="info-row">
+            <strong>Verified Pubkey</strong>
+            <p>{{ authRuntime?.pubkey ?? authSession?.access.pubkey }}</p>
+          </div>
+          <div v-if="authSession" class="info-row">
+            <strong>Authenticated At</strong>
+            <p>{{ authSession.loggedInAt }}</p>
+          </div>
+          <div class="info-row">
+            <strong>Auth Runtime</strong>
+            <p v-if="authRuntime">
+              {{ authRuntime.state }} · {{ authRuntime.accessKind }} · {{ authRuntime.label }}
+            </p>
+            <p v-else>No auth runtime state persisted yet.</p>
+          </div>
+          <div v-if="authRuntime" class="info-row">
+            <strong>Auth Runtime Updated</strong>
+            <p>{{ authRuntime.updatedAt }}</p>
+          </div>
+          <div v-if="authRuntime" class="info-row">
+            <strong>Auth Runtime Source</strong>
+            <p>{{ authRuntime.persistedInNativeStore ? "native store" : "local fallback" }}</p>
+          </div>
+          <div
+            v-if="
+              authRuntime &&
+              (authRuntime.accessKind === 'nsec' || authRuntime.accessKind === 'hexKey')
+            "
+            class="info-row"
+          >
+            <strong>Local Credential</strong>
+            <p>
+              {{
+                authRuntime.credentialPersistedInNativeStore
+                  ? 'native credential store'
+                  : 'missing from native credential store'
+              }}
+            </p>
+          </div>
+          <div v-if="authRuntime" class="info-row">
+            <strong>Send Status</strong>
+            <p>{{ authRuntime.canSendMessages ? "ready" : "blocked" }}</p>
+          </div>
+          <div v-if="authRuntime?.sendBlockedReason" class="info-row">
+            <strong>Send Gate Reason</strong>
+            <p>{{ authRuntime.sendBlockedReason }}</p>
+          </div>
+          <div v-if="authRuntime?.error" class="info-row">
+            <strong>Auth Runtime Error</strong>
+            <p>{{ authRuntime.error }}</p>
+          </div>
+          <div v-if="authRuntimeBinding" class="info-row">
+            <strong>Auth Runtime Binding</strong>
+            <p>
+              {{ authRuntimeBinding.accessKind }} · {{ authRuntimeBinding.endpoint }} ·
+              {{ authRuntimeBinding.persistedInNativeStore ? "native store" : "local fallback" }}
+            </p>
+          </div>
+          <div v-if="authRuntimeBinding?.connectionPubkey" class="info-row">
+            <strong>Binding Pubkey</strong>
+            <p>{{ authRuntimeBinding.connectionPubkey }}</p>
+          </div>
+          <div v-if="authRuntimeBinding" class="info-row">
+            <strong>Binding Relays</strong>
+            <p>{{ authRuntimeBinding.relayCount }}</p>
+          </div>
+          <div v-if="authRuntimeBinding" class="info-row">
+            <strong>Binding Secret</strong>
+            <p>{{ authRuntimeBinding.hasSecret ? "present in URI" : "not embedded" }}</p>
+          </div>
+          <div v-if="authRuntimeBinding?.requestedPermissions?.length" class="info-row">
+            <strong>Requested Permissions</strong>
+            <p>{{ authRuntimeBinding.requestedPermissions.join(", ") }}</p>
+          </div>
+          <div v-if="authRuntimeBinding?.clientName" class="info-row">
+            <strong>Binding Client Name</strong>
+            <p>{{ authRuntimeBinding.clientName }}</p>
+          </div>
+          <div v-if="authRuntimeBinding" class="info-row">
+            <strong>Binding Updated</strong>
+            <p>{{ authRuntimeBinding.updatedAt }}</p>
+          </div>
+          <div v-if="authSession" class="info-row auth-runtime-controls">
+            <strong>Auth Runtime Controls</strong>
+            <div class="auth-runtime-panel">
+              <p v-if="!canUpdateAuthRuntime" class="runtime-note">
+                Quick Start stays on `localProfile` and does not require a remote signer handshake.
+              </p>
+              <template v-else>
+                <p class="runtime-note">
+                  Re-run native auth runtime sync and signer checks without waiting for the next automatic poll.
+                </p>
+                <InputText
+                  v-model="authRuntimeErrorDraft"
+                  placeholder="Optional pending/failure detail"
+                />
+                <div class="auth-runtime-actions">
+                  <Button
+                    v-if="canSyncAuthRuntime"
+                    :label="authRuntimeSyncLabel"
+                    icon="pi pi-refresh"
+                    text
+                    severity="info"
+                    @click="emit('sync-auth-runtime')"
+                  />
+                  <Button
+                    label="Mark Pending"
+                    text
+                    severity="secondary"
+                    @click="emitAuthRuntimeUpdate('pending')"
+                  />
+                  <Button
+                    label="Mark Connected"
+                    text
+                    severity="success"
+                    @click="emitAuthRuntimeUpdate('connected')"
+                  />
+                  <Button
+                    label="Mark Failed"
+                    text
+                    severity="danger"
+                    @click="emitAuthRuntimeUpdate('failed')"
+                  />
+                </div>
+              </template>
+            </div>
+          </div>
           <div class="info-row">
             <strong>Current Circle</strong>
             <p>{{ activeCircle?.name ?? "No active circle" }}</p>
@@ -830,7 +1109,8 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
 .footer-actions,
 .hero-tags,
 .tag-row,
-.list-tags {
+.list-tags,
+.restore-actions {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -927,6 +1207,30 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
 .copy-feedback {
   color: #2f8c6a;
   font-size: 0.9rem;
+}
+
+.auth-runtime-controls {
+  align-items: start;
+}
+
+.auth-runtime-panel {
+  display: grid;
+  gap: 10px;
+  width: min(100%, 420px);
+}
+
+.auth-runtime-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.runtime-note {
+  margin: 0;
+}
+
+.restore-row {
+  align-items: center;
 }
 
 @media (max-width: 720px) {

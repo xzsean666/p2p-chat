@@ -2,7 +2,7 @@ use crate::domain::chat::{
     ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage,
     CircleItem, CircleStatus, CircleType, ContactItem, GroupMember, GroupProfile, GroupRole,
     LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, MessageAuthor, MessageDeliveryStatus,
-    MessageItem, MessageKind, MessageSyncSource, SessionItem, SessionKind,
+    MessageItem, MessageKind, MessageSyncSource, SessionItem, SessionKind, SignedNostrEvent,
 };
 use crate::domain::chat_repository::{
     merge_message_records, ChatDomainChangeSet, ChatRepository, ChatUpsert,
@@ -112,7 +112,9 @@ impl<R: Runtime> SqliteChatRepository<R> {
               delivery_status TEXT,
               remote_id TEXT,
               sync_source TEXT,
-              acked_at TEXT
+              acked_at TEXT,
+              signed_nostr_event TEXT,
+              reply_to TEXT
             );
 
             CREATE TABLE IF NOT EXISTS chat_meta (
@@ -126,7 +128,9 @@ impl<R: Runtime> SqliteChatRepository<R> {
         ensure_message_delivery_status_column(conn)?;
         ensure_message_remote_id_column(conn)?;
         ensure_message_sync_source_column(conn)?;
-        ensure_message_acked_at_column(conn)
+        ensure_message_acked_at_column(conn)?;
+        ensure_message_signed_nostr_event_column(conn)?;
+        ensure_message_reply_to_column(conn)
     }
 
     fn ensure_seed_data(&self, conn: &mut rusqlite::Connection) -> Result<(), String> {
@@ -451,7 +455,7 @@ impl<R: Runtime> SqliteChatRepository<R> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT session_id, id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at FROM messages ORDER BY rowid ASC",
+                    "SELECT session_id, id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at, signed_nostr_event, reply_to FROM messages ORDER BY rowid ASC",
                 )
                 .map_err(|error| error.to_string())?;
 
@@ -497,7 +501,7 @@ fn load_session_messages_page_with_connection(
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, author, body, time, meta, delivery_status
-                        , remote_id, sync_source, acked_at
+                        , remote_id, sync_source, acked_at, signed_nostr_event, reply_to
                  FROM messages
                  WHERE session_id = ?1 AND rowid < ?2
                  ORDER BY rowid DESC
@@ -516,7 +520,7 @@ fn load_session_messages_page_with_connection(
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, author, body, time, meta, delivery_status
-                        , remote_id, sync_source, acked_at
+                        , remote_id, sync_source, acked_at, signed_nostr_event, reply_to
                  FROM messages
                  WHERE session_id = ?1
                  ORDER BY rowid DESC
@@ -567,7 +571,7 @@ fn load_session_message_updates_with_connection(
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, author, body, time, meta, delivery_status
-                        , remote_id, sync_source, acked_at
+                        , remote_id, sync_source, acked_at, signed_nostr_event, reply_to
                  FROM messages
                  WHERE session_id = ?1 AND rowid > ?2
                  ORDER BY rowid ASC
@@ -586,7 +590,7 @@ fn load_session_message_updates_with_connection(
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, author, body, time, meta, delivery_status
-                        , remote_id, sync_source, acked_at
+                        , remote_id, sync_source, acked_at, signed_nostr_event, reply_to
                  FROM messages
                  WHERE session_id = ?1
                  ORDER BY rowid DESC
@@ -1013,8 +1017,18 @@ fn insert_message(
     session_id: &str,
     message: &MessageItem,
 ) -> Result<(), String> {
+    let signed_nostr_event = message
+        .signed_nostr_event
+        .as_ref()
+        .map(encode_signed_nostr_event_json)
+        .transpose()?;
+    let reply_to = message
+        .reply_to
+        .as_ref()
+        .map(encode_message_reply_preview_json)
+        .transpose()?;
     tx.execute(
-        "INSERT INTO messages (id, session_id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO messages (id, session_id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at, signed_nostr_event, reply_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             &message.id,
             session_id,
@@ -1029,7 +1043,9 @@ fn insert_message(
                 .map(message_delivery_status_to_str),
             &message.remote_id,
             message.sync_source.as_ref().map(message_sync_source_to_str),
-            &message.acked_at
+            &message.acked_at,
+            signed_nostr_event,
+            reply_to
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1092,6 +1108,14 @@ fn message_item_from_row(
             .map(|value| message_sync_source_from_str(&value).map_err(sqlite_user_error))
             .transpose()?,
         acked_at: row.get(offset + 9)?,
+        signed_nostr_event: row
+            .get::<_, Option<String>>(offset + 10)?
+            .map(|value| decode_signed_nostr_event_json(&value).map_err(sqlite_user_error))
+            .transpose()?,
+        reply_to: row
+            .get::<_, Option<String>>(offset + 11)?
+            .map(|value| decode_message_reply_preview_json(&value).map_err(sqlite_user_error))
+            .transpose()?,
     })
 }
 
@@ -1101,7 +1125,7 @@ fn load_existing_message(
 ) -> Result<Option<MessageItem>, String> {
     let existing_message = if let Some(remote_id) = message.remote_id.as_deref() {
         conn.query_row(
-            "SELECT id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at
+            "SELECT id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at, signed_nostr_event, reply_to
              FROM messages
              WHERE id = ?1 OR remote_id = ?2
              ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END
@@ -1113,7 +1137,7 @@ fn load_existing_message(
         .map_err(|error| error.to_string())?
     } else {
         conn.query_row(
-            "SELECT id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at
+            "SELECT id, kind, author, body, time, meta, delivery_status, remote_id, sync_source, acked_at, signed_nostr_event, reply_to
              FROM messages
              WHERE id = ?1
              LIMIT 1",
@@ -1132,6 +1156,16 @@ fn update_existing_message(
     session_id: &str,
     message: &MessageItem,
 ) -> Result<(), String> {
+    let signed_nostr_event = message
+        .signed_nostr_event
+        .as_ref()
+        .map(encode_signed_nostr_event_json)
+        .transpose()?;
+    let reply_to = message
+        .reply_to
+        .as_ref()
+        .map(encode_message_reply_preview_json)
+        .transpose()?;
     tx.execute(
         "UPDATE messages
          SET session_id = ?2,
@@ -1143,7 +1177,9 @@ fn update_existing_message(
              delivery_status = ?8,
              remote_id = ?9,
              sync_source = ?10,
-             acked_at = ?11
+             acked_at = ?11,
+             signed_nostr_event = ?12,
+             reply_to = ?13
          WHERE id = ?1",
         params![
             &message.id,
@@ -1159,7 +1195,9 @@ fn update_existing_message(
                 .map(message_delivery_status_to_str),
             &message.remote_id,
             message.sync_source.as_ref().map(message_sync_source_to_str),
-            &message.acked_at
+            &message.acked_at,
+            signed_nostr_event,
+            reply_to
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1169,6 +1207,26 @@ fn update_existing_message(
 
 fn optional_bool_to_i64(value: Option<bool>) -> Option<i64> {
     value.map(|flag| if flag { 1 } else { 0 })
+}
+
+fn encode_signed_nostr_event_json(value: &SignedNostrEvent) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
+}
+
+fn decode_signed_nostr_event_json(value: &str) -> Result<SignedNostrEvent, String> {
+    serde_json::from_str(value).map_err(|error| error.to_string())
+}
+
+fn encode_message_reply_preview_json(
+    value: &crate::domain::chat::MessageReplyPreview,
+) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
+}
+
+fn decode_message_reply_preview_json(
+    value: &str,
+) -> Result<crate::domain::chat::MessageReplyPreview, String> {
+    serde_json::from_str(value).map_err(|error| error.to_string())
 }
 
 fn optional_i64_to_bool(value: Option<i64>) -> Option<bool> {
@@ -1261,6 +1319,8 @@ fn group_role_from_str(value: &str) -> Result<GroupRole, String> {
 fn message_kind_to_str(value: &MessageKind) -> &'static str {
     match value {
         MessageKind::Text => "text",
+        MessageKind::Image => "image",
+        MessageKind::Video => "video",
         MessageKind::File => "file",
         MessageKind::Audio => "audio",
         MessageKind::System => "system",
@@ -1270,6 +1330,8 @@ fn message_kind_to_str(value: &MessageKind) -> &'static str {
 fn message_kind_from_str(value: &str) -> Result<MessageKind, String> {
     match value {
         "text" => Ok(MessageKind::Text),
+        "image" => Ok(MessageKind::Image),
+        "video" => Ok(MessageKind::Video),
         "file" => Ok(MessageKind::File),
         "audio" => Ok(MessageKind::Audio),
         "system" => Ok(MessageKind::System),
@@ -1354,6 +1416,25 @@ fn ensure_message_sync_source_column(conn: &rusqlite::Connection) -> Result<(), 
 
 fn ensure_message_acked_at_column(conn: &rusqlite::Connection) -> Result<(), String> {
     match conn.execute("ALTER TABLE messages ADD COLUMN acked_at TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_message_signed_nostr_event_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute(
+        "ALTER TABLE messages ADD COLUMN signed_nostr_event TEXT",
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_message_reply_to_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT", []) {
         Ok(_) => Ok(()),
         Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
         Err(error) => Err(error.to_string()),

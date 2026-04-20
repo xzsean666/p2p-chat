@@ -40,6 +40,10 @@ const filteredContacts = computed(() => {
     .sort((left, right) => left.name.localeCompare(right.name));
 });
 
+function contactMetaLine(contact: ContactItem) {
+  return contact.subtitle ? `${contact.handle} · ${contact.subtitle}` : contact.handle;
+}
+
 function toggleContact(contactId: string) {
   if (selectedContactSet.value.has(contactId)) {
     selectedContactIds.value = selectedContactIds.value.filter((id) => id !== contactId);
@@ -85,7 +89,7 @@ function submit() {
                 <strong>{{ contact.name }}</strong>
                 <span v-if="contact.online" class="online-dot"></span>
               </div>
-              <p>{{ contact.handle }} · {{ contact.subtitle }}</p>
+              <p>{{ contactMetaLine(contact) }}</p>
             </div>
           </button>
 

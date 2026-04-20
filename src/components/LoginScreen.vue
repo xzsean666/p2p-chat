@@ -12,11 +12,13 @@ import type {
   LoginCircleSelectionMode,
   LoginCompletionInput,
   LoginMethod,
+  RestorableCircleEntry,
   UserProfile,
 } from "../types/chat";
 
 const props = defineProps<{
   circles: CircleItem[];
+  restorableCircles: RestorableCircleEntry[];
   profile: UserProfile;
 }>();
 
@@ -57,6 +59,7 @@ const handle = ref(props.profile.handle);
 const profileStatus = ref(props.profile.status);
 const circleMode = ref<LoginCircleSelectionMode>(props.circles.length ? "existing" : "custom");
 const selectedCircleId = ref(props.circles[0]?.id ?? "");
+const selectedRestoreRelay = ref(props.restorableCircles[0]?.relay ?? "");
 const inviteCode = ref("");
 const inviteName = ref("");
 const customCircleName = ref("My Circle");
@@ -65,6 +68,14 @@ let timer: number | undefined;
 
 const selectedCircle = computed(() => {
   return props.circles.find((circle) => circle.id === selectedCircleId.value) ?? null;
+});
+
+const selectedRestorableCircle = computed(() => {
+  return props.restorableCircles.find((circle) => circle.relay === selectedRestoreRelay.value) ?? null;
+});
+
+const hasRestorableCircles = computed(() => {
+  return props.restorableCircles.length > 0;
 });
 
 const normalizedHandle = computed(() => {
@@ -86,7 +97,7 @@ const credentialValid = computed(() => {
 });
 
 const canRestoreCirclesAfterLogin = computed(() => {
-  return selectedMethod.value !== "quickStart" && !props.circles.length;
+  return selectedMethod.value !== "quickStart" && hasRestorableCircles.value;
 });
 
 const profileValid = computed(() => {
@@ -95,7 +106,7 @@ const profileValid = computed(() => {
 
 const circleValid = computed(() => {
   if (circleMode.value === "restore") {
-    return canRestoreCirclesAfterLogin.value;
+    return canRestoreCirclesAfterLogin.value && !!selectedRestorableCircle.value;
   }
 
   if (circleMode.value === "existing") {
@@ -167,9 +178,18 @@ const selectedCircleSummary = computed(() => {
   }
 
   if (circleMode.value === "restore") {
+    if (!selectedRestorableCircle.value) {
+      return {
+        title: "Restore Saved Circles",
+        detail: hasRestorableCircles.value
+          ? "Select an archived circle from the local restore catalog."
+          : "No archived circles are available in the local restore catalog yet.",
+      };
+    }
+
     return {
-      title: "Restore Saved Circles",
-      detail: "Finish account entry first, then reload the local circle catalog after login.",
+      title: selectedRestorableCircle.value.name,
+      detail: `${selectedRestorableCircle.value.relay} · ${selectedRestorableCircle.value.type}`,
     };
   }
 
@@ -180,19 +200,19 @@ const selectedCircleSummary = computed(() => {
 });
 
 watch(
-  [selectedMethod, () => props.circles.length],
-  ([method, circleCount]) => {
-    if (!circleCount && method !== "quickStart" && circleMode.value === "existing") {
+  [selectedMethod, () => props.circles.length, () => props.restorableCircles.length],
+  ([method, circleCount, restorableCount]) => {
+    if (!circleCount && method !== "quickStart" && restorableCount > 0 && circleMode.value === "existing") {
       circleMode.value = "restore";
       return;
     }
 
-    if (method === "quickStart" && circleMode.value === "restore") {
-      circleMode.value = "custom";
+    if (circleMode.value === "restore" && (method === "quickStart" || restorableCount === 0)) {
+      circleMode.value = circleCount ? "existing" : "custom";
       return;
     }
 
-    if (circleCount && circleMode.value === "restore") {
+    if (circleCount && circleMode.value === "restore" && restorableCount === 0) {
       circleMode.value = "existing";
     }
   },
@@ -205,13 +225,34 @@ watch(
     if (!circles.length) {
       selectedCircleId.value = "";
       if (circleMode.value === "existing") {
-        circleMode.value = selectedMethod.value === "quickStart" ? "custom" : "restore";
+        circleMode.value =
+          selectedMethod.value !== "quickStart" && props.restorableCircles.length
+            ? "restore"
+            : "custom";
       }
       return;
     }
 
     if (!circles.some((circle) => circle.id === selectedCircleId.value)) {
       selectedCircleId.value = circles[0]?.id ?? "";
+    }
+  },
+  { deep: true, immediate: true },
+);
+
+watch(
+  () => props.restorableCircles,
+  (restorableCircles) => {
+    if (!restorableCircles.length) {
+      selectedRestoreRelay.value = "";
+      if (circleMode.value === "restore") {
+        circleMode.value = props.circles.length ? "existing" : "custom";
+      }
+      return;
+    }
+
+    if (!restorableCircles.some((circle) => circle.relay === selectedRestoreRelay.value)) {
+      selectedRestoreRelay.value = restorableCircles[0]?.relay ?? "";
     }
   },
   { deep: true, immediate: true },
@@ -283,7 +324,7 @@ function selectMethod(method: LoginMethod) {
     return;
   }
 
-  if (!props.circles.length) {
+  if (!props.circles.length && props.restorableCircles.length) {
     circleMode.value = "restore";
   }
 }
@@ -335,6 +376,27 @@ function buildInviteCircleName() {
 
   const suffix = inviteCode.value.trim().slice(0, 6).toUpperCase();
   return suffix ? `Invite ${suffix}` : "Invite Circle";
+}
+
+function restoreTypeTone(type: RestorableCircleEntry["type"]) {
+  if (type === "paid") {
+    return "warn";
+  }
+
+  if (type === "custom") {
+    return "contrast";
+  }
+
+  return "secondary";
+}
+
+function archivedAtCopy(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString();
 }
 
 function deriveExistingAccountAccessKind(value: string): LoginAccessInput["kind"] {
@@ -407,6 +469,7 @@ function submit() {
         : circleMode.value === "restore"
           ? {
               mode: "restore",
+              relay: selectedRestorableCircle.value?.relay,
             }
           : {
               mode: "custom",
@@ -427,20 +490,20 @@ function submit() {
         <h1>{{ slides[currentSlide].title }}</h1>
         <p class="hero-copy">{{ slides[currentSlide].text }}</p>
 
-        <div class="hero-metrics">
-          <div class="metric-chip">
-            <strong>{{ props.circles.length }}</strong>
-            <span>saved circles</span>
+          <div class="hero-metrics">
+            <div class="metric-chip">
+              <strong>{{ props.circles.length }}</strong>
+              <span>saved circles</span>
+            </div>
+            <div class="metric-chip">
+              <strong>{{ props.restorableCircles.length }}</strong>
+              <span>restore entries</span>
+            </div>
+            <div class="metric-chip">
+              <strong>4</strong>
+              <span>entry steps</span>
+            </div>
           </div>
-          <div class="metric-chip">
-            <strong>4</strong>
-            <span>entry steps</span>
-          </div>
-          <div class="metric-chip">
-            <strong>SQLite</strong>
-            <span>local shell store</span>
-          </div>
-        </div>
 
         <div class="slide-markers">
           <button
@@ -607,9 +670,10 @@ function submit() {
                   v-if="selectedMethod !== 'quickStart'"
                   type="button"
                   :class="['mode-chip', { active: circleMode === 'restore' }]"
+                  :disabled="!canRestoreCirclesAfterLogin"
                   @click="circleMode = 'restore'"
                 >
-                  Restore Later
+                  Restore Catalog
                 </button>
                 <button
                   type="button"
@@ -657,8 +721,37 @@ function submit() {
               </div>
 
               <div v-else-if="circleMode === 'restore'" class="field-grid">
-                <Message severity="info" :closable="false">
-                  The desktop shell will finish account entry first, then restore saved circles from the local store after login. If nothing is available, you can still add a circle from inside the app.
+                <Message
+                  v-if="selectedMethod === 'quickStart'"
+                  severity="secondary"
+                  :closable="false"
+                >
+                  Restore catalog is only available for existing-account and signer entry paths.
+                </Message>
+                <template v-else-if="props.restorableCircles.length">
+                  <Message severity="info" :closable="false">
+                    Pick one archived circle from the local restore catalog. The desktop shell will restore it immediately after authentication completes.
+                  </Message>
+                  <div class="selection-grid">
+                    <button
+                      v-for="circle in props.restorableCircles"
+                      :key="circle.relay"
+                      type="button"
+                      :class="['selection-card', { active: selectedRestoreRelay === circle.relay }]"
+                      @click="selectedRestoreRelay = circle.relay"
+                    >
+                      <div class="card-head">
+                        <strong>{{ circle.name }}</strong>
+                        <Tag :value="circle.type" :severity="restoreTypeTone(circle.type)" rounded />
+                      </div>
+                      <p>{{ circle.description || 'No archived description available.' }}</p>
+                      <span class="card-meta">{{ circle.relay }}</span>
+                      <span class="card-meta">Archived {{ archivedAtCopy(circle.archivedAt) }}</span>
+                    </button>
+                  </div>
+                </template>
+                <Message v-else severity="secondary" :closable="false">
+                  No archived circles are available yet. Use invite code or custom relay instead.
                 </Message>
               </div>
 

@@ -5,6 +5,7 @@ import Button from "primevue/button";
 import InputText from "primevue/inputtext";
 import Tag from "primevue/tag";
 import OverlayPageShell from "./OverlayPageShell.vue";
+import { classifyChatQuery, isCircleQuery } from "../services/chatQueryIntents";
 import type { CircleItem, ContactItem } from "../types/chat";
 
 const props = defineProps<{
@@ -100,28 +101,23 @@ const groupedContacts = computed(() => {
 });
 
 const queryType = computed(() => {
-  const value = keyword.value.trim();
-  if (!value) {
+  const kind = classifyChatQuery(keyword.value);
+  if (!kind) {
     return null;
   }
 
-  if (/^wss?:\/\//i.test(value) || /^mesh:\/\//i.test(value)) {
-    return "Relay";
+  switch (kind) {
+    case "relay":
+      return "Relay";
+    case "invite":
+      return "Invite";
+    case "handle":
+      return "Handle";
+    case "pubkey":
+      return "Pubkey";
+    default:
+      return props.mode === "join-circle" ? "Join Link" : "Lookup";
   }
-
-  if (value.includes("://")) {
-    return "Invite";
-  }
-
-  if (value.startsWith("@")) {
-    return "Handle";
-  }
-
-  if (value.startsWith("npub") || /^[a-f0-9]{32,}$/i.test(value)) {
-    return "Pubkey";
-  }
-
-  return props.mode === "join-circle" ? "Join Link" : "Lookup";
 });
 
 const showLookupCard = computed(() => {
@@ -137,18 +133,43 @@ const showLookupCard = computed(() => {
   return !exactLocalMatch.value;
 });
 
-function submitLookup() {
+const circleInputDetected = computed(() => {
+  if (props.mode === "join-circle") {
+    return true;
+  }
+
+  return isCircleQuery(keyword.value);
+});
+
+function contactMetaLine(contact: ContactItem) {
+  return contact.subtitle ? `${contact.handle} · ${contact.subtitle}` : contact.handle;
+}
+
+function submitJoinCircle() {
   const value = keyword.value.trim();
   if (!value) {
     return;
   }
 
-  if (props.mode === "join-circle") {
-    emit("join-circle", value);
+  emit("join-circle", value);
+}
+
+function submitContactLookup() {
+  const value = keyword.value.trim();
+  if (!value) {
     return;
   }
 
   emit("lookup-contact", value);
+}
+
+function submitLookup() {
+  if (props.mode === "join-circle" || circleInputDetected.value) {
+    submitJoinCircle();
+    return;
+  }
+
+  submitContactLookup();
 }
 
 async function pasteFromClipboard() {
@@ -186,7 +207,7 @@ async function pasteFromClipboard() {
             rounded
             text
             severity="secondary"
-            :aria-label="mode === 'join-circle' ? 'Connect circle' : 'Run lookup'"
+            :aria-label="mode === 'join-circle' || circleInputDetected ? 'Connect circle' : 'Run lookup'"
             @click="submitLookup"
           />
         </div>
@@ -199,7 +220,7 @@ async function pasteFromClipboard() {
             severity="secondary"
             @click="pasteFromClipboard"
           />
-          <Tag :value="mode === 'join-circle' ? 'Join Circle' : 'Lookup'" severity="contrast" rounded />
+          <Tag :value="mode === 'join-circle' || circleInputDetected ? 'Circle Import' : 'Lookup'" severity="contrast" rounded />
         </div>
         <p v-if="pasteFeedback === 'pasted'" class="feedback success">Clipboard value pasted into the field.</p>
         <p v-else-if="pasteFeedback === 'failed'" class="feedback">Clipboard is unavailable or empty in this environment.</p>
@@ -214,19 +235,29 @@ async function pasteFromClipboard() {
           <p>{{ keyword.trim() }}</p>
           <span>
             {{
-              mode === "join-circle"
-                ? "This will create or resolve a local circle entry from the invite or relay string."
+              mode === "join-circle" || circleInputDetected
+                ? "This looks like a circle invite or relay address. The desktop flow will resolve it as a circle import by default."
                 : "This will create a local contact shell when no matching person already exists."
             }}
           </span>
         </div>
 
-        <Button
-          :icon="mode === 'join-circle' ? 'pi pi-compass' : 'pi pi-send'"
-          :label="mode === 'join-circle' ? 'Connect to Circle' : 'Start from Lookup'"
-          severity="contrast"
-          @click="submitLookup"
-        />
+        <div class="lookup-actions">
+          <Button
+            :icon="mode === 'join-circle' || circleInputDetected ? 'pi pi-compass' : 'pi pi-send'"
+            :label="mode === 'join-circle' || circleInputDetected ? 'Join Circle' : 'Start from Lookup'"
+            severity="contrast"
+            @click="submitLookup"
+          />
+          <Button
+            v-if="mode === 'chat' && circleInputDetected"
+            icon="pi pi-user-plus"
+            label="Treat as Person Lookup"
+            text
+            severity="secondary"
+            @click="submitContactLookup"
+          />
+        </div>
       </section>
 
       <section v-if="mode === 'chat' && groupedContacts.length" class="grouped-list">
@@ -242,7 +273,7 @@ async function pasteFromClipboard() {
                     <strong>{{ contact.name }}</strong>
                     <span v-if="contact.online" class="online-dot"></span>
                   </div>
-                  <p>{{ contact.handle }} · {{ contact.subtitle }}</p>
+                  <p>{{ contactMetaLine(contact) }}</p>
                 </div>
               </button>
 
@@ -336,7 +367,8 @@ async function pasteFromClipboard() {
 .contact-head,
 .contact-actions,
 .lookup-head,
-.tool-row {
+.tool-row,
+.lookup-actions {
   display: flex;
   align-items: center;
 }
@@ -365,6 +397,11 @@ async function pasteFromClipboard() {
   justify-content: space-between;
   gap: 10px;
   margin-top: 10px;
+}
+
+.lookup-actions {
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .feedback,

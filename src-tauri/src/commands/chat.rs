@@ -1,12 +1,16 @@
 use crate::app::{chat_mutations, chat_queries};
 use crate::domain::chat::{
-    AddCircleInput, AddCircleResult, ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates,
-    ChatSessionMessagesPage, ChatShellSnapshot, CreateGroupConversationInput,
-    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, MergeRemoteDeliveryReceiptsInput,
-    MergeRemoteMessagesInput, RetryMessageDeliveryInput, SendMessageInput, SessionActionInput,
+    AddCircleInput, AddCircleResult, CacheChatMessageMediaInput, CachedChatMessageMediaResult,
+    ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage,
+    ChatShellSnapshot, CleanupChatMediaAssetsResult,
+    CreateGroupConversationInput, LoadSessionMessageUpdatesInput, LoadSessionMessagesInput,
+    LoginCompletionInput, MergeRemoteDeliveryReceiptsInput, MergeRemoteMessagesInput,
+    RestoreCircleInput, RetryMessageDeliveryInput, SendFileMessageInput, SendImageMessageInput,
+    SendMessageInput, SendVideoMessageInput, SessionActionInput, ShellStateSnapshot,
     StartConversationInput, StartConversationResult, StartLookupConversationInput,
-    StartSelfConversationInput, UpdateCircleInput, UpdateGroupMembersInput, UpdateGroupNameInput,
-    UpdateMessageDeliveryStatusInput, UpdateSessionDraftInput,
+    StartSelfConversationInput, StoreChatMediaAssetInput, StoredChatMediaAsset,
+    UpdateAuthRuntimeInput, UpdateCircleInput, UpdateContactRemarkInput, UpdateGroupMembersInput,
+    UpdateGroupNameInput, UpdateMessageDeliveryStatusInput, UpdateSessionDraftInput,
 };
 
 #[tauri::command]
@@ -15,11 +19,45 @@ pub fn load_chat_shell_snapshot(app_handle: tauri::AppHandle) -> Result<ChatShel
 }
 
 #[tauri::command]
+pub fn sync_auth_runtime(app_handle: tauri::AppHandle) -> Result<ShellStateSnapshot, String> {
+    chat_queries::sync_auth_runtime(&app_handle)
+}
+
+#[tauri::command]
 pub fn save_chat_shell_snapshot(
     app_handle: tauri::AppHandle,
     snapshot: ChatShellSnapshot,
 ) -> Result<(), String> {
     chat_queries::save_chat_shell_snapshot(&app_handle, snapshot)
+}
+
+#[tauri::command]
+pub fn bootstrap_auth_session(
+    app_handle: tauri::AppHandle,
+    input: LoginCompletionInput,
+) -> Result<ShellStateSnapshot, String> {
+    chat_queries::bootstrap_auth_session(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn complete_login(
+    app_handle: tauri::AppHandle,
+    input: LoginCompletionInput,
+) -> Result<ChatShellSnapshot, String> {
+    chat_queries::complete_login(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn logout_chat_session(app_handle: tauri::AppHandle) -> Result<ChatShellSnapshot, String> {
+    chat_queries::logout_chat_session(&app_handle)
+}
+
+#[tauri::command]
+pub fn update_auth_runtime(
+    app_handle: tauri::AppHandle,
+    input: UpdateAuthRuntimeInput,
+) -> Result<ShellStateSnapshot, String> {
+    chat_queries::update_auth_runtime(&app_handle, input)
 }
 
 #[tauri::command]
@@ -58,6 +96,53 @@ pub fn send_chat_message(
     input: SendMessageInput,
 ) -> Result<ChatDomainSeed, String> {
     chat_mutations::send_message(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn send_chat_file_message(
+    app_handle: tauri::AppHandle,
+    input: SendFileMessageInput,
+) -> Result<ChatDomainSeed, String> {
+    chat_mutations::send_file_message(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn send_chat_image_message(
+    app_handle: tauri::AppHandle,
+    input: SendImageMessageInput,
+) -> Result<ChatDomainSeed, String> {
+    chat_mutations::send_image_message(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn send_chat_video_message(
+    app_handle: tauri::AppHandle,
+    input: SendVideoMessageInput,
+) -> Result<ChatDomainSeed, String> {
+    chat_mutations::send_video_message(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn store_chat_media_asset(
+    app_handle: tauri::AppHandle,
+    input: StoreChatMediaAssetInput,
+) -> Result<StoredChatMediaAsset, String> {
+    chat_mutations::store_chat_media_asset(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn cleanup_chat_media_assets(
+    app_handle: tauri::AppHandle,
+) -> Result<CleanupChatMediaAssetsResult, String> {
+    chat_mutations::cleanup_chat_media_assets(&app_handle)
+}
+
+#[tauri::command]
+pub fn cache_chat_message_media(
+    app_handle: tauri::AppHandle,
+    input: CacheChatMessageMediaInput,
+) -> Result<CachedChatMessageMediaResult, String> {
+    chat_mutations::cache_chat_message_media(&app_handle, input)
 }
 
 #[tauri::command]
@@ -149,6 +234,14 @@ pub fn toggle_chat_contact_block(
 }
 
 #[tauri::command]
+pub fn update_chat_contact_remark(
+    app_handle: tauri::AppHandle,
+    input: UpdateContactRemarkInput,
+) -> Result<ChatDomainSeed, String> {
+    chat_mutations::update_contact_remark(&app_handle, input)
+}
+
+#[tauri::command]
 pub fn update_chat_group_name(
     app_handle: tauri::AppHandle,
     input: UpdateGroupNameInput,
@@ -170,6 +263,14 @@ pub fn add_chat_circle(
     input: AddCircleInput,
 ) -> Result<AddCircleResult, String> {
     chat_mutations::add_circle(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn restore_chat_circle(
+    app_handle: tauri::AppHandle,
+    input: RestoreCircleInput,
+) -> Result<AddCircleResult, String> {
+    chat_mutations::restore_circle(&app_handle, input)
 }
 
 #[tauri::command]

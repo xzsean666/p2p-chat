@@ -1,6 +1,7 @@
+use crate::app::shell_auth;
 use crate::domain::chat::{
-    ChatDomainSeed, CircleStatus, CircleType, MessageAuthor, MessageDeliveryStatus,
-    RemoteDeliveryReceipt,
+    ChatDomainSeed, CircleStatus, CircleType, MergeRemoteMessagesInput, MessageAuthor,
+    MessageDeliveryStatus, MessageItem, MessageSyncSource, RemoteDeliveryReceipt, SessionKind,
 };
 use crate::domain::chat_repository::{
     apply_change_set_to_seed, build_remote_delivery_receipt_change_set,
@@ -10,14 +11,16 @@ use crate::domain::transport::{
     CircleTransportDiagnostic, RelayProtocol, TransportActivityItem, TransportActivityKind,
     TransportActivityLevel, TransportCapabilities, TransportChatEffects, TransportCircleAction,
     TransportCircleActionInput, TransportEngineKind, TransportHealth, TransportMutationResult,
-    TransportRuntimeLaunchResult, TransportRuntimeSession, TransportService, TransportSnapshot,
-    TransportSnapshotInput,
+    TransportRelaySyncFilter, TransportRuntimeLaunchResult, TransportRuntimeOutboundMessage,
+    TransportRuntimeSession, TransportService, TransportSnapshot, TransportSnapshotInput,
 };
 use crate::domain::transport_adapter::TransportRuntimeOptions;
 use crate::domain::transport_engine::{
     overall_transport_health, TransportEngine, TransportEngineState,
 };
-use crate::domain::transport_repository::{TransportCache, TransportRepository};
+use crate::domain::transport_repository::{
+    TransportCache, TransportRelaySyncCursor, TransportRepository,
+};
 use crate::domain::transport_runtime_registry::{
     project_runtime_session, runtime_registry_entry_from_session,
 };
@@ -29,12 +32,15 @@ use crate::infra::sqlite_transport_repository::SqliteTransportRepository;
 use crate::infra::transport_engine_factory::select_transport_engine;
 use crate::infra::transport_runtime_factory::select_transport_runtime;
 use crate::infra::transport_runtime_manager_factory::select_transport_runtime_manager;
-use std::collections::HashSet;
+use nostr_connect::prelude::PublicKey as NostrPublicKey;
+use std::collections::{HashMap, HashSet};
 use tauri::Runtime;
 
 pub struct LocalTransportService<R: Runtime> {
     app_handle: tauri::AppHandle<R>,
 }
+
+const RELAY_SYNC_OVERLAP_SECS: u64 = 300;
 
 impl<R: Runtime> LocalTransportService<R> {
     pub fn new(app_handle: &tauri::AppHandle<R>) -> Self {
@@ -55,14 +61,17 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
             use_tor_network: input.use_tor_network,
             experimental_transport: input.experimental_transport,
         };
+        let current_user_pubkey = self.resolve_current_user_pubkey();
         let mut pending_chat_effects = TransportChatEffects::default();
         let mut seed_changed = normalize_seed_runtime_status(&mut seed, &previous_cache);
         let initial_runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
-        let (normalized_previous_cache, normalized_chat_effects) =
+        let (mut normalized_previous_cache, normalized_chat_effects) =
             self.normalize_runtime_cache(&previous_cache, &initial_runtime_profiles)?;
         pending_chat_effects.append(normalized_chat_effects);
         seed_changed |= normalize_seed_runtime_status(&mut seed, &normalized_previous_cache);
         seed_changed |= reconcile_open_circle_message_delivery(&mut seed);
+        reconcile_transport_outbound_dispatches(&mut normalized_previous_cache, &seed);
+        reconcile_transport_relay_sync_cursors(&mut normalized_previous_cache, &seed);
         let runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
         let recovery_actions = collect_local_transport_recovery_actions(
             &seed,
@@ -72,18 +81,25 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
         );
         let state = if recovery_actions.is_empty() {
             let mut state = engine.build_state(&seed, &normalized_previous_cache)?;
+            let outbound_messages =
+                collect_transport_outbound_messages(&seed, &normalized_previous_cache, None);
             let runtime_chat_effects = runtime_manager.sync_cache(
                 &normalized_previous_cache,
                 &mut state.cache,
                 runtime_profiles,
                 None,
+                &outbound_messages,
+                &[],
             )?;
             pending_chat_effects.append(runtime_chat_effects);
             state
                 .chat_effects
                 .append(std::mem::take(&mut pending_chat_effects));
-            let chat_effects_changed =
-                apply_transport_chat_effects(&mut seed, &state.chat_effects)?;
+            let chat_effects_changed = apply_transport_chat_effects(
+                &mut seed,
+                &state.chat_effects,
+                current_user_pubkey.as_deref(),
+            )?;
             if chat_effects_changed {
                 state.chat_effects = TransportChatEffects::default();
             }
@@ -100,22 +116,34 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
             for action in &recovery_actions {
                 let action_input =
                     recovery_action_input(action, input.active_circle_id.clone(), runtime_options);
+                reconcile_transport_outbound_dispatches(&mut working_cache, &seed);
+                reconcile_transport_relay_sync_cursors(&mut working_cache, &seed);
+                let action_input =
+                    enrich_runtime_sync_action_input(&seed, &working_cache, action_input);
                 let next_state =
                     engine.apply_circle_action(&mut seed, &working_cache, &action_input)?;
                 let mut next_state = next_state;
                 let recovery_runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
+                let outbound_messages =
+                    collect_transport_outbound_messages(&seed, &working_cache, Some(&action_input));
+                let relay_sync_filters = relay_sync_filters(&seed, &action_input);
                 let runtime_chat_effects = runtime_manager.sync_cache(
                     &working_cache,
                     &mut next_state.cache,
                     recovery_runtime_profiles,
                     Some(&action_input),
+                    &outbound_messages,
+                    &relay_sync_filters,
                 )?;
                 pending_chat_effects.append(runtime_chat_effects);
                 next_state
                     .chat_effects
                     .append(std::mem::take(&mut pending_chat_effects));
-                let chat_effects_changed =
-                    apply_transport_chat_effects(&mut seed, &next_state.chat_effects)?;
+                let chat_effects_changed = apply_transport_chat_effects(
+                    &mut seed,
+                    &next_state.chat_effects,
+                    current_user_pubkey.as_deref(),
+                )?;
                 if chat_effects_changed {
                     next_state.chat_effects = TransportChatEffects::default();
                 }
@@ -127,12 +155,18 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
                 )?;
                 seed_changed |= reconciled_seed_changed;
                 let mut next_state = next_state;
+                reconcile_transport_outbound_dispatches(&mut next_state.cache, &seed);
+                reconcile_transport_relay_sync_cursors(&mut next_state.cache, &seed);
                 merge_runtime_session_activities(&mut next_state.cache, &working_cache);
                 working_cache = next_state.cache.clone();
                 state = Some(next_state);
             }
             state.ok_or_else(|| "local recovery worker produced no transport state".to_string())?
         };
+
+        let mut state = state;
+        reconcile_transport_outbound_dispatches(&mut state.cache, &seed);
+        reconcile_transport_relay_sync_cursors(&mut state.cache, &seed);
 
         if seed_changed {
             self.save_seed(&seed)?;
@@ -161,29 +195,42 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
             use_tor_network: input.use_tor_network,
             experimental_transport: input.experimental_transport,
         };
+        let current_user_pubkey = self.resolve_current_user_pubkey();
         let mut pending_chat_effects = TransportChatEffects::default();
         normalize_seed_runtime_status(&mut seed, &previous_cache);
         let initial_runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
-        let (normalized_previous_cache, normalized_chat_effects) =
+        let (mut normalized_previous_cache, normalized_chat_effects) =
             self.normalize_runtime_cache(&previous_cache, &initial_runtime_profiles)?;
         pending_chat_effects.append(normalized_chat_effects);
         normalize_seed_runtime_status(&mut seed, &normalized_previous_cache);
+        reconcile_transport_outbound_dispatches(&mut normalized_previous_cache, &seed);
+        reconcile_transport_relay_sync_cursors(&mut normalized_previous_cache, &seed);
         let normalized_runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
+        let input = enrich_runtime_sync_action_input(&seed, &normalized_previous_cache, input);
         validate_runtime_action(&input, &normalized_runtime_profiles)?;
         let mut state =
             engine.apply_circle_action(&mut seed, &normalized_previous_cache, &input)?;
         let runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
+        let outbound_messages =
+            collect_transport_outbound_messages(&seed, &normalized_previous_cache, Some(&input));
+        let relay_sync_filters = relay_sync_filters(&seed, &input);
         let runtime_chat_effects = runtime_manager.sync_cache(
             &normalized_previous_cache,
             &mut state.cache,
             runtime_profiles,
             Some(&input),
+            &outbound_messages,
+            &relay_sync_filters,
         )?;
         pending_chat_effects.append(runtime_chat_effects);
         state
             .chat_effects
             .append(std::mem::take(&mut pending_chat_effects));
-        let chat_effects_changed = apply_transport_chat_effects(&mut seed, &state.chat_effects)?;
+        let chat_effects_changed = apply_transport_chat_effects(
+            &mut seed,
+            &state.chat_effects,
+            current_user_pubkey.as_deref(),
+        )?;
         if chat_effects_changed {
             state.chat_effects = TransportChatEffects::default();
         }
@@ -191,6 +238,8 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
             reconcile_seed_and_transport_state(engine, &mut seed, state, chat_effects_changed)?;
         let _ = reconciled_seed_changed;
         let mut state = state_after_reconcile;
+        reconcile_transport_outbound_dispatches(&mut state.cache, &seed);
+        reconcile_transport_relay_sync_cursors(&mut state.cache, &seed);
         merge_runtime_session_activities(&mut state.cache, &normalized_previous_cache);
         self.save_seed(&seed)?;
         self.save_transport_cache(state.cache.clone())?;
@@ -232,6 +281,24 @@ impl<R: Runtime> LocalTransportService<R> {
         repository.save_transport_cache(cache)
     }
 
+    fn resolve_current_user_pubkey(&self) -> Option<String> {
+        shell_auth::load_saved_shell_snapshot(&self.app_handle)
+            .ok()
+            .and_then(|shell| {
+                shell
+                    .auth_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.pubkey.as_deref())
+                    .or_else(|| {
+                        shell
+                            .auth_session
+                            .as_ref()
+                            .and_then(|session| session.access.pubkey.as_deref())
+                    })
+                    .and_then(normalize_nostr_pubkey)
+            })
+    }
+
     fn normalize_runtime_cache(
         &self,
         previous_cache: &TransportCache,
@@ -244,9 +311,318 @@ impl<R: Runtime> LocalTransportService<R> {
             &mut normalized_cache,
             runtime_profiles.to_vec(),
             None,
+            &[],
+            &[],
         )?;
         Ok((normalized_cache, chat_effects))
     }
+}
+
+fn collect_transport_outbound_messages(
+    seed: &ChatDomainSeed,
+    cache: &TransportCache,
+    action: Option<&TransportCircleActionInput>,
+) -> Vec<TransportRuntimeOutboundMessage> {
+    let allowed_circle_id = match action {
+        Some(action)
+            if matches!(
+                action.action,
+                TransportCircleAction::Sync | TransportCircleAction::SyncSessions
+            ) =>
+        {
+            Some(action.circle_id.as_str())
+        }
+        Some(_) => return Vec::new(),
+        None => None,
+    };
+
+    let dispatched_message_ids = cache
+        .outbound_dispatches
+        .iter()
+        .filter(|dispatch| {
+            allowed_circle_id
+                .map(|circle_id| dispatch.circle_id == circle_id)
+                .unwrap_or(true)
+        })
+        .map(|dispatch| (dispatch.session_id.as_str(), dispatch.message_id.as_str()))
+        .collect::<HashSet<_>>();
+
+    seed.sessions
+        .iter()
+        .filter(|session| {
+            allowed_circle_id
+                .map(|circle_id| session.circle_id == circle_id)
+                .unwrap_or(true)
+        })
+        .flat_map(|session| {
+            seed.message_store
+                .get(&session.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|message| {
+                    if !message_is_pending_local_outbound_publish(message) {
+                        return None;
+                    }
+
+                    let signed_nostr_event = message.signed_nostr_event.clone()?;
+                    if dispatched_message_ids.contains(&(session.id.as_str(), message.id.as_str()))
+                    {
+                        return None;
+                    }
+
+                    Some(TransportRuntimeOutboundMessage {
+                        session_id: session.id.clone(),
+                        message_id: message.id.clone(),
+                        remote_id: message
+                            .remote_id
+                            .clone()
+                            .unwrap_or_else(|| signed_nostr_event.event_id.clone()),
+                        signed_nostr_event,
+                    })
+                })
+        })
+        .collect()
+}
+
+fn message_is_pending_local_outbound_publish(message: &MessageItem) -> bool {
+    matches!(message.author, MessageAuthor::Me)
+        && !matches!(
+            message.sync_source,
+            Some(MessageSyncSource::Relay | MessageSyncSource::System)
+        )
+        && matches!(
+            message.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        )
+        && message.signed_nostr_event.is_some()
+}
+
+fn enrich_runtime_sync_action_input(
+    seed: &ChatDomainSeed,
+    cache: &TransportCache,
+    mut input: TransportCircleActionInput,
+) -> TransportCircleActionInput {
+    input.sync_since_created_at = relay_sync_since_created_at(seed, cache, &input);
+    input
+}
+
+fn relay_sync_filters(
+    seed: &ChatDomainSeed,
+    input: &TransportCircleActionInput,
+) -> Vec<TransportRelaySyncFilter> {
+    if !matches!(input.action, TransportCircleAction::Sync) {
+        return Vec::new();
+    }
+
+    let contact_pubkeys = seed
+        .contacts
+        .iter()
+        .filter_map(|contact| {
+            normalize_nostr_pubkey(&contact.pubkey).map(|pubkey| (contact.id.as_str(), pubkey))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut filters = Vec::new();
+    let mut direct_authors = seed
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.circle_id == input.circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Direct)
+        })
+        .filter_map(|session| session.contact_id.as_deref())
+        .filter_map(|contact_id| contact_pubkeys.get(contact_id).cloned())
+        .collect::<Vec<_>>();
+    direct_authors.sort_unstable();
+    direct_authors.dedup();
+    if !direct_authors.is_empty() {
+        filters.push(TransportRelaySyncFilter {
+            authors: direct_authors,
+            tagged_pubkeys: Vec::new(),
+        });
+    }
+
+    filters.extend(
+        seed.sessions
+            .iter()
+            .filter(|session| {
+                session.circle_id == input.circle_id
+                    && !session.archived.unwrap_or(false)
+                    && matches!(session.kind, SessionKind::Group)
+            })
+            .filter_map(|session| {
+                let group = seed
+                    .groups
+                    .iter()
+                    .find(|group| group.session_id == session.id)?;
+                let mut member_pubkeys = group
+                    .members
+                    .iter()
+                    .filter_map(|member| contact_pubkeys.get(member.contact_id.as_str()).cloned())
+                    .collect::<Vec<_>>();
+                member_pubkeys.sort_unstable();
+                member_pubkeys.dedup();
+                if member_pubkeys.is_empty() {
+                    return None;
+                }
+
+                Some(TransportRelaySyncFilter {
+                    tagged_pubkeys: if member_pubkeys.len() >= 2 {
+                        member_pubkeys.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    authors: member_pubkeys,
+                })
+            }),
+    );
+    filters.sort_by(|left, right| {
+        left.authors
+            .cmp(&right.authors)
+            .then(left.tagged_pubkeys.cmp(&right.tagged_pubkeys))
+    });
+    filters.dedup();
+    filters
+}
+
+fn relay_sync_since_created_at(
+    seed: &ChatDomainSeed,
+    cache: &TransportCache,
+    input: &TransportCircleActionInput,
+) -> Option<u64> {
+    if !matches!(input.action, TransportCircleAction::Sync) {
+        return None;
+    }
+
+    relay_sync_cursor_created_at(cache, &input.circle_id)
+        .or_else(|| latest_peer_relay_created_at(seed, &input.circle_id))
+        .map(|created_at| created_at.saturating_sub(RELAY_SYNC_OVERLAP_SECS))
+}
+
+fn relay_sync_cursor_created_at(cache: &TransportCache, circle_id: &str) -> Option<u64> {
+    cache
+        .relay_sync_cursors
+        .iter()
+        .filter(|cursor| cursor.circle_id == circle_id)
+        .map(|cursor| cursor.last_created_at)
+        .max()
+}
+
+fn latest_peer_relay_created_at(seed: &ChatDomainSeed, circle_id: &str) -> Option<u64> {
+    seed.sessions
+        .iter()
+        .filter(|session| session.circle_id == circle_id)
+        .filter_map(|session| seed.message_store.get(&session.id))
+        .flat_map(|messages| messages.iter())
+        .filter(|message| {
+            matches!(message.author, MessageAuthor::Peer)
+                && matches!(message.sync_source, Some(MessageSyncSource::Relay))
+        })
+        .filter_map(|message| {
+            message
+                .signed_nostr_event
+                .as_ref()
+                .map(|event| event.created_at)
+        })
+        .max()
+}
+
+fn reconcile_transport_relay_sync_cursors(cache: &mut TransportCache, seed: &ChatDomainSeed) {
+    let mut last_created_at_by_circle =
+        cache
+            .relay_sync_cursors
+            .iter()
+            .fold(HashMap::<String, u64>::new(), |mut acc, cursor| {
+                acc.entry(cursor.circle_id.clone())
+                    .and_modify(|last_created_at| {
+                        *last_created_at = (*last_created_at).max(cursor.last_created_at);
+                    })
+                    .or_insert(cursor.last_created_at);
+                acc
+            });
+
+    for circle in &seed.circles {
+        if let Some(last_created_at) = latest_peer_relay_created_at(seed, &circle.id) {
+            last_created_at_by_circle
+                .entry(circle.id.clone())
+                .and_modify(|cursor_created_at| {
+                    *cursor_created_at = (*cursor_created_at).max(last_created_at);
+                })
+                .or_insert(last_created_at);
+        }
+    }
+
+    cache.relay_sync_cursors = seed
+        .circles
+        .iter()
+        .filter_map(|circle| {
+            last_created_at_by_circle
+                .get(&circle.id)
+                .copied()
+                .map(|last_created_at| TransportRelaySyncCursor {
+                    circle_id: circle.id.clone(),
+                    last_created_at,
+                })
+        })
+        .collect();
+}
+
+fn reconcile_transport_outbound_dispatches(cache: &mut TransportCache, seed: &ChatDomainSeed) {
+    let session_circle_ids = seed
+        .sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session.circle_id.as_str()))
+        .collect::<HashMap<_, _>>();
+    let runtime_generations = current_runtime_generation_by_circle(cache);
+    let valid_dispatches = seed
+        .message_store
+        .iter()
+        .flat_map(|(session_id, messages)| {
+            let circle_id = session_circle_ids.get(session_id.as_str()).copied();
+            messages.iter().filter_map(move |message| {
+                let circle_id = circle_id?;
+                if !message_is_pending_local_outbound_publish(message) {
+                    return None;
+                }
+                let signed_nostr_event = message.signed_nostr_event.as_ref()?;
+
+                Some((
+                    circle_id.to_string(),
+                    session_id.clone(),
+                    message.id.clone(),
+                    signed_nostr_event.event_id.clone(),
+                ))
+            })
+        })
+        .collect::<HashSet<_>>();
+
+    cache.outbound_dispatches.retain(|dispatch| {
+        valid_dispatches.contains(&(
+            dispatch.circle_id.clone(),
+            dispatch.session_id.clone(),
+            dispatch.message_id.clone(),
+            dispatch.event_id.clone(),
+        )) && runtime_generations
+            .get(dispatch.circle_id.as_str())
+            .map(|generation| *generation == dispatch.runtime_generation)
+            .unwrap_or(true)
+    });
+}
+
+fn current_runtime_generation_by_circle(cache: &TransportCache) -> HashMap<String, u32> {
+    if !cache.runtime_registry.is_empty() {
+        return cache
+            .runtime_registry
+            .iter()
+            .map(|entry| (entry.circle_id.clone(), entry.generation))
+            .collect();
+    }
+
+    cache
+        .runtime_sessions
+        .iter()
+        .map(|session| (session.circle_id.clone(), session.generation))
+        .collect()
 }
 
 fn normalize_seed_runtime_status(seed: &mut ChatDomainSeed, cache: &TransportCache) -> bool {
@@ -316,6 +692,7 @@ fn reconcile_open_circle_message_delivery(seed: &mut ChatDomainSeed) -> bool {
                         message.delivery_status,
                         Some(MessageDeliveryStatus::Sending)
                     )
+                    && message.signed_nostr_event.is_none()
             })
             .map(|message| RemoteDeliveryReceipt {
                 remote_id: message
@@ -359,6 +736,7 @@ fn circle_status_for_runtime(
 fn apply_transport_chat_effects(
     seed: &mut ChatDomainSeed,
     chat_effects: &TransportChatEffects,
+    current_user_pubkey: Option<&str>,
 ) -> Result<bool, String> {
     if chat_effects.is_empty() {
         return Ok(false);
@@ -371,8 +749,14 @@ fn apply_transport_chat_effects(
             continue;
         }
 
-        merge_remote_messages_into_seed(seed, &merge.session_id, merge.messages.clone())?;
-        changed = true;
+        for routed_merge in route_remote_message_merges(seed, merge, current_user_pubkey) {
+            if routed_merge.messages.is_empty() {
+                continue;
+            }
+
+            merge_remote_messages_into_seed(seed, &routed_merge.session_id, routed_merge.messages)?;
+            changed = true;
+        }
     }
 
     for merge in &chat_effects.remote_delivery_receipt_merges {
@@ -396,6 +780,401 @@ fn apply_transport_chat_effects(
     }
 
     Ok(changed)
+}
+
+fn route_remote_message_merges(
+    seed: &ChatDomainSeed,
+    merge: &MergeRemoteMessagesInput,
+    current_user_pubkey: Option<&str>,
+) -> Vec<MergeRemoteMessagesInput> {
+    let mut ordered_session_ids = Vec::<String>::new();
+    let mut messages_by_session = HashMap::<String, Vec<MessageItem>>::new();
+
+    for message in &merge.messages {
+        let normalized_message =
+            normalize_relay_message_for_current_user(message, current_user_pubkey);
+        let target_session_id = existing_message_session_id(seed, &normalized_message)
+            .or_else(|| {
+                resolve_remote_message_target_session(
+                    seed,
+                    &merge.session_id,
+                    &normalized_message,
+                    current_user_pubkey,
+                )
+            })
+            .unwrap_or_else(|| merge.session_id.clone());
+        if !messages_by_session.contains_key(&target_session_id) {
+            ordered_session_ids.push(target_session_id.clone());
+        }
+        messages_by_session
+            .entry(target_session_id)
+            .or_default()
+            .push(normalized_message);
+    }
+
+    ordered_session_ids
+        .into_iter()
+        .filter_map(|session_id| {
+            messages_by_session
+                .remove(&session_id)
+                .map(|messages| MergeRemoteMessagesInput {
+                    session_id,
+                    messages,
+                })
+        })
+        .collect()
+}
+
+fn existing_message_session_id(seed: &ChatDomainSeed, message: &MessageItem) -> Option<String> {
+    seed.message_store
+        .iter()
+        .find_map(|(session_id, messages)| {
+            messages
+                .iter()
+                .any(|existing_message| same_message_identity(existing_message, message))
+                .then(|| session_id.clone())
+        })
+}
+
+fn same_message_identity(existing: &MessageItem, incoming: &MessageItem) -> bool {
+    if existing.id == incoming.id {
+        return true;
+    }
+
+    matches!(
+        (existing.remote_id.as_deref(), incoming.remote_id.as_deref()),
+        (Some(existing_remote_id), Some(incoming_remote_id))
+            if existing_remote_id == incoming_remote_id
+    )
+}
+
+fn resolve_remote_message_target_session(
+    seed: &ChatDomainSeed,
+    fallback_session_id: &str,
+    message: &MessageItem,
+    current_user_pubkey: Option<&str>,
+) -> Option<String> {
+    let sender_pubkey = message_sender_pubkey(message)?;
+    let fallback_circle_id = seed
+        .sessions
+        .iter()
+        .find(|session| session.id == fallback_session_id)
+        .map(|session| session.circle_id.as_str())?;
+    let raw_p_tag_count = raw_p_tag_count_for_remote_message(message);
+    if current_user_pubkey.is_some_and(|pubkey| pubkey == sender_pubkey) {
+        return resolve_group_self_message_target_session(seed, fallback_circle_id, message)
+            .or_else(|| {
+                (raw_p_tag_count < 2)
+                    .then(|| {
+                        resolve_direct_self_message_target_session(
+                            seed,
+                            fallback_circle_id,
+                            message,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                (raw_p_tag_count == 0)
+                    .then(|| resolve_self_chat_target_session(seed, fallback_circle_id))
+                    .flatten()
+            });
+    }
+
+    if !matches!(message.author, MessageAuthor::Peer) {
+        return None;
+    }
+
+    resolve_group_peer_message_target_session(seed, fallback_circle_id, &sender_pubkey, message)
+        .or_else(|| {
+            (raw_p_tag_count < 2)
+                .then(|| {
+                    resolve_direct_peer_message_target_session(
+                        seed,
+                        fallback_circle_id,
+                        &sender_pubkey,
+                    )
+                })
+                .flatten()
+        })
+}
+
+fn normalize_relay_message_for_current_user(
+    message: &MessageItem,
+    current_user_pubkey: Option<&str>,
+) -> MessageItem {
+    let mut normalized_message = message.clone();
+    if !matches!(
+        normalized_message.sync_source,
+        Some(MessageSyncSource::Relay)
+    ) {
+        return normalized_message;
+    }
+    let Some(current_user_pubkey) = current_user_pubkey else {
+        return normalized_message;
+    };
+    let Some(sender_pubkey) = message_sender_pubkey(message) else {
+        return normalized_message;
+    };
+    if sender_pubkey != current_user_pubkey {
+        return normalized_message;
+    }
+
+    normalized_message.author = MessageAuthor::Me;
+    if normalized_message.delivery_status.is_none() {
+        normalized_message.delivery_status = Some(MessageDeliveryStatus::Sent);
+    }
+    normalized_message
+}
+
+fn message_sender_pubkey(message: &MessageItem) -> Option<String> {
+    message
+        .signed_nostr_event
+        .as_ref()
+        .and_then(|event| normalize_nostr_pubkey(&event.pubkey))
+}
+
+fn resolve_direct_peer_message_target_session(
+    seed: &ChatDomainSeed,
+    circle_id: &str,
+    sender_pubkey: &str,
+) -> Option<String> {
+    let matching_contact_ids = seed
+        .contacts
+        .iter()
+        .filter_map(|contact| {
+            normalize_nostr_pubkey(&contact.pubkey)
+                .filter(|pubkey| pubkey == sender_pubkey)
+                .map(|_| contact.id.as_str())
+        })
+        .collect::<HashSet<_>>();
+    if matching_contact_ids.is_empty() {
+        return None;
+    }
+
+    seed.sessions
+        .iter()
+        .find(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Direct)
+                && session
+                    .contact_id
+                    .as_deref()
+                    .is_some_and(|contact_id| matching_contact_ids.contains(contact_id))
+        })
+        .map(|session| session.id.clone())
+}
+
+fn resolve_direct_self_message_target_session(
+    seed: &ChatDomainSeed,
+    circle_id: &str,
+    message: &MessageItem,
+) -> Option<String> {
+    let tagged_pubkeys = tagged_pubkeys_for_remote_message(message);
+    if tagged_pubkeys.is_empty() {
+        return None;
+    }
+
+    let candidate_session_ids = seed
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Direct)
+        })
+        .filter_map(|session| {
+            let contact_id = session.contact_id.as_deref()?;
+            let contact = seed
+                .contacts
+                .iter()
+                .find(|contact| contact.id == contact_id)?;
+            let contact_pubkey = normalize_nostr_pubkey(&contact.pubkey)?;
+            tagged_pubkeys
+                .contains(&contact_pubkey)
+                .then(|| session.id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if candidate_session_ids.len() == 1 {
+        candidate_session_ids.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn resolve_group_peer_message_target_session(
+    seed: &ChatDomainSeed,
+    circle_id: &str,
+    sender_pubkey: &str,
+    message: &MessageItem,
+) -> Option<String> {
+    let tagged_pubkeys = tagged_pubkeys_for_remote_message(message);
+    if tagged_pubkeys.is_empty() {
+        return None;
+    }
+
+    let contact_pubkeys = seed
+        .contacts
+        .iter()
+        .filter_map(|contact| {
+            normalize_nostr_pubkey(&contact.pubkey).map(|pubkey| (contact.id.as_str(), pubkey))
+        })
+        .collect::<HashMap<_, _>>();
+    let candidate_session_ids = seed
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Group)
+        })
+        .filter_map(|session| {
+            let group = seed
+                .groups
+                .iter()
+                .find(|group| group.session_id == session.id)?;
+            group_message_matches_session(group, &contact_pubkeys, sender_pubkey, &tagged_pubkeys)
+                .then(|| session.id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if candidate_session_ids.len() == 1 {
+        candidate_session_ids.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn resolve_group_self_message_target_session(
+    seed: &ChatDomainSeed,
+    circle_id: &str,
+    message: &MessageItem,
+) -> Option<String> {
+    let tagged_pubkeys = tagged_pubkeys_for_remote_message(message);
+    if tagged_pubkeys.is_empty() {
+        return None;
+    }
+
+    let contact_pubkeys = seed
+        .contacts
+        .iter()
+        .filter_map(|contact| {
+            normalize_nostr_pubkey(&contact.pubkey).map(|pubkey| (contact.id.as_str(), pubkey))
+        })
+        .collect::<HashMap<_, _>>();
+    let candidate_session_ids = seed
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::Group)
+        })
+        .filter_map(|session| {
+            let group = seed
+                .groups
+                .iter()
+                .find(|group| group.session_id == session.id)?;
+            group_self_message_matches_session(group, &contact_pubkeys, &tagged_pubkeys)
+                .then(|| session.id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if candidate_session_ids.len() == 1 {
+        candidate_session_ids.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn group_message_matches_session(
+    group: &crate::domain::chat::GroupProfile,
+    contact_pubkeys: &HashMap<&str, String>,
+    sender_pubkey: &str,
+    tagged_pubkeys: &HashSet<String>,
+) -> bool {
+    let member_pubkeys = group
+        .members
+        .iter()
+        .filter_map(|member| contact_pubkeys.get(member.contact_id.as_str()).cloned())
+        .collect::<HashSet<_>>();
+    if member_pubkeys.is_empty() || !member_pubkeys.contains(sender_pubkey) {
+        return false;
+    }
+
+    member_pubkeys
+        .iter()
+        .filter(|pubkey| pubkey.as_str() != sender_pubkey)
+        .all(|pubkey| tagged_pubkeys.contains(pubkey))
+}
+
+fn group_self_message_matches_session(
+    group: &crate::domain::chat::GroupProfile,
+    contact_pubkeys: &HashMap<&str, String>,
+    tagged_pubkeys: &HashSet<String>,
+) -> bool {
+    let member_pubkeys = group
+        .members
+        .iter()
+        .filter_map(|member| contact_pubkeys.get(member.contact_id.as_str()).cloned())
+        .collect::<HashSet<_>>();
+    !member_pubkeys.is_empty()
+        && member_pubkeys
+            .iter()
+            .all(|pubkey| tagged_pubkeys.contains(pubkey))
+}
+
+fn resolve_self_chat_target_session(seed: &ChatDomainSeed, circle_id: &str) -> Option<String> {
+    let candidate_session_ids = seed
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.circle_id == circle_id
+                && !session.archived.unwrap_or(false)
+                && matches!(session.kind, SessionKind::SelfChat)
+        })
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+
+    if candidate_session_ids.len() == 1 {
+        candidate_session_ids.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn tagged_pubkeys_for_remote_message(message: &MessageItem) -> HashSet<String> {
+    message
+        .signed_nostr_event
+        .as_ref()
+        .into_iter()
+        .flat_map(|event| event.tags.iter())
+        .filter_map(|tag| {
+            if tag.first().map(String::as_str) != Some("p") {
+                return None;
+            }
+
+            tag.get(1).and_then(|value| normalize_nostr_pubkey(value))
+        })
+        .collect()
+}
+
+fn raw_p_tag_count_for_remote_message(message: &MessageItem) -> usize {
+    message
+        .signed_nostr_event
+        .as_ref()
+        .into_iter()
+        .flat_map(|event| event.tags.iter())
+        .filter(|tag| tag.first().map(String::as_str) == Some("p"))
+        .count()
+}
+
+fn normalize_nostr_pubkey(value: &str) -> Option<String> {
+    NostrPublicKey::parse(value.trim())
+        .ok()
+        .map(|pubkey| pubkey.to_hex())
 }
 
 fn clear_session_unread(seed: &mut ChatDomainSeed, session_id: &str) -> bool {
@@ -638,17 +1417,22 @@ fn trim_transport_activities(activities: Vec<TransportActivityItem>) -> Vec<Tran
 mod tests {
     use super::*;
     use crate::domain::chat::{
-        CircleItem, CircleType, MessageAuthor, MessageDeliveryStatus, MessageItem, MessageKind,
-        MessageSyncSource, SessionItem, SessionKind,
+        CircleItem, CircleType, ContactItem, GroupMember, GroupProfile, GroupRole,
+        MergeRemoteMessagesInput, MessageAuthor, MessageDeliveryStatus, MessageItem, MessageKind,
+        MessageSyncSource, SessionItem, SessionKind, SignedNostrEvent,
     };
     use crate::domain::transport::{
         TransportActivityKind, TransportActivityLevel, TransportCircleAction,
-        TransportCircleActionInput, TransportRuntimeAdapterKind, TransportRuntimeDesiredState,
-        TransportRuntimeLaunchResult, TransportRuntimeLaunchStatus, TransportRuntimeQueueState,
-        TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry, TransportRuntimeState,
+        TransportCircleActionInput, TransportOutboundDispatch, TransportRelaySyncFilter,
+        TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchResult,
+        TransportRuntimeLaunchStatus, TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy,
+        TransportRuntimeRegistryEntry, TransportRuntimeState,
     };
+    use crate::domain::transport_repository::TransportRelaySyncCursor;
+    use secp256k1::{Secp256k1, SecretKey};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -733,6 +1517,107 @@ mod tests {
         }
     }
 
+    fn direct_session_with_contact(id: &str, circle_id: &str, contact_id: &str) -> SessionItem {
+        SessionItem {
+            contact_id: Some(contact_id.into()),
+            ..direct_session(id, circle_id)
+        }
+    }
+
+    fn group_session(id: &str, circle_id: &str, name: &str) -> SessionItem {
+        SessionItem {
+            id: id.into(),
+            circle_id: circle_id.into(),
+            name: name.into(),
+            initials: "G".into(),
+            subtitle: "test".into(),
+            time: "now".into(),
+            unread_count: None,
+            muted: None,
+            pinned: None,
+            draft: None,
+            kind: SessionKind::Group,
+            category: "groups".into(),
+            members: Some(3),
+            contact_id: None,
+            archived: Some(false),
+        }
+    }
+
+    fn self_session(id: &str, circle_id: &str) -> SessionItem {
+        SessionItem {
+            id: id.into(),
+            circle_id: circle_id.into(),
+            name: "Note to Self".into(),
+            initials: "ME".into(),
+            subtitle: "Private note space".into(),
+            time: "now".into(),
+            unread_count: None,
+            muted: None,
+            pinned: None,
+            draft: None,
+            kind: SessionKind::SelfChat,
+            category: "system".into(),
+            members: None,
+            contact_id: None,
+            archived: Some(false),
+        }
+    }
+
+    fn group_profile(session_id: &str, member_contact_ids: &[&str]) -> GroupProfile {
+        GroupProfile {
+            session_id: session_id.into(),
+            name: session_id.into(),
+            description: "test".into(),
+            members: member_contact_ids
+                .iter()
+                .map(|contact_id| GroupMember {
+                    contact_id: (*contact_id).into(),
+                    role: Some(GroupRole::Member),
+                })
+                .collect(),
+            muted: None,
+        }
+    }
+
+    fn contact(id: &str, pubkey: &str) -> ContactItem {
+        ContactItem {
+            id: id.into(),
+            name: id.into(),
+            initials: "C".into(),
+            handle: format!("@{id}"),
+            pubkey: pubkey.into(),
+            subtitle: "test".into(),
+            bio: "test".into(),
+            online: Some(false),
+            blocked: Some(false),
+        }
+    }
+
+    fn valid_sender_pubkey_hex() -> String {
+        valid_pubkey_hex("1111111111111111111111111111111111111111111111111111111111111111")
+    }
+
+    fn valid_group_member_pubkey_hex() -> String {
+        valid_pubkey_hex("2222222222222222222222222222222222222222222222222222222222222222")
+    }
+
+    fn valid_unknown_tag_pubkey_hex() -> String {
+        valid_pubkey_hex("3333333333333333333333333333333333333333333333333333333333333333")
+    }
+
+    fn valid_pubkey_hex(secret_key_hex: &str) -> String {
+        let secret_key =
+            SecretKey::from_str(secret_key_hex).expect("valid test secret key should parse");
+        let secp = Secp256k1::new();
+        let (pubkey, _) = secret_key.x_only_public_key(&secp);
+        pubkey
+            .serialize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    }
+
     fn text_message(
         id: &str,
         author: MessageAuthor,
@@ -754,6 +1639,65 @@ mod tests {
                 MessageSyncSource::Relay
             }),
             acked_at: None,
+            signed_nostr_event: None,
+            reply_to: None,
+        }
+    }
+
+    fn signed_text_message(
+        id: &str,
+        delivery_status: Option<MessageDeliveryStatus>,
+        remote_id: &str,
+    ) -> MessageItem {
+        MessageItem {
+            remote_id: Some(remote_id.into()),
+            signed_nostr_event: Some(SignedNostrEvent {
+                event_id: remote_id.into(),
+                pubkey: "02b4631d6f1d6659d8e7a0f4d1f56ea74413c5fc11d16f55b3e25a03e353dd1510".into(),
+                created_at: 1_735_689_600,
+                kind: 1,
+                tags: Vec::new(),
+                content: id.into(),
+                signature: "c".repeat(128),
+            }),
+            ..text_message(id, MessageAuthor::Me, delivery_status)
+        }
+    }
+
+    fn signed_relay_self_message(id: &str, remote_id: &str) -> MessageItem {
+        let mut message = signed_text_message(id, None, remote_id);
+        message.sync_source = Some(MessageSyncSource::Relay);
+        message
+    }
+
+    fn legacy_signed_pending_local_message(id: &str, remote_id: &str) -> MessageItem {
+        let mut message = signed_text_message(id, Some(MessageDeliveryStatus::Sending), remote_id);
+        message.sync_source = None;
+        message
+    }
+
+    fn inbound_relay_message(id: &str, sender_pubkey: &str, body: &str) -> MessageItem {
+        MessageItem {
+            id: id.into(),
+            kind: MessageKind::Text,
+            author: MessageAuthor::Peer,
+            body: body.into(),
+            time: "now".into(),
+            meta: None,
+            delivery_status: None,
+            remote_id: Some(id.into()),
+            sync_source: Some(MessageSyncSource::Relay),
+            acked_at: None,
+            signed_nostr_event: Some(SignedNostrEvent {
+                event_id: id.into(),
+                pubkey: sender_pubkey.into(),
+                created_at: 1_735_689_600,
+                kind: 1,
+                tags: Vec::new(),
+                content: body.into(),
+                signature: "d".repeat(128),
+            }),
+            reply_to: None,
         }
     }
 
@@ -899,6 +1843,1006 @@ mod tests {
     }
 
     #[test]
+    fn active_runtime_leaves_signed_local_messages_pending_until_runtime_receipt() {
+        let mut seed = seed(CircleStatus::Connecting, "--");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![signed_text_message(
+                "signed-sending",
+                Some(MessageDeliveryStatus::Sending),
+                "event-signed-sending",
+            )],
+        );
+
+        let status_changed = normalize_seed_runtime_status(
+            &mut seed,
+            &TransportCache {
+                runtime_registry: vec![runtime_entry(TransportRuntimeState::Active)],
+                ..TransportCache::default()
+            },
+        );
+        let message_changed = reconcile_open_circle_message_delivery(&mut seed);
+
+        assert!(status_changed);
+        assert!(!message_changed);
+        let session_messages = &seed.message_store["session-1"];
+        assert!(matches!(
+            session_messages[0].delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+        assert_eq!(
+            session_messages[0].remote_id.as_deref(),
+            Some("event-signed-sending")
+        );
+        assert_eq!(session_messages[0].acked_at, None);
+    }
+
+    #[test]
+    fn collect_transport_outbound_messages_filters_to_undispatched_signed_local_messages() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.circles.push(CircleItem {
+            id: "circle-2".into(),
+            name: "Circle 2".into(),
+            relay: "wss://relay-2.example.com".into(),
+            circle_type: CircleType::Default,
+            status: CircleStatus::Open,
+            latency: "18 ms".into(),
+            description: "test".into(),
+        });
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.sessions.push(direct_session("session-2", "circle-2"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![
+                signed_text_message(
+                    "message-queued",
+                    Some(MessageDeliveryStatus::Sending),
+                    "event-queued",
+                ),
+                signed_text_message(
+                    "message-sent",
+                    Some(MessageDeliveryStatus::Sent),
+                    "event-sent",
+                ),
+                signed_text_message(
+                    "message-failed",
+                    Some(MessageDeliveryStatus::Failed),
+                    "event-failed",
+                ),
+            ],
+        );
+        seed.message_store.insert(
+            "session-2".into(),
+            vec![signed_text_message(
+                "message-other-circle",
+                Some(MessageDeliveryStatus::Sending),
+                "event-other-circle",
+            )],
+        );
+
+        let cache = TransportCache {
+            outbound_dispatches: vec![TransportOutboundDispatch {
+                circle_id: "circle-1".into(),
+                session_id: "session-1".into(),
+                message_id: "message-sent".into(),
+                remote_id: "event-sent".into(),
+                event_id: "event-sent".into(),
+                runtime_generation: 1,
+                request_id: "sync:circle-1:1".into(),
+                dispatched_at: "now".into(),
+            }],
+            ..TransportCache::default()
+        };
+
+        let outbound_messages = collect_transport_outbound_messages(
+            &seed,
+            &cache,
+            Some(&TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            }),
+        );
+
+        assert_eq!(outbound_messages.len(), 1);
+        assert_eq!(outbound_messages[0].session_id, "session-1");
+        assert_eq!(outbound_messages[0].message_id, "message-queued");
+        assert_eq!(outbound_messages[0].remote_id, "event-queued");
+    }
+
+    #[test]
+    fn collect_transport_outbound_messages_ignores_self_authored_relay_echoes() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![
+                signed_text_message(
+                    "message-local",
+                    Some(MessageDeliveryStatus::Sending),
+                    "event-local",
+                ),
+                signed_relay_self_message("message-relay-self", "event-relay-self"),
+            ],
+        );
+
+        let outbound_messages =
+            collect_transport_outbound_messages(&seed, &TransportCache::default(), None);
+
+        assert_eq!(outbound_messages.len(), 1);
+        assert_eq!(outbound_messages[0].message_id, "message-local");
+        assert_eq!(outbound_messages[0].remote_id, "event-local");
+    }
+
+    #[test]
+    fn collect_transport_outbound_messages_keeps_legacy_pending_local_signed_messages() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![legacy_signed_pending_local_message(
+                "message-legacy-local",
+                "event-legacy-local",
+            )],
+        );
+
+        let outbound_messages =
+            collect_transport_outbound_messages(&seed, &TransportCache::default(), None);
+
+        assert_eq!(outbound_messages.len(), 1);
+        assert_eq!(outbound_messages[0].message_id, "message-legacy-local");
+        assert_eq!(outbound_messages[0].remote_id, "event-legacy-local");
+    }
+
+    #[test]
+    fn collect_transport_outbound_messages_without_action_includes_all_circles() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.circles.push(CircleItem {
+            id: "circle-2".into(),
+            name: "Circle 2".into(),
+            relay: "wss://relay-2.example.com".into(),
+            circle_type: CircleType::Default,
+            status: CircleStatus::Open,
+            latency: "18 ms".into(),
+            description: "test".into(),
+        });
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.sessions.push(direct_session("session-2", "circle-2"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![signed_text_message(
+                "message-circle-1",
+                Some(MessageDeliveryStatus::Sending),
+                "event-circle-1",
+            )],
+        );
+        seed.message_store.insert(
+            "session-2".into(),
+            vec![signed_text_message(
+                "message-circle-2",
+                Some(MessageDeliveryStatus::Sending),
+                "event-circle-2",
+            )],
+        );
+
+        let outbound_messages =
+            collect_transport_outbound_messages(&seed, &TransportCache::default(), None);
+
+        assert_eq!(outbound_messages.len(), 2);
+        assert!(outbound_messages
+            .iter()
+            .any(|message| message.session_id == "session-1"
+                && message.remote_id == "event-circle-1"));
+        assert!(outbound_messages
+            .iter()
+            .any(|message| message.session_id == "session-2"
+                && message.remote_id == "event-circle-2"));
+    }
+
+    #[test]
+    fn relay_sync_since_created_at_uses_latest_peer_relay_event_with_overlap() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.sessions.push(direct_session("session-2", "circle-1"));
+        let mut older_relay_peer =
+            inbound_relay_message("relay-event-1", &sender_pubkey, "older relay peer");
+        older_relay_peer
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .created_at = 1_735_689_600;
+        let mut local_signed_message = signed_text_message(
+            "local-signed-message",
+            Some(MessageDeliveryStatus::Sent),
+            "event-local-signed",
+        );
+        local_signed_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("local signed message should have signed event")
+            .created_at = 1_735_690_000;
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![older_relay_peer, local_signed_message],
+        );
+        let mut latest_relay_peer =
+            inbound_relay_message("relay-event-2", &sender_pubkey, "latest relay peer");
+        latest_relay_peer
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .created_at = 1_735_689_900;
+        seed.message_store
+            .insert("session-2".into(), vec![latest_relay_peer]);
+
+        let since = relay_sync_since_created_at(
+            &seed,
+            &TransportCache::default(),
+            &TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            },
+        );
+
+        assert_eq!(since, Some(1_735_689_600));
+    }
+
+    #[test]
+    fn relay_sync_filters_include_direct_authors_and_group_member_p_tags() {
+        let direct_pubkey = valid_sender_pubkey_hex();
+        let group_sender_pubkey = valid_group_member_pubkey_hex();
+        let other_group_pubkey =
+            valid_pubkey_hex("4444444444444444444444444444444444444444444444444444444444444444");
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts
+            .push(contact("direct-contact", &direct_pubkey));
+        seed.contacts
+            .push(contact("bob-contact", &group_sender_pubkey));
+        seed.contacts
+            .push(contact("carol-contact", &other_group_pubkey));
+        seed.sessions.push(direct_session_with_contact(
+            "direct-1",
+            "circle-1",
+            "direct-contact",
+        ));
+        seed.sessions
+            .push(group_session("group-1", "circle-1", "Design Crew"));
+        seed.groups
+            .push(group_profile("group-1", &["bob-contact", "carol-contact"]));
+
+        let filters = relay_sync_filters(
+            &seed,
+            &TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            },
+        );
+        let mut expected_group_pubkeys = vec![group_sender_pubkey, other_group_pubkey];
+        expected_group_pubkeys.sort_unstable();
+
+        assert_eq!(filters.len(), 2);
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: vec![direct_pubkey],
+            tagged_pubkeys: Vec::new(),
+        }));
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: expected_group_pubkeys.clone(),
+            tagged_pubkeys: expected_group_pubkeys,
+        }));
+    }
+
+    #[test]
+    fn relay_sync_filters_fall_back_to_author_only_for_single_member_groups() {
+        let group_member_pubkey = valid_group_member_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts
+            .push(contact("bob-contact", &group_member_pubkey));
+        seed.sessions
+            .push(group_session("group-1", "circle-1", "Single Member Group"));
+        seed.groups.push(group_profile("group-1", &["bob-contact"]));
+
+        let filters = relay_sync_filters(
+            &seed,
+            &TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            },
+        );
+
+        assert_eq!(
+            filters,
+            vec![TransportRelaySyncFilter {
+                authors: vec![group_member_pubkey],
+                tagged_pubkeys: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn relay_sync_since_created_at_prefers_persisted_cursor_over_seed_history() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        let mut relay_peer =
+            inbound_relay_message("relay-event-1", &sender_pubkey, "older relay peer");
+        relay_peer
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .created_at = 1_735_689_600;
+        seed.message_store
+            .insert("session-1".into(), vec![relay_peer]);
+
+        let since = relay_sync_since_created_at(
+            &seed,
+            &TransportCache {
+                relay_sync_cursors: vec![TransportRelaySyncCursor {
+                    circle_id: "circle-1".into(),
+                    last_created_at: 1_735_690_200,
+                }],
+                ..TransportCache::default()
+            },
+            &TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            },
+        );
+
+        assert_eq!(since, Some(1_735_689_900));
+    }
+
+    #[test]
+    fn reconcile_transport_relay_sync_cursors_backfills_and_advances_from_seed() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.circles.push(CircleItem {
+            id: "circle-2".into(),
+            name: "Circle 2".into(),
+            relay: "wss://relay-2.example.com".into(),
+            circle_type: CircleType::Default,
+            status: CircleStatus::Open,
+            latency: "18 ms".into(),
+            description: "test".into(),
+        });
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.sessions.push(direct_session("session-2", "circle-2"));
+        let mut circle_1_message =
+            inbound_relay_message("relay-event-1", &sender_pubkey, "circle 1 relay peer");
+        circle_1_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .created_at = 1_735_689_700;
+        let mut circle_2_message =
+            inbound_relay_message("relay-event-2", &sender_pubkey, "circle 2 relay peer");
+        circle_2_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .created_at = 1_735_690_100;
+        seed.message_store
+            .insert("session-1".into(), vec![circle_1_message]);
+        seed.message_store
+            .insert("session-2".into(), vec![circle_2_message]);
+
+        let mut cache = TransportCache {
+            relay_sync_cursors: vec![
+                TransportRelaySyncCursor {
+                    circle_id: "circle-1".into(),
+                    last_created_at: 1_735_689_650,
+                },
+                TransportRelaySyncCursor {
+                    circle_id: "circle-ghost".into(),
+                    last_created_at: 42,
+                },
+            ],
+            ..TransportCache::default()
+        };
+
+        reconcile_transport_relay_sync_cursors(&mut cache, &seed);
+
+        assert_eq!(
+            cache.relay_sync_cursors,
+            vec![
+                TransportRelaySyncCursor {
+                    circle_id: "circle-1".into(),
+                    last_created_at: 1_735_689_700,
+                },
+                TransportRelaySyncCursor {
+                    circle_id: "circle-2".into(),
+                    last_created_at: 1_735_690_100,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_transport_repository_roundtrips_relay_sync_cursors() {
+        let guard = test_app();
+        let repository = SqliteTransportRepository::new(guard.app.handle());
+        let expected = vec![
+            TransportRelaySyncCursor {
+                circle_id: "circle-1".into(),
+                last_created_at: 1_735_689_700,
+            },
+            TransportRelaySyncCursor {
+                circle_id: "circle-2".into(),
+                last_created_at: 1_735_690_100,
+            },
+        ];
+
+        repository
+            .save_transport_cache(TransportCache {
+                relay_sync_cursors: expected.clone(),
+                ..TransportCache::default()
+            })
+            .expect("transport cache should save");
+        let cache = repository
+            .load_transport_cache()
+            .expect("transport cache should load");
+
+        assert_eq!(cache.relay_sync_cursors, expected);
+    }
+
+    #[test]
+    fn reconcile_transport_outbound_dispatches_drops_missing_replaced_and_stale_generation_records()
+    {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![
+                signed_text_message(
+                    "message-queued",
+                    Some(MessageDeliveryStatus::Sending),
+                    "event-queued",
+                ),
+                signed_text_message(
+                    "message-sent",
+                    Some(MessageDeliveryStatus::Sent),
+                    "event-sent",
+                ),
+            ],
+        );
+        let mut cache = TransportCache {
+            runtime_registry: vec![runtime_entry(TransportRuntimeState::Active)],
+            outbound_dispatches: vec![
+                TransportOutboundDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-queued".into(),
+                    remote_id: "event-queued".into(),
+                    event_id: "event-queued".into(),
+                    runtime_generation: 1,
+                    request_id: "sync:circle-1:1".into(),
+                    dispatched_at: "now".into(),
+                },
+                TransportOutboundDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-sent".into(),
+                    remote_id: "event-sent".into(),
+                    event_id: "event-sent".into(),
+                    runtime_generation: 1,
+                    request_id: "sync:circle-1:sent".into(),
+                    dispatched_at: "now".into(),
+                },
+                TransportOutboundDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-queued".into(),
+                    remote_id: "event-queued".into(),
+                    event_id: "event-queued".into(),
+                    runtime_generation: 0,
+                    request_id: "sync:circle-1:stale-generation".into(),
+                    dispatched_at: "now".into(),
+                },
+                TransportOutboundDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-stale".into(),
+                    remote_id: "event-stale".into(),
+                    event_id: "event-stale".into(),
+                    runtime_generation: 1,
+                    request_id: "sync:circle-1:2".into(),
+                    dispatched_at: "now".into(),
+                },
+            ],
+            ..TransportCache::default()
+        };
+
+        reconcile_transport_outbound_dispatches(&mut cache, &seed);
+
+        assert_eq!(cache.outbound_dispatches.len(), 1);
+        assert_eq!(cache.outbound_dispatches[0].message_id, "message-queued");
+        assert_eq!(cache.outbound_dispatches[0].event_id, "event-queued");
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_routes_inbound_peer_message_to_matching_direct_session() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts.push(contact("alice-contact", &sender_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions.push(direct_session_with_contact(
+            "session-alice",
+            "circle-1",
+            "alice-contact",
+        ));
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_relay_message(
+                    "relay-event-1",
+                    &sender_pubkey,
+                    "hello from alice via relay",
+                )],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(&mut seed, &chat_effects, None)
+            .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("session-alice")
+            .expect("matching direct session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-event-1");
+        let session = seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-alice")
+            .expect("missing routed session");
+        assert_eq!(session.subtitle, "hello from alice via relay");
+        assert_eq!(session.unread_count, Some(1));
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_does_not_route_peer_message_across_circles() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.circles.push(CircleItem {
+            id: "circle-2".into(),
+            name: "Circle 2".into(),
+            relay: "wss://relay-2.example.com".into(),
+            circle_type: CircleType::Default,
+            status: CircleStatus::Open,
+            latency: "18 ms".into(),
+            description: "test".into(),
+        });
+        seed.contacts.push(contact("alice-contact", &sender_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions.push(direct_session_with_contact(
+            "session-alice-circle-2",
+            "circle-2",
+            "alice-contact",
+        ));
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_relay_message(
+                    "relay-event-2",
+                    &sender_pubkey,
+                    "stay inside circle-1",
+                )],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(&mut seed, &chat_effects, None)
+            .expect("chat effects apply");
+
+        assert!(changed);
+        let original_messages = seed
+            .message_store
+            .get("session-primary")
+            .expect("fallback session should retain unmatched circle message");
+        assert_eq!(original_messages.len(), 1);
+        assert_eq!(original_messages[0].id, "relay-event-2");
+        assert!(seed
+            .message_store
+            .get("session-alice-circle-2")
+            .map_or(true, |messages| messages.is_empty()));
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_routes_inbound_peer_message_to_matching_group_session() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let other_member_pubkey = valid_group_member_pubkey_hex();
+        let unknown_tag_pubkey = valid_unknown_tag_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts.push(contact("alice-contact", &sender_pubkey));
+        seed.contacts
+            .push(contact("bob-contact", &other_member_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions
+            .push(group_session("session-design", "circle-1", "Design Circle"));
+        seed.groups.push(group_profile(
+            "session-design",
+            &["alice-contact", "bob-contact"],
+        ));
+        let mut inbound_message =
+            inbound_relay_message("relay-group-1", &sender_pubkey, "hello design circle");
+        inbound_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .tags = vec![
+            vec!["p".into(), other_member_pubkey],
+            vec!["p".into(), unknown_tag_pubkey],
+        ];
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_message],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(&mut seed, &chat_effects, None)
+            .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("session-design")
+            .expect("matching group session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-group-1");
+        let session = seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-design")
+            .expect("missing routed group session");
+        assert_eq!(session.subtitle, "hello design circle");
+        assert_eq!(session.unread_count, Some(1));
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_prefers_group_session_over_direct_session_for_group_tags() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let other_member_pubkey = valid_group_member_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts.push(contact("alice-contact", &sender_pubkey));
+        seed.contacts
+            .push(contact("bob-contact", &other_member_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions.push(direct_session_with_contact(
+            "session-alice",
+            "circle-1",
+            "alice-contact",
+        ));
+        seed.sessions
+            .push(group_session("session-design", "circle-1", "Design Circle"));
+        seed.groups.push(group_profile(
+            "session-design",
+            &["alice-contact", "bob-contact"],
+        ));
+        let mut inbound_message =
+            inbound_relay_message("relay-group-2", &sender_pubkey, "route to group first");
+        inbound_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .tags = vec![vec!["p".into(), other_member_pubkey]];
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_message],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(&mut seed, &chat_effects, None)
+            .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        assert!(seed
+            .message_store
+            .get("session-alice")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("session-design")
+            .expect("matching group session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-group-2");
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_routes_self_authored_relay_message_to_matching_direct_session()
+    {
+        let current_user_pubkey = valid_sender_pubkey_hex();
+        let contact_pubkey = valid_group_member_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts.push(contact("bob-contact", &contact_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions.push(direct_session_with_contact(
+            "session-bob",
+            "circle-1",
+            "bob-contact",
+        ));
+        let mut inbound_message = inbound_relay_message(
+            "relay-self-direct-1",
+            &current_user_pubkey,
+            "sent from another device",
+        );
+        inbound_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .tags = vec![vec!["p".into(), contact_pubkey]];
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_message],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(
+            &mut seed,
+            &chat_effects,
+            Some(current_user_pubkey.as_str()),
+        )
+        .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("session-bob")
+            .expect("matching direct session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-self-direct-1");
+        assert!(matches!(routed_messages[0].author, MessageAuthor::Me));
+        assert!(matches!(
+            routed_messages[0].sync_source,
+            Some(MessageSyncSource::Relay)
+        ));
+        assert!(matches!(
+            routed_messages[0].delivery_status,
+            Some(MessageDeliveryStatus::Sent)
+        ));
+        let session = seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-bob")
+            .expect("missing routed direct session");
+        assert_eq!(session.subtitle, "sent from another device");
+        assert_eq!(session.unread_count, None);
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_routes_self_authored_relay_message_to_matching_group_session() {
+        let current_user_pubkey = valid_sender_pubkey_hex();
+        let bob_pubkey = valid_group_member_pubkey_hex();
+        let carol_pubkey =
+            valid_pubkey_hex("4444444444444444444444444444444444444444444444444444444444444444");
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts.push(contact("bob-contact", &bob_pubkey));
+        seed.contacts.push(contact("carol-contact", &carol_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions
+            .push(group_session("session-design", "circle-1", "Design Circle"));
+        seed.groups.push(group_profile(
+            "session-design",
+            &["bob-contact", "carol-contact"],
+        ));
+        let mut inbound_message = inbound_relay_message(
+            "relay-self-group-1",
+            &current_user_pubkey,
+            "group update from my laptop",
+        );
+        inbound_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .tags = vec![vec!["p".into(), bob_pubkey], vec!["p".into(), carol_pubkey]];
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_message],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(
+            &mut seed,
+            &chat_effects,
+            Some(current_user_pubkey.as_str()),
+        )
+        .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("session-design")
+            .expect("matching group session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-self-group-1");
+        assert!(matches!(routed_messages[0].author, MessageAuthor::Me));
+        let session = seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-design")
+            .expect("missing routed group session");
+        assert_eq!(session.subtitle, "group update from my laptop");
+        assert_eq!(session.unread_count, None);
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_routes_self_authored_relay_message_to_self_chat_session() {
+        let current_user_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions
+            .push(self_session("self-circle-1", "circle-1"));
+        let inbound_message = inbound_relay_message(
+            "relay-self-note-1",
+            &current_user_pubkey,
+            "note to self from another device",
+        );
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_message],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(
+            &mut seed,
+            &chat_effects,
+            Some(current_user_pubkey.as_str()),
+        )
+        .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("self-circle-1")
+            .expect("self session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-self-note-1");
+        assert!(matches!(routed_messages[0].author, MessageAuthor::Me));
+        let session = seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "self-circle-1")
+            .expect("missing self session");
+        assert_eq!(session.subtitle, "note to self from another device");
+        assert_eq!(session.unread_count, None);
+    }
+
+    #[test]
+    fn apply_transport_chat_effects_prefers_existing_message_session_over_self_chat_fallback() {
+        let current_user_pubkey = valid_sender_pubkey_hex();
+        let bob_pubkey = valid_group_member_pubkey_hex();
+        let carol_pubkey =
+            valid_pubkey_hex("4444444444444444444444444444444444444444444444444444444444444444");
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts.push(contact("bob-contact", &bob_pubkey));
+        seed.contacts.push(contact("carol-contact", &carol_pubkey));
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        seed.sessions
+            .push(group_session("session-design", "circle-1", "Design Circle"));
+        seed.sessions
+            .push(self_session("self-circle-1", "circle-1"));
+        seed.groups.push(group_profile(
+            "session-design",
+            &["bob-contact", "carol-contact"],
+        ));
+        seed.message_store.insert(
+            "session-design".into(),
+            vec![signed_text_message(
+                "local-group-message",
+                Some(MessageDeliveryStatus::Sending),
+                "relay-existing-group-event",
+            )],
+        );
+        let inbound_message = inbound_relay_message(
+            "relay-existing-group-event",
+            &current_user_pubkey,
+            "group replay without tags",
+        );
+        let chat_effects = TransportChatEffects {
+            remote_message_merges: vec![MergeRemoteMessagesInput {
+                session_id: "session-primary".into(),
+                messages: vec![inbound_message],
+            }],
+            ..TransportChatEffects::default()
+        };
+
+        let changed = apply_transport_chat_effects(
+            &mut seed,
+            &chat_effects,
+            Some(current_user_pubkey.as_str()),
+        )
+        .expect("chat effects apply");
+
+        assert!(changed);
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+        assert!(seed
+            .message_store
+            .get("self-circle-1")
+            .map_or(true, |messages| messages.is_empty()));
+        let routed_messages = seed
+            .message_store
+            .get("session-design")
+            .expect("existing message should stay in its original session");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "local-group-message");
+        assert_eq!(
+            routed_messages[0].remote_id.as_deref(),
+            Some("relay-existing-group-event")
+        );
+        assert!(matches!(routed_messages[0].author, MessageAuthor::Me));
+        assert!(matches!(
+            routed_messages[0].sync_source,
+            Some(MessageSyncSource::Local)
+        ));
+    }
+
+    #[test]
     fn apply_circle_action_applies_sync_session_chat_effects_and_rebuilds_snapshot() {
         let guard = test_app();
         let service = LocalTransportService::new(guard.app.handle());
@@ -910,6 +2854,7 @@ mod tests {
                 active_circle_id: Some("main-circle".into()),
                 use_tor_network: false,
                 experimental_transport: false,
+                sync_since_created_at: None,
             })
             .expect("sync sessions action should succeed");
 

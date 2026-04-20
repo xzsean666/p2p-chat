@@ -1,11 +1,13 @@
 use crate::domain::transport::{
     DiscoveredPeer, PeerPresence, SessionSyncItem, SessionSyncState, TransportActivityItem,
-    TransportActivityKind, TransportActivityLevel, TransportRuntimeAdapterKind,
-    TransportRuntimeDesiredState, TransportRuntimeLaunchResult, TransportRuntimeLaunchStatus,
-    TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry,
-    TransportRuntimeSession, TransportRuntimeState,
+    TransportActivityKind, TransportActivityLevel, TransportOutboundDispatch,
+    TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchResult,
+    TransportRuntimeLaunchStatus, TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy,
+    TransportRuntimeRegistryEntry, TransportRuntimeSession, TransportRuntimeState,
 };
-use crate::domain::transport_repository::{TransportCache, TransportRepository};
+use crate::domain::transport_repository::{
+    TransportCache, TransportRelaySyncCursor, TransportRepository,
+};
 use crate::domain::transport_runtime_registry::{
     infer_runtime_registry_entry_from_legacy_session, project_runtime_session,
 };
@@ -78,6 +80,23 @@ impl<R: Runtime> SqliteTransportRepository<R> {
               title TEXT NOT NULL,
               detail TEXT NOT NULL,
               time TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS transport_outbound_dispatch (
+              circle_id TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              message_id TEXT NOT NULL,
+              remote_id TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              runtime_generation INTEGER NOT NULL DEFAULT 0,
+              request_id TEXT NOT NULL,
+              dispatched_at TEXT NOT NULL,
+              PRIMARY KEY (circle_id, message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS transport_relay_sync_cursor (
+              circle_id TEXT PRIMARY KEY,
+              last_created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS transport_runtime_session (
@@ -306,6 +325,12 @@ impl<R: Runtime> SqliteTransportRepository<R> {
             "last_failure_at",
             "TEXT",
         )?;
+        ensure_table_column(
+            conn,
+            "transport_outbound_dispatch",
+            "runtime_generation",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         Ok(())
     }
@@ -387,6 +412,50 @@ impl<R: Runtime> TransportRepository for SqliteTransportRepository<R> {
                 })
                 .map_err(|error| error.to_string())?;
             let activities = activity_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+
+            let mut outbound_dispatch_stmt = conn
+                .prepare(
+                    "SELECT circle_id, session_id, message_id, remote_id, event_id, runtime_generation, request_id, dispatched_at FROM transport_outbound_dispatch ORDER BY rowid ASC",
+                )
+                .map_err(|error| error.to_string())?;
+            let outbound_dispatch_rows = outbound_dispatch_stmt
+                .query_map([], |row| {
+                    Ok(TransportOutboundDispatch {
+                        circle_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        message_id: row.get(2)?,
+                        remote_id: row.get(3)?,
+                        event_id: row.get(4)?,
+                        runtime_generation: row
+                            .get::<_, i64>(5)
+                            .and_then(|value| i64_to_u32(value).map_err(sqlite_user_error))?,
+                        request_id: row.get(6)?,
+                        dispatched_at: row.get(7)?,
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            let outbound_dispatches = outbound_dispatch_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+
+            let mut relay_sync_cursor_stmt = conn
+                .prepare(
+                    "SELECT circle_id, last_created_at FROM transport_relay_sync_cursor ORDER BY rowid ASC",
+                )
+                .map_err(|error| error.to_string())?;
+            let relay_sync_cursor_rows = relay_sync_cursor_stmt
+                .query_map([], |row| {
+                    Ok(TransportRelaySyncCursor {
+                        circle_id: row.get(0)?,
+                        last_created_at: row
+                            .get::<_, i64>(1)
+                            .and_then(|value| i64_to_u64(value).map_err(sqlite_user_error))?,
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            let relay_sync_cursors = relay_sync_cursor_rows
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
 
@@ -555,6 +624,8 @@ impl<R: Runtime> TransportRepository for SqliteTransportRepository<R> {
                 peers,
                 session_sync,
                 activities,
+                outbound_dispatches,
+                relay_sync_cursors,
                 runtime_registry,
                 runtime_sessions,
             })
@@ -567,6 +638,8 @@ impl<R: Runtime> TransportRepository for SqliteTransportRepository<R> {
             tx.execute_batch(
                 r#"
                 DELETE FROM transport_activity;
+                DELETE FROM transport_outbound_dispatch;
+                DELETE FROM transport_relay_sync_cursor;
                 DELETE FROM transport_runtime_registry;
                 DELETE FROM transport_runtime_session;
                 DELETE FROM transport_session_sync;
@@ -622,6 +695,31 @@ impl<R: Runtime> TransportRepository for SqliteTransportRepository<R> {
                         item.detail,
                         item.time,
                     ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+
+            for item in cache.outbound_dispatches {
+                tx.execute(
+                    "INSERT INTO transport_outbound_dispatch (circle_id, session_id, message_id, remote_id, event_id, runtime_generation, request_id, dispatched_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        item.circle_id,
+                        item.session_id,
+                        item.message_id,
+                        item.remote_id,
+                        item.event_id,
+                        i64::from(item.runtime_generation),
+                        item.request_id,
+                        item.dispatched_at,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+
+            for item in cache.relay_sync_cursors {
+                tx.execute(
+                    "INSERT INTO transport_relay_sync_cursor (circle_id, last_created_at) VALUES (?1, ?2)",
+                    params![item.circle_id, item.last_created_at as i64],
                 )
                 .map_err(|error| error.to_string())?;
             }

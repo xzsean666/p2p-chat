@@ -2,6 +2,7 @@ use crate::domain::chat::{
     ChatDomainSeed, CircleItem, ContactItem, GroupProfile, MessageAuthor, MessageDeliveryStatus,
     MessageItem, MessageKind, MessageSyncSource, RemoteDeliveryReceipt, SessionItem,
 };
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
@@ -130,28 +131,29 @@ pub fn build_remote_message_merge_change_set(
         })
         .collect::<HashSet<_>>();
     let mut new_peer_message_count = 0u32;
-    let mut has_new_non_local_message = false;
+    let mut latest_remote_activity_message = None;
     let mut normalized_messages = Vec::with_capacity(messages.len());
 
     for message in messages {
-        let normalized_message = normalize_remote_message(message);
+        let mut normalized_message = normalize_remote_message(message);
+        hydrate_remote_message_reply_to(seed, &normalized_messages, &mut normalized_message);
         let is_known_id = seen_message_ids.contains(&normalized_message.id);
         let is_known_remote_id = normalized_message
             .remote_id
             .as_ref()
             .is_some_and(|remote_id| seen_remote_ids.contains(remote_id));
+        let is_new_message = !is_known_id && !is_known_remote_id;
 
-        if !is_known_id
-            && !is_known_remote_id
-            && matches!(normalized_message.author, MessageAuthor::Peer)
-        {
+        if is_new_message && matches!(normalized_message.author, MessageAuthor::Peer) {
             new_peer_message_count = new_peer_message_count.saturating_add(1);
         }
-        if !is_known_id
-            && !is_known_remote_id
-            && !matches!(normalized_message.author, MessageAuthor::Me)
-        {
-            has_new_non_local_message = true;
+        if is_new_message && message_counts_as_remote_session_activity(&normalized_message) {
+            if should_replace_latest_remote_activity_message(
+                latest_remote_activity_message.as_ref(),
+                &normalized_message,
+            ) {
+                latest_remote_activity_message = Some(normalized_message.clone());
+            }
         }
 
         seen_message_ids.insert(normalized_message.id.clone());
@@ -161,10 +163,6 @@ pub fn build_remote_message_merge_change_set(
         normalized_messages.push(normalized_message);
     }
 
-    let latest_message = normalized_messages
-        .last()
-        .cloned()
-        .ok_or_else(|| "missing latest remote message".to_string())?;
     let has_peer_message = normalized_messages
         .iter()
         .any(|message| matches!(message.author, MessageAuthor::Peer));
@@ -176,7 +174,7 @@ pub fn build_remote_message_merge_change_set(
         ..Default::default()
     };
 
-    if has_new_non_local_message {
+    if let Some(latest_message) = latest_remote_activity_message {
         session.subtitle = message_preview_text(&latest_message);
         session.time = latest_message.time.clone();
         session.unread_count = match session.unread_count {
@@ -210,6 +208,36 @@ pub fn build_remote_message_merge_change_set(
     }
 
     Ok(change_set)
+}
+
+fn message_counts_as_remote_session_activity(message: &MessageItem) -> bool {
+    !matches!(message.author, MessageAuthor::Me)
+        || matches!(message.sync_source, Some(MessageSyncSource::Relay))
+}
+
+fn should_replace_latest_remote_activity_message(
+    current: Option<&MessageItem>,
+    candidate: &MessageItem,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    match (
+        current
+            .signed_nostr_event
+            .as_ref()
+            .map(|event| event.created_at),
+        candidate
+            .signed_nostr_event
+            .as_ref()
+            .map(|event| event.created_at),
+    ) {
+        (Some(current_created_at), Some(candidate_created_at)) => {
+            candidate_created_at >= current_created_at
+        }
+        _ => true,
+    }
 }
 
 pub fn build_remote_delivery_receipt_change_set(
@@ -327,6 +355,19 @@ pub(crate) fn merge_message_records(existing: MessageItem, incoming: MessageItem
     let preserve_existing_id = existing.id != incoming.id
         && existing.remote_id.is_some()
         && existing.remote_id == incoming.remote_id;
+    let preserve_existing_author = preserve_existing_id
+        && !matches!(&existing.author, MessageAuthor::Peer)
+        && matches!(&incoming.author, MessageAuthor::Peer);
+    let preserve_existing_sync_source = preserve_existing_id
+        && matches!(
+            existing.sync_source.as_ref(),
+            Some(MessageSyncSource::Local)
+        )
+        && matches!(
+            incoming.sync_source.as_ref(),
+            Some(MessageSyncSource::Relay)
+        );
+    let merged_meta = merge_message_meta(&incoming.kind, existing.meta.clone(), incoming.meta.clone());
 
     MessageItem {
         id: if preserve_existing_id {
@@ -335,7 +376,11 @@ pub(crate) fn merge_message_records(existing: MessageItem, incoming: MessageItem
             incoming.id
         },
         kind: incoming.kind,
-        author: incoming.author,
+        author: if preserve_existing_author {
+            existing.author
+        } else {
+            incoming.author
+        },
         body: if incoming.body.is_empty() {
             existing.body
         } else {
@@ -346,12 +391,212 @@ pub(crate) fn merge_message_records(existing: MessageItem, incoming: MessageItem
         } else {
             incoming.time
         },
-        meta: incoming.meta.or(existing.meta),
+        meta: merged_meta,
         delivery_status: incoming.delivery_status.or(existing.delivery_status),
         remote_id: incoming.remote_id.or(existing.remote_id),
-        sync_source: incoming.sync_source.or(existing.sync_source),
+        sync_source: if preserve_existing_sync_source {
+            existing.sync_source.or(incoming.sync_source)
+        } else {
+            incoming.sync_source.or(existing.sync_source)
+        },
         acked_at: incoming.acked_at.or(existing.acked_at),
+        signed_nostr_event: incoming.signed_nostr_event.or(existing.signed_nostr_event),
+        reply_to: incoming.reply_to.or(existing.reply_to),
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NormalizedMediaMeta {
+    label: String,
+    preview_data_url: Option<String>,
+    local_path: Option<String>,
+    remote_url: Option<String>,
+}
+
+pub(crate) fn merge_message_meta(
+    kind: &MessageKind,
+    existing: Option<String>,
+    incoming: Option<String>,
+) -> Option<String> {
+    match kind {
+        MessageKind::File | MessageKind::Image | MessageKind::Video => {
+            merge_structured_media_message_meta(kind, existing.as_deref(), incoming.as_deref())
+                .or(incoming)
+                .or(existing)
+        }
+        _ => incoming.or(existing),
+    }
+}
+
+fn merge_structured_media_message_meta(
+    kind: &MessageKind,
+    existing: Option<&str>,
+    incoming: Option<&str>,
+) -> Option<String> {
+    let existing_meta = existing.and_then(|value| decode_structured_media_meta(kind, value));
+    let incoming_meta = incoming.and_then(|value| decode_structured_media_meta(kind, value));
+    if existing_meta.is_none() && incoming_meta.is_none() {
+        return None;
+    }
+
+    let merged = NormalizedMediaMeta {
+        label: incoming_meta
+            .as_ref()
+            .map(|meta| meta.label.clone())
+            .or_else(|| existing_meta.as_ref().map(|meta| meta.label.clone()))
+            .unwrap_or_default(),
+        preview_data_url: incoming_meta
+            .as_ref()
+            .and_then(|meta| meta.preview_data_url.clone())
+            .or_else(|| existing_meta.as_ref().and_then(|meta| meta.preview_data_url.clone())),
+        local_path: incoming_meta
+            .as_ref()
+            .and_then(|meta| meta.local_path.clone())
+            .or_else(|| existing_meta.as_ref().and_then(|meta| meta.local_path.clone())),
+        remote_url: incoming_meta
+            .as_ref()
+            .and_then(|meta| meta.remote_url.clone())
+            .or_else(|| existing_meta.as_ref().and_then(|meta| meta.remote_url.clone())),
+    };
+
+    encode_structured_media_meta(kind, merged)
+}
+
+pub(crate) fn message_media_local_path(message: &MessageItem) -> Option<String> {
+    decode_structured_media_meta(&message.kind, message.meta.as_deref()?)?.local_path
+}
+
+pub(crate) fn message_media_remote_url(message: &MessageItem) -> Option<String> {
+    decode_structured_media_meta(&message.kind, message.meta.as_deref()?)?.remote_url
+}
+
+pub(crate) fn message_media_meta_with_local_path(
+    message: &MessageItem,
+    local_path: String,
+) -> Option<String> {
+    let mut meta = decode_structured_media_meta(&message.kind, message.meta.as_deref()?)?;
+    meta.local_path = Some(local_path);
+    encode_structured_media_meta(&message.kind, meta)
+}
+
+fn decode_structured_media_meta(kind: &MessageKind, value: &str) -> Option<NormalizedMediaMeta> {
+    let parsed = serde_json::from_str::<JsonValue>(value).ok()?;
+    let version = parsed.get("version")?.as_u64()?;
+    let label = json_non_empty_string(&parsed, "label")?;
+
+    match kind {
+        MessageKind::File => {
+            if !matches!(version, 1 | 2) {
+                return None;
+            }
+
+            let local_path = json_non_empty_string(&parsed, "localPath");
+            let remote_url = json_non_empty_string(&parsed, "remoteUrl");
+            if local_path.is_none() && remote_url.is_none() {
+                return None;
+            }
+
+            Some(NormalizedMediaMeta {
+                label,
+                local_path,
+                remote_url,
+                ..Default::default()
+            })
+        }
+        MessageKind::Image | MessageKind::Video => match version {
+            1 => Some(NormalizedMediaMeta {
+                label,
+                preview_data_url: json_non_empty_string(&parsed, "previewDataUrl"),
+                ..Default::default()
+            })
+            .filter(|meta| meta.preview_data_url.is_some()),
+            2 => Some(NormalizedMediaMeta {
+                label,
+                local_path: json_non_empty_string(&parsed, "localPath"),
+                ..Default::default()
+            })
+            .filter(|meta| meta.local_path.is_some()),
+            3 => {
+                let local_path = json_non_empty_string(&parsed, "localPath");
+                let remote_url = json_non_empty_string(&parsed, "remoteUrl");
+                if local_path.is_none() && remote_url.is_none() {
+                    return None;
+                }
+
+                Some(NormalizedMediaMeta {
+                    label,
+                    local_path,
+                    remote_url,
+                    ..Default::default()
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn encode_structured_media_meta(kind: &MessageKind, meta: NormalizedMediaMeta) -> Option<String> {
+    if meta.label.trim().is_empty() {
+        return None;
+    }
+
+    match kind {
+        MessageKind::File => {
+            let version = if meta.remote_url.is_some() || meta.local_path.is_none() {
+                2
+            } else {
+                1
+            };
+            let mut payload = JsonMap::new();
+            payload.insert("version".into(), JsonValue::from(version));
+            payload.insert("label".into(), JsonValue::from(meta.label));
+            if let Some(local_path) = meta.local_path {
+                payload.insert("localPath".into(), JsonValue::from(local_path));
+            }
+            if let Some(remote_url) = meta.remote_url {
+                payload.insert("remoteUrl".into(), JsonValue::from(remote_url));
+            }
+            Some(JsonValue::Object(payload).to_string())
+        }
+        MessageKind::Image | MessageKind::Video => {
+            if meta.local_path.is_some() || meta.remote_url.is_some() {
+                let version = if meta.remote_url.is_some() || meta.local_path.is_none() {
+                    3
+                } else {
+                    2
+                };
+                let mut payload = JsonMap::new();
+                payload.insert("version".into(), JsonValue::from(version));
+                payload.insert("label".into(), JsonValue::from(meta.label));
+                if let Some(local_path) = meta.local_path {
+                    payload.insert("localPath".into(), JsonValue::from(local_path));
+                }
+                if let Some(remote_url) = meta.remote_url {
+                    payload.insert("remoteUrl".into(), JsonValue::from(remote_url));
+                }
+                return Some(JsonValue::Object(payload).to_string());
+            }
+
+            meta.preview_data_url.map(|preview_data_url| {
+                let mut payload = JsonMap::new();
+                payload.insert("version".into(), JsonValue::from(1));
+                payload.insert("label".into(), JsonValue::from(meta.label));
+                payload.insert("previewDataUrl".into(), JsonValue::from(preview_data_url));
+                JsonValue::Object(payload).to_string()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn json_non_empty_string(parsed: &JsonValue, key: &str) -> Option<String> {
+    parsed
+        .get(key)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn normalize_remote_message(mut message: MessageItem) -> MessageItem {
@@ -373,12 +618,123 @@ fn normalize_remote_message(mut message: MessageItem) -> MessageItem {
 fn message_preview_text(message: &MessageItem) -> String {
     match message.kind {
         MessageKind::System | MessageKind::Text => message.body.clone(),
+        MessageKind::Image => format!("Shared image: {}", message.body),
+        MessageKind::Video => format!("Shared video: {}", message.body),
         MessageKind::File => format!("Shared file: {}", message.body),
         MessageKind::Audio => {
             let label = message.meta.as_deref().unwrap_or("Voice note");
             format!("Audio: {label}")
         }
     }
+}
+
+fn message_reply_preview_text(message: &MessageItem) -> String {
+    let preview = message_preview_text(message);
+    let trimmed = preview.trim();
+    if trimmed.is_empty() {
+        return "Empty message".into();
+    }
+
+    const MAX_REPLY_SNIPPET_CHARS: usize = 96;
+    let snippet = trimmed
+        .chars()
+        .take(MAX_REPLY_SNIPPET_CHARS)
+        .collect::<String>();
+    if trimmed.chars().count() > MAX_REPLY_SNIPPET_CHARS {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
+}
+
+fn default_reply_author_label(author: &MessageAuthor) -> &'static str {
+    match author {
+        MessageAuthor::Me => "You",
+        MessageAuthor::Peer => "Peer",
+        MessageAuthor::System => "System",
+    }
+}
+
+pub(crate) fn build_message_reply_preview(
+    message: &MessageItem,
+) -> crate::domain::chat::MessageReplyPreview {
+    crate::domain::chat::MessageReplyPreview {
+        message_id: message.id.clone(),
+        remote_id: message.remote_id.clone().or_else(|| {
+            message
+                .signed_nostr_event
+                .as_ref()
+                .map(|event| event.event_id.clone())
+        }),
+        author: message.author.clone(),
+        author_label: default_reply_author_label(&message.author).into(),
+        kind: message.kind.clone(),
+        snippet: message_reply_preview_text(message),
+    }
+}
+
+fn unresolved_message_reply_preview(
+    reply_reference_id: &str,
+) -> crate::domain::chat::MessageReplyPreview {
+    crate::domain::chat::MessageReplyPreview {
+        message_id: reply_reference_id.into(),
+        remote_id: Some(reply_reference_id.into()),
+        author: MessageAuthor::System,
+        author_label: "Quoted message".into(),
+        kind: MessageKind::Text,
+        snippet: "Referenced message".into(),
+    }
+}
+
+fn reply_reference_id_from_tags(message: &MessageItem) -> Option<String> {
+    message.signed_nostr_event.as_ref().and_then(|event| {
+        event
+            .tags
+            .iter()
+            .find_map(|tag| match tag.first().map(String::as_str) {
+                Some("e") => tag.get(1).cloned(),
+                _ => None,
+            })
+    })
+}
+
+fn hydrate_remote_message_reply_to(
+    seed: &ChatDomainSeed,
+    pending_messages: &[MessageItem],
+    message: &mut MessageItem,
+) {
+    if message.reply_to.is_some() {
+        return;
+    }
+
+    let Some(reply_reference_id) = reply_reference_id_from_tags(message) else {
+        return;
+    };
+
+    if let Some(existing_message) = pending_messages
+        .iter()
+        .find(|candidate| message_matches_reply_reference(candidate, &reply_reference_id))
+        .or_else(|| {
+            seed.message_store
+                .values()
+                .flat_map(|messages| messages.iter())
+                .find(|candidate| message_matches_reply_reference(candidate, &reply_reference_id))
+        })
+    {
+        message.reply_to = Some(build_message_reply_preview(existing_message));
+        return;
+    }
+
+    message.reply_to = Some(unresolved_message_reply_preview(&reply_reference_id));
+}
+
+fn message_matches_reply_reference(message: &MessageItem, reply_reference_id: &str) -> bool {
+    message.id == reply_reference_id
+        || message.remote_id.as_deref() == Some(reply_reference_id)
+        || message
+            .signed_nostr_event
+            .as_ref()
+            .is_some_and(|event| event.event_id == reply_reference_id)
 }
 
 fn merge_delivery_receipt(mut message: MessageItem, receipt: RemoteDeliveryReceipt) -> MessageItem {
@@ -440,5 +796,112 @@ fn upsert_with_position<T: Clone>(
         None => {
             items.push(upsert.item);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value as JsonValue;
+
+    fn test_message(kind: MessageKind, meta: Option<&str>) -> MessageItem {
+        MessageItem {
+            id: "message-1".into(),
+            kind,
+            author: MessageAuthor::Me,
+            body: "media-body".into(),
+            time: "09:41".into(),
+            meta: meta.map(str::to_string),
+            delivery_status: None,
+            remote_id: Some("relay:message-1".into()),
+            sync_source: Some(MessageSyncSource::Local),
+            acked_at: None,
+            signed_nostr_event: None,
+            reply_to: None,
+        }
+    }
+
+    fn assert_json_meta_eq(actual: Option<&str>, expected: &str) {
+        let actual_value = actual
+            .map(|value| serde_json::from_str::<JsonValue>(value).expect("actual json should parse"));
+        let expected_value =
+            serde_json::from_str::<JsonValue>(expected).expect("expected json should parse");
+        assert_eq!(actual_value, Some(expected_value));
+    }
+
+    #[test]
+    fn merge_message_records_keeps_local_image_path_and_adds_remote_url() {
+        let existing = test_message(
+            MessageKind::Image,
+            Some(
+                r#"{"version":2,"label":"PNG · 84 KB","localPath":"/tmp/chat-media/images/local.png"}"#,
+            ),
+        );
+        let incoming = MessageItem {
+            author: MessageAuthor::Peer,
+            sync_source: Some(MessageSyncSource::Relay),
+            meta: Some(
+                r#"{"version":3,"label":"PNG · CDN copy","remoteUrl":"https://cdn.example.test/chat-media/local.png"}"#
+                    .into(),
+            ),
+            ..test_message(MessageKind::Image, None)
+        };
+
+        let merged = merge_message_records(existing, incoming);
+
+        assert_json_meta_eq(
+            merged.meta.as_deref(),
+            r#"{"version":3,"label":"PNG · CDN copy","localPath":"/tmp/chat-media/images/local.png","remoteUrl":"https://cdn.example.test/chat-media/local.png"}"#,
+        );
+    }
+
+    #[test]
+    fn merge_message_records_keeps_remote_video_url_when_local_cache_arrives() {
+        let existing = test_message(
+            MessageKind::Video,
+            Some(
+                r#"{"version":3,"label":"MP4 · Remote","remoteUrl":"https://cdn.example.test/chat-media/clip.mp4"}"#,
+            ),
+        );
+        let incoming = MessageItem {
+            meta: Some(
+                r#"{"version":2,"label":"MP4 · Downloaded","localPath":"/tmp/chat-media/videos/clip.mp4"}"#
+                    .into(),
+            ),
+            ..test_message(MessageKind::Video, None)
+        };
+
+        let merged = merge_message_records(existing, incoming);
+
+        assert_json_meta_eq(
+            merged.meta.as_deref(),
+            r#"{"version":3,"label":"MP4 · Downloaded","localPath":"/tmp/chat-media/videos/clip.mp4","remoteUrl":"https://cdn.example.test/chat-media/clip.mp4"}"#,
+        );
+    }
+
+    #[test]
+    fn merge_message_records_promotes_file_meta_to_remote_capable_shape() {
+        let existing = test_message(
+            MessageKind::File,
+            Some(
+                r#"{"version":1,"label":"PDF · 2.4 MB","localPath":"/tmp/chat-media/files/contract.pdf"}"#,
+            ),
+        );
+        let incoming = MessageItem {
+            author: MessageAuthor::Peer,
+            sync_source: Some(MessageSyncSource::Relay),
+            meta: Some(
+                r#"{"version":2,"label":"PDF · shared","remoteUrl":"https://cdn.example.test/chat-media/contract.pdf"}"#
+                    .into(),
+            ),
+            ..test_message(MessageKind::File, None)
+        };
+
+        let merged = merge_message_records(existing, incoming);
+
+        assert_json_meta_eq(
+            merged.meta.as_deref(),
+            r#"{"version":2,"label":"PDF · shared","localPath":"/tmp/chat-media/files/contract.pdf","remoteUrl":"https://cdn.example.test/chat-media/contract.pdf"}"#,
+        );
     }
 }

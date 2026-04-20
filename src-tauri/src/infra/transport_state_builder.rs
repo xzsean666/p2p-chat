@@ -130,6 +130,8 @@ fn build_transport_cache(
         peers,
         session_sync,
         activities,
+        outbound_dispatches: previous_cache.outbound_dispatches.clone(),
+        relay_sync_cursors: previous_cache.relay_sync_cursors.clone(),
         runtime_registry: Vec::new(),
         runtime_sessions: Vec::new(),
     }
@@ -580,6 +582,8 @@ fn build_session_sync_chat_effects(
             remote_id: None,
             sync_source: Some(MessageSyncSource::System),
             acked_at: None,
+            signed_nostr_event: None,
+            reply_to: None,
         };
 
         if let Some(batch) = remote_message_merges
@@ -647,6 +651,8 @@ fn build_sync_peer_message(seed: &ChatDomainSeed, session_id: &str, is_group: bo
         remote_id: Some(unique_remote_peer_message_id(session_id)),
         sync_source: Some(MessageSyncSource::Relay),
         acked_at: None,
+        signed_nostr_event: None,
+        reply_to: None,
     }
 }
 

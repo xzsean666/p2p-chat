@@ -16,6 +16,7 @@ const props = defineProps<{
   user: UserProfile;
   circles: CircleItem[];
   activeCircleId: string;
+  restorableCount: number;
   sections: SettingSection[];
   phase?: string;
   showLogout?: boolean;
@@ -25,6 +26,7 @@ const emit = defineEmits<{
   (event: "update:visible", value: boolean): void;
   (event: "select-circle", circleId: string): void;
   (event: "join-circle"): void;
+  (event: "open-restore"): void;
   (event: "open-circle-detail", circleId: string): void;
   (event: "item-click", itemId: SettingPageId): void;
   (event: "logout"): void;
@@ -33,6 +35,16 @@ const emit = defineEmits<{
 const drawerVisible = computed({
   get: () => props.visible,
   set: (value: boolean) => emit("update:visible", value),
+});
+
+const circleEmptyTitle = computed(() => {
+  return props.restorableCount > 0 ? "Add or Restore Circle" : "Join a Circle";
+});
+
+const circleEmptyCopy = computed(() => {
+  return props.restorableCount > 0
+    ? "No active circle is mounted in this shell. Join a new one or reopen a saved entry from the local restore catalog."
+    : "No circles are mounted in this shell yet. Join a circle before starting chats.";
 });
 </script>
 
@@ -62,41 +74,64 @@ const drawerVisible = computed({
 
       <section class="drawer-section">
         <p class="section-title">Circles</p>
-        <div
-          v-for="circle in circles"
-          :key="circle.id"
-          :class="['circle-row-shell', { active: circle.id === activeCircleId }]"
-        >
-          <button type="button" class="drawer-row circle-row-main" @click="emit('select-circle', circle.id)">
-            <Avatar :label="circle.name.slice(0, 1)" shape="circle" class="circle-avatar" />
-            <div class="row-copy">
-              <strong>{{ circle.name }}</strong>
-              <span>{{ circle.relay }}</span>
-            </div>
-            <i
-              v-if="circle.id === activeCircleId"
-              class="pi pi-check-circle active-check"
-            ></i>
-          </button>
+        <template v-if="circles.length">
+          <div
+            v-for="circle in circles"
+            :key="circle.id"
+            :class="['circle-row-shell', { active: circle.id === activeCircleId }]"
+          >
+            <button type="button" class="drawer-row circle-row-main" @click="emit('select-circle', circle.id)">
+              <Avatar :label="circle.name.slice(0, 1)" shape="circle" class="circle-avatar" />
+              <div class="row-copy">
+                <strong>{{ circle.name }}</strong>
+                <span>{{ circle.relay }}</span>
+              </div>
+              <i
+                v-if="circle.id === activeCircleId"
+                class="pi pi-check-circle active-check"
+              ></i>
+            </button>
 
-          <Button
-            icon="pi pi-info-circle"
-            text
+            <Button
+              icon="pi pi-info-circle"
+              text
+              rounded
+              severity="secondary"
+              class="detail-button"
+              @click="emit('open-circle-detail', circle.id)"
+            />
+          </div>
+        </template>
+        <div v-else class="circle-empty-state">
+          <strong>{{ circleEmptyTitle }}</strong>
+          <p>{{ circleEmptyCopy }}</p>
+          <Tag
+            v-if="restorableCount > 0"
+            :value="`${restorableCount} restore entries`"
+            severity="warn"
             rounded
-            severity="secondary"
-            class="detail-button"
-            @click="emit('open-circle-detail', circle.id)"
           />
         </div>
 
-        <Button
-          icon="pi pi-plus"
-          label="Add a Circle"
-          text
-          severity="contrast"
-          class="join-button"
-          @click="emit('join-circle')"
-        />
+        <div class="circle-actions">
+          <Button
+            :icon="circles.length ? 'pi pi-plus' : 'pi pi-compass'"
+            :label="circles.length ? 'Add a Circle' : 'Join Circle'"
+            text
+            severity="contrast"
+            class="join-button"
+            @click="emit('join-circle')"
+          />
+          <Button
+            v-if="restorableCount > 0"
+            icon="pi pi-refresh"
+            label="Restore Access"
+            text
+            severity="secondary"
+            class="join-button"
+            @click="emit('open-restore')"
+          />
+        </div>
       </section>
 
       <section
@@ -196,6 +231,14 @@ const drawerVisible = computed({
   gap: 8px;
 }
 
+.circle-empty-state {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 18px;
+  background: var(--shell-surface-soft);
+}
+
 .section-title {
   color: var(--shell-text-muted);
   text-transform: uppercase;
@@ -259,9 +302,25 @@ const drawerVisible = computed({
   align-self: stretch;
 }
 
+.circle-actions {
+  display: grid;
+  gap: 4px;
+}
+
 .row-chevron {
   margin-left: auto;
   color: #8a9ab0;
+}
+
+.circle-empty-state strong,
+.circle-empty-state p {
+  margin: 0;
+}
+
+.circle-empty-state p {
+  color: var(--shell-text-muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
 }
 
 .join-button {

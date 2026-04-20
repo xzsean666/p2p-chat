@@ -1,12 +1,20 @@
 import type {
   AdvancedPreferences,
+  AuthRuntimeBindingSummary,
+  AuthRuntimeSummary,
   AuthSessionSummary,
   AppPreferences,
   NotificationPreferences,
   PersistedShellState,
+  RestorableCircleEntry,
   UserProfile,
 } from "../types/chat";
 import { defaultUserProfile } from "../data/shellDefaults";
+import {
+  deriveAuthRuntimeFromAuthSession,
+  resolveAuthRuntimeCanSendMessages,
+  resolveAuthRuntimeSendBlockedReason,
+} from "./authRuntime";
 
 const LOCAL_STORAGE_KEY = "p2p-chat.shell-state";
 
@@ -153,6 +161,10 @@ function normalizeAuthSession(
     typeof value.access?.label === "string" && value.access.label.trim()
       ? value.access.label
       : null;
+  const accessPubkey =
+    typeof value.access?.pubkey === "string" && value.access.pubkey.trim()
+      ? value.access.pubkey.trim()
+      : undefined;
   const loggedInAt =
     typeof value.loggedInAt === "string" && value.loggedInAt.trim()
       ? value.loggedInAt
@@ -167,23 +179,188 @@ function normalizeAuthSession(
     access: {
       kind: accessKind,
       label: accessLabel,
+      pubkey: accessPubkey,
     },
     circleSelectionMode,
     loggedInAt,
   };
 }
 
+function normalizeAuthRuntime(
+  value: Partial<AuthRuntimeSummary> | null | undefined,
+): AuthRuntimeSummary | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const state =
+    value.state === "localProfile" ||
+    value.state === "pending" ||
+    value.state === "connected" ||
+    value.state === "failed"
+      ? value.state
+      : null;
+  const loginMethod =
+    value.loginMethod === "quickStart" ||
+    value.loginMethod === "existingAccount" ||
+    value.loginMethod === "signer"
+      ? value.loginMethod
+      : null;
+  const accessKind =
+    value.accessKind === "localProfile" ||
+    value.accessKind === "nsec" ||
+    value.accessKind === "npub" ||
+    value.accessKind === "hexKey" ||
+    value.accessKind === "bunker" ||
+    value.accessKind === "nostrConnect"
+      ? value.accessKind
+      : null;
+  const label = typeof value.label === "string" && value.label.trim() ? value.label : null;
+  const pubkey =
+    typeof value.pubkey === "string" && value.pubkey.trim() ? value.pubkey.trim() : undefined;
+  const canSendMessages =
+    typeof value.canSendMessages === "boolean" ? value.canSendMessages : null;
+  const sendBlockedReason =
+    typeof value.sendBlockedReason === "string" && value.sendBlockedReason.trim()
+      ? value.sendBlockedReason.trim()
+      : undefined;
+  const persistedInNativeStore =
+    typeof value.persistedInNativeStore === "boolean" ? value.persistedInNativeStore : false;
+  const credentialPersistedInNativeStore =
+    typeof value.credentialPersistedInNativeStore === "boolean"
+      ? value.credentialPersistedInNativeStore
+      : false;
+  const updatedAt = typeof value.updatedAt === "string" && value.updatedAt.trim() ? value.updatedAt : null;
+  const error = typeof value.error === "string" && value.error.trim() ? value.error : undefined;
+
+  if (!state || !loginMethod || !accessKind || !label || !updatedAt) {
+    return null;
+  }
+
+  return {
+    state,
+    loginMethod,
+    accessKind,
+    label,
+    pubkey,
+    error,
+    canSendMessages:
+      canSendMessages ??
+      resolveAuthRuntimeCanSendMessages(accessKind, state, error),
+    sendBlockedReason:
+      sendBlockedReason ??
+      resolveAuthRuntimeSendBlockedReason(accessKind, state, error),
+    persistedInNativeStore,
+    credentialPersistedInNativeStore,
+    updatedAt,
+  };
+}
+
+function normalizeAuthRuntimeBinding(
+  value: Partial<AuthRuntimeBindingSummary> | null | undefined,
+): AuthRuntimeBindingSummary | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const accessKind =
+    value.accessKind === "bunker" || value.accessKind === "nostrConnect"
+      ? value.accessKind
+      : null;
+  const endpoint = typeof value.endpoint === "string" && value.endpoint.trim() ? value.endpoint : null;
+  const connectionPubkey =
+    typeof value.connectionPubkey === "string" && value.connectionPubkey.trim()
+      ? value.connectionPubkey.trim()
+      : undefined;
+  const relayCount = typeof value.relayCount === "number" && value.relayCount >= 0
+    ? Math.floor(value.relayCount)
+    : 0;
+  const hasSecret = typeof value.hasSecret === "boolean" ? value.hasSecret : false;
+  const requestedPermissions = Array.isArray(value.requestedPermissions)
+    ? value.requestedPermissions
+        .filter((permission): permission is string => typeof permission === "string")
+        .map((permission) => permission.trim())
+        .filter(Boolean)
+    : [];
+  const clientName =
+    typeof value.clientName === "string" && value.clientName.trim()
+      ? value.clientName.trim()
+      : undefined;
+  const persistedInNativeStore =
+    typeof value.persistedInNativeStore === "boolean" ? value.persistedInNativeStore : null;
+  const updatedAt = typeof value.updatedAt === "string" && value.updatedAt.trim() ? value.updatedAt : null;
+
+  if (!accessKind || !endpoint || persistedInNativeStore === null || !updatedAt) {
+    return null;
+  }
+
+  return {
+    accessKind,
+    endpoint,
+    connectionPubkey,
+    relayCount,
+    hasSecret,
+    requestedPermissions,
+    clientName,
+    persistedInNativeStore,
+    updatedAt,
+  };
+}
+
+function normalizeRestorableCircles(
+  value: Partial<RestorableCircleEntry>[] | null | undefined,
+): RestorableCircleEntry[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      const type =
+        entry?.type === "default" ||
+        entry?.type === "paid" ||
+        entry?.type === "bitchat" ||
+        entry?.type === "custom"
+          ? entry.type
+          : null;
+      const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+      const relay = typeof entry?.relay === "string" ? entry.relay.trim() : "";
+      const description = typeof entry?.description === "string" ? entry.description.trim() : "";
+      const archivedAt = typeof entry?.archivedAt === "string" ? entry.archivedAt.trim() : "";
+
+      if (!type || !name || !relay || !archivedAt) {
+        return null;
+      }
+
+      return {
+        type,
+        name,
+        relay,
+        description,
+        archivedAt,
+      };
+    })
+    .filter((entry): entry is RestorableCircleEntry => !!entry);
+}
+
 function normalizeShellState(
   value: Partial<PersistedShellState> | null | undefined,
   defaults: PersistedShellState,
 ): PersistedShellState {
+  const authSession = normalizeAuthSession(value?.authSession);
+  const authRuntime =
+    normalizeAuthRuntime(value?.authRuntime) ?? deriveAuthRuntimeFromAuthSession(authSession);
+
   return {
     isAuthenticated:
       typeof value?.isAuthenticated === "boolean"
         ? value.isAuthenticated
         : defaults.isAuthenticated,
-    authSession: normalizeAuthSession(value?.authSession),
+    authSession,
+    authRuntime,
+    authRuntimeBinding: normalizeAuthRuntimeBinding(value?.authRuntimeBinding),
     userProfile: normalizeUserProfile(value?.userProfile, defaults.userProfile ?? defaultUserProfile),
+    restorableCircles: normalizeRestorableCircles(value?.restorableCircles),
     circles: Array.isArray(value?.circles) ? cloneState(value.circles) : cloneState(defaults.circles),
     appPreferences: normalizeAppPreferences(value?.appPreferences, defaults.appPreferences),
     notificationPreferences: normalizeNotificationPreferences(

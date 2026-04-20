@@ -109,6 +109,7 @@ mod tests {
                     active_circle_id: Some("circle-1".into()),
                     use_tor_network: false,
                     experimental_transport: false,
+                    sync_since_created_at: None,
                 },
             )
             .expect("sync sessions should succeed");

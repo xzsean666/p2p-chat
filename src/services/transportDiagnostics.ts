@@ -29,6 +29,15 @@ function cloneState<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function hasTauriRuntime() {
+  const globalWindow = globalThis as typeof globalThis & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  };
+
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in globalWindow || "__TAURI__" in globalWindow);
+}
+
 function protocolFromRelay(relay: string): CircleTransportDiagnostic["protocol"] {
   if (relay.startsWith("mesh://")) {
     return "mesh";
@@ -995,6 +1004,20 @@ function deriveFallbackSnapshot(args: {
   };
 }
 
+export function loadTransportSnapshotLocally(fallback: {
+  circles: CircleItem[];
+  contacts: ContactItem[];
+  sessions: SessionItem[];
+  groups: GroupProfile[];
+  messageStore: Record<string, MessageItem[]>;
+  activeCircleId: string;
+  advanced: AdvancedPreferences;
+  previousSnapshot?: TransportSnapshot | null;
+  pendingActivity?: { circleId: string; action: TransportCircleAction };
+}): TransportSnapshot {
+  return deriveFallbackSnapshot(fallback);
+}
+
 export async function loadTransportSnapshot(
   input: TransportSnapshotInput,
   fallback: {
@@ -1009,20 +1032,20 @@ export async function loadTransportSnapshot(
     pendingActivity?: { circleId: string; action: TransportCircleAction };
   },
 ): Promise<TransportSnapshotLoadResult> {
-  try {
-    const snapshot = await invoke<TransportSnapshot>("load_transport_snapshot", {
-      input: cloneState(input),
-    });
+  if (!hasTauriRuntime()) {
     return {
-      snapshot: cloneState(snapshot),
-      source: "tauri",
-    };
-  } catch {
-    return {
-      snapshot: deriveFallbackSnapshot(fallback),
+      snapshot: loadTransportSnapshotLocally(fallback),
       source: "fallback",
     };
   }
+
+  const snapshot = await invoke<TransportSnapshot>("load_transport_snapshot", {
+    input: cloneState(input),
+  });
+  return {
+    snapshot: cloneState(snapshot),
+    source: "tauri",
+  };
 }
 
 export function deriveRuntimeRetryAction(
@@ -1121,6 +1144,12 @@ export async function applyTransportCircleAction(
       message: string;
     }
 > {
+  if (!hasTauriRuntime()) {
+    return {
+      kind: "soft-fallback",
+    };
+  }
+
   try {
     const result = await invoke<TransportMutationResult>("apply_transport_circle_action", {
       input: cloneState(input),
@@ -1139,8 +1168,6 @@ export async function applyTransportCircleAction(
       };
     }
 
-    return {
-      kind: "soft-fallback",
-    };
+    throw error;
   }
 }

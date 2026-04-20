@@ -32,6 +32,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
     protocol: &RelayProtocol,
     options: TransportRuntimeOptions,
     circle_id: &str,
+    relay_url: Option<&str>,
     preferred_session_id: Option<&str>,
 ) -> ResolvedLocalTransportRuntimeAdapter {
     match (flavor, protocol) {
@@ -54,6 +55,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
                 preview_runtime_arguments(
                     "preview-relay",
                     circle_id,
+                    relay_url,
                     Some("--tor"),
                     preferred_session_id,
                 ),
@@ -65,7 +67,13 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
             "ws",
             "native",
             "p2p-chat-runtime",
-            preview_runtime_arguments("preview-relay", circle_id, None, preferred_session_id),
+            preview_runtime_arguments(
+                "preview-relay",
+                circle_id,
+                relay_url,
+                None,
+                preferred_session_id,
+            ),
         ),
         (TransportRuntimeFlavor::Preview, RelayProtocol::Mesh) => local_command_adapter(
             "native-preview-mesh-runtime",
@@ -73,7 +81,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
             "mesh",
             "native",
             "p2p-chat-runtime",
-            preview_runtime_arguments("preview-mesh", circle_id, None, preferred_session_id),
+            preview_runtime_arguments("preview-mesh", circle_id, None, None, preferred_session_id),
         ),
         (TransportRuntimeFlavor::Preview, RelayProtocol::Invite) => local_command_adapter(
             "native-preview-invite-runtime",
@@ -81,7 +89,13 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
             "invite",
             "native",
             "p2p-chat-runtime",
-            preview_runtime_arguments("preview-invite", circle_id, None, preferred_session_id),
+            preview_runtime_arguments(
+                "preview-invite",
+                circle_id,
+                None,
+                None,
+                preferred_session_id,
+            ),
         ),
     }
 }
@@ -89,12 +103,17 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
 fn preview_runtime_arguments(
     command: &str,
     circle_id: &str,
+    relay_url: Option<&str>,
     extra_flag: Option<&str>,
     preferred_session_id: Option<&str>,
 ) -> Vec<String> {
     let mut arguments = vec![command.into()];
     if let Some(extra_flag) = extra_flag {
         arguments.push(extra_flag.into());
+    }
+    if let Some(relay_url) = relay_url {
+        arguments.push("--relay-url".into());
+        arguments.push(relay_url.into());
     }
     arguments.push("--circle".into());
     arguments.push(circle_id.into());
@@ -297,6 +316,7 @@ mod tests {
             },
             "circle-1",
             None,
+            None,
         );
 
         assert!(matches!(
@@ -344,6 +364,7 @@ mod tests {
                 experimental_transport: true,
             },
             "main-circle",
+            Some("wss://relay.example.com"),
             Some("alice"),
         );
 
@@ -351,6 +372,8 @@ mod tests {
             adapter.launch_arguments,
             vec![
                 "preview-relay".to_string(),
+                "--relay-url".to_string(),
+                "wss://relay.example.com".to_string(),
                 "--circle".to_string(),
                 "main-circle".to_string(),
                 "--session".to_string(),

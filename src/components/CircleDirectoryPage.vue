@@ -10,6 +10,7 @@ import type {
   CircleItem,
   CircleTransportDiagnostic,
   CircleType,
+  RestorableCircleEntry,
   TransportActivityItem,
   TransportSnapshot,
 } from "../types/chat";
@@ -19,6 +20,7 @@ type JoinMode = "invite" | "private" | "custom";
 const props = defineProps<{
   circles: CircleItem[];
   activeCircleId: string;
+  restorableCircles: RestorableCircleEntry[];
   transportSnapshot: TransportSnapshot | null;
 }>();
 
@@ -26,6 +28,8 @@ const emit = defineEmits<{
   (event: "close"): void;
   (event: "select-circle", circleId: string): void;
   (event: "open-circle-detail", circleId: string): void;
+  (event: "restore-circle", entry: RestorableCircleEntry): void;
+  (event: "forget-restorable-circle", relay: string): void;
   (
     event: "add-circle",
     payload: {
@@ -47,7 +51,49 @@ const openCount = computed(() => {
 });
 
 const statusLabel = computed(() => {
+  if (props.circles.length === 0 && props.restorableCircles.length > 0) {
+    return `0 circles · ${props.restorableCircles.length} saved`;
+  }
+
   return `${props.circles.length} circles · ${openCount.value} online`;
+});
+
+const directorySubtitle = computed(() => {
+  if (props.circles.length > 0) {
+    return "Switch circles, restore a saved relay space, or connect a new one.";
+  }
+
+  if (props.restorableCircles.length > 0) {
+    return "Restore a saved circle or connect a new relay space before starting chats.";
+  }
+
+  return "Connect a new relay space before starting chats in this shell.";
+});
+
+const heroDescription = computed(() => {
+  if (props.circles.length > 0) {
+    return "Keep the current circle quick-switch overlay for fast hops, and use this page for fuller setup.";
+  }
+
+  if (props.restorableCircles.length > 0) {
+    return "Nothing is mounted right now. Restore a saved circle entry or connect a new relay space from this page.";
+  }
+
+  return "Start by joining or creating a circle from this page, then return to the chat shell.";
+});
+
+const currentCirclesEmptyTitle = computed(() => {
+  return props.restorableCircles.length > 0 ? "No circles mounted right now" : "No circles in this shell";
+});
+
+const currentCirclesEmptyCopy = computed(() => {
+  return props.restorableCircles.length > 0
+    ? "You can restore one of the saved circle entries below, or connect a new relay space from this directory."
+    : "Join or create a circle from this directory before starting chats.";
+});
+
+const addSectionTitle = computed(() => {
+  return props.circles.length > 0 ? "Add Circle" : "Join or Add Circle";
 });
 
 const diagnosticByCircleId = computed(() => {
@@ -146,6 +192,15 @@ function circleLatestActivity(circleId: string) {
   return latestActivityByCircleId.value.get(circleId) ?? null;
 }
 
+function archivedAtCopy(value: string) {
+  const time = new Date(value);
+  if (Number.isNaN(time.getTime())) {
+    return value;
+  }
+
+  return time.toLocaleString();
+}
+
 function submit() {
   if (!canSubmit.value) {
     return;
@@ -168,14 +223,14 @@ function submit() {
 <template>
   <OverlayPageShell
     title="Circle Directory"
-    subtitle="Switch circles or connect a new relay space."
+    :subtitle="directorySubtitle"
     @close="emit('close')"
   >
     <div class="directory-page">
       <section class="hero-card">
         <div class="hero-copy">
           <h3>Circles</h3>
-          <p>Keep the current circle quick-switch overlay for fast hops, and use this page for fuller setup.</p>
+          <p>{{ heroDescription }}</p>
         </div>
         <div class="hero-tags">
           <Tag :value="statusLabel" severity="info" rounded />
@@ -193,7 +248,7 @@ function submit() {
           <span class="section-title">Current Circles</span>
         </div>
 
-        <div class="circle-list">
+        <div v-if="circles.length" class="circle-list">
           <div
             v-for="circle in circles"
             :key="circle.id"
@@ -243,13 +298,62 @@ function submit() {
             />
           </div>
         </div>
+        <div v-else class="empty-state-card">
+          <strong>{{ currentCirclesEmptyTitle }}</strong>
+          <p>{{ currentCirclesEmptyCopy }}</p>
+          <div class="empty-tags">
+            <Tag v-if="restorableCircles.length" :value="`${restorableCircles.length} restore entries`" severity="warn" rounded />
+            <Tag :value="restorableCircles.length ? 'Restore ready' : 'Join required'" severity="contrast" rounded />
+          </div>
+        </div>
+      </section>
+
+      <section v-if="restorableCircles.length" class="section-card">
+        <div class="section-head">
+          <span class="section-title">Restore Access</span>
+          <Tag :value="`${restorableCircles.length} saved`" severity="warn" rounded />
+        </div>
+
+        <div class="restore-list">
+          <div v-for="entry in restorableCircles" :key="entry.relay" class="restore-row">
+            <div class="restore-copy">
+              <div class="row-head">
+                <strong>{{ entry.name }}</strong>
+                <div class="row-tags">
+                  <Tag :value="typeLabel(entry.type)" :severity="typeTone(entry.type)" rounded />
+                </div>
+              </div>
+              <p>{{ entry.description || "No description archived for this circle." }}</p>
+              <div class="row-meta">
+                <span>{{ entry.relay }}</span>
+                <span>Archived {{ archivedAtCopy(entry.archivedAt) }}</span>
+              </div>
+            </div>
+
+            <div class="restore-actions">
+              <Button
+                icon="pi pi-refresh"
+                label="Restore"
+                severity="contrast"
+                @click="emit('restore-circle', entry)"
+              />
+              <Button
+                icon="pi pi-trash"
+                text
+                severity="secondary"
+                aria-label="Forget restore entry"
+                @click="emit('forget-restorable-circle', entry.relay)"
+              />
+            </div>
+          </div>
+        </div>
       </section>
 
       <Divider />
 
       <section class="section-card">
         <div class="section-head">
-          <span class="section-title">Add Circle</span>
+          <span class="section-title">{{ addSectionTitle }}</span>
         </div>
 
         <div class="mode-grid">
@@ -341,6 +445,7 @@ function submit() {
 .hero-card,
 .section-card,
 .circle-list,
+.restore-list,
 .mode-grid,
 .form-grid {
   display: grid;
@@ -385,8 +490,18 @@ function submit() {
   gap: 14px;
 }
 
+.empty-state-card {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+  border-radius: 22px;
+  background: #f7fafc;
+}
+
 .section-head,
-.hero-tags {
+.hero-tags,
+.empty-tags,
+.restore-actions {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -404,6 +519,10 @@ function submit() {
 }
 
 .circle-list {
+  gap: 10px;
+}
+
+.restore-list {
   gap: 10px;
 }
 
@@ -461,11 +580,28 @@ function submit() {
   min-width: 0;
 }
 
+.restore-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 20px;
+  background: #f7fafc;
+}
+
+.restore-copy {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
 .row-head,
 .row-tags,
 .row-meta,
 .transport-meta,
-.footer-actions {
+.footer-actions,
+.empty-tags,
+.restore-actions {
   display: flex;
   align-items: center;
 }
@@ -484,16 +620,30 @@ function submit() {
 }
 
 .circle-copy strong,
-.circle-copy p {
+.circle-copy p,
+.restore-copy strong,
+.restore-copy p {
+  margin: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .circle-copy p,
+.restore-copy p,
 .row-meta,
 .transport-meta {
   color: #6d809a;
+}
+
+.empty-state-card strong,
+.empty-state-card p {
+  margin: 0;
+}
+
+.empty-state-card p {
+  color: #6b7d97;
+  line-height: 1.6;
 }
 
 .transport-meta {
