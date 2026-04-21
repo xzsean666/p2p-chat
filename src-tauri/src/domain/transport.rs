@@ -1,5 +1,6 @@
 use crate::domain::chat::{
-    ChatDomainSeed, MergeRemoteDeliveryReceiptsInput, MergeRemoteMessagesInput, SignedNostrEvent,
+    ChatDomainSeed, MergeRemoteDeliveryReceiptsInput, MergeRemoteMessagesInput, MessageKind,
+    SignedNostrEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -366,12 +367,39 @@ pub struct TransportRuntimeOutboundMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TransportRuntimeOutboundMedia {
+    pub session_id: String,
+    pub message_id: String,
+    pub remote_id: String,
+    pub kind: MessageKind,
+    pub name: String,
+    pub label: String,
+    pub local_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransportOutboundDispatch {
     pub circle_id: String,
     pub session_id: String,
     pub message_id: String,
     pub remote_id: String,
     pub event_id: String,
+    pub runtime_generation: u32,
+    pub request_id: String,
+    pub dispatched_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportOutboundMediaDispatch {
+    pub circle_id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub remote_id: String,
+    pub local_path: String,
     pub runtime_generation: u32,
     pub request_id: String,
     pub dispatched_at: String,
@@ -452,12 +480,21 @@ pub enum TransportRuntimeInputEvent {
     PublishOutboundMessages(TransportRuntimePublishRequest),
 }
 
+#[derive(Debug, Clone)]
+pub struct TransportRuntimeBackgroundSyncRequest {
+    pub circle_id: String,
+    pub sync_since_created_at: Option<u64>,
+    pub relay_sync_filters: Vec<TransportRelaySyncFilter>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransportRuntimeActionRequest {
     pub request_id: String,
     pub circle_id: String,
     pub action: TransportCircleAction,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -472,6 +509,12 @@ pub struct TransportRuntimeActionRequest {
     pub relay_sync_filters: Vec<TransportRelaySyncFilter>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbound_messages: Vec<TransportRuntimeOutboundMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_media_messages: Vec<TransportRuntimeOutboundMedia>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +524,8 @@ pub struct TransportRuntimePublishRequest {
     pub circle_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbound_messages: Vec<TransportRuntimeOutboundMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_media_messages: Vec<TransportRuntimeOutboundMedia>,
 }
 
 pub trait TransportService {

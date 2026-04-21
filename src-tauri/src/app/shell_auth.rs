@@ -9,16 +9,20 @@ use crate::infra::auth_runtime_client_store::{self, StoredAuthRuntimeClient};
 use crate::infra::auth_runtime_credential_store::{self, StoredAuthRuntimeCredential};
 use crate::infra::auth_runtime_state_store::{self, StoredAuthRuntimeState};
 use crate::infra::shell_state_store;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use nostr_connect::prelude::{
-    Event as NostrEvent, EventBuilder as NostrEventBuilder, Keys as NostrKeys, NostrConnect,
-    NostrConnectURI, NostrSigner, PublicKey as NostrPublicKey, Tag as NostrTag,
-    Timestamp as NostrTimestamp, ToBech32,
+    Event as NostrEvent, EventBuilder as NostrEventBuilder, JsonUtil, Keys as NostrKeys,
+    Kind as NostrKind, NostrConnect, NostrConnectURI, NostrSigner, PublicKey as NostrPublicKey,
+    Tag as NostrTag, Timestamp as NostrTimestamp, ToBech32,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::time::Duration;
 
 const REMOTE_SIGNER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+const BLOSSOM_UPLOAD_AUTH_EXPIRATION_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 pub fn deserialize_shell_state_snapshot(value: Value) -> Option<ShellStateSnapshot> {
     serde_json::from_value::<ShellStateSnapshot>(value.clone())
@@ -157,6 +161,82 @@ pub fn sign_remote_auth_runtime_text_note<R: tauri::Runtime>(
             )?;
             Err(error)
         }
+    }
+}
+
+pub fn build_auth_runtime_nip98_http_auth_header<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    request_url: &str,
+    payload: &[u8],
+) -> Result<String, String> {
+    build_auth_runtime_authorization_header(
+        app_handle,
+        build_nip98_http_auth_event_builder(request_url, payload)?,
+        "NIP-98",
+    )
+}
+
+pub fn build_auth_runtime_blossom_upload_auth_header<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    _request_url: &str,
+    payload: &[u8],
+) -> Result<String, String> {
+    build_auth_runtime_authorization_header(
+        app_handle,
+        build_blossom_upload_auth_event_builder(payload)?,
+        "Blossom upload",
+    )
+}
+
+fn build_auth_runtime_authorization_header<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    builder: NostrEventBuilder,
+    auth_label: &str,
+) -> Result<String, String> {
+    let shell = load_saved_shell_snapshot(app_handle)?;
+    if !shell.is_authenticated {
+        return Err(format!(
+            "{auth_label} auth requires an authenticated shell."
+        ));
+    }
+
+    let auth_session = shell
+        .auth_session
+        .as_ref()
+        .ok_or_else(|| format!("{auth_label} auth requires an authenticated session summary."))?;
+    if let Some(reason) = auth_runtime_send_block_reason(&shell) {
+        return Err(format!("{auth_label} auth is unavailable: {reason}"));
+    }
+
+    if let Some(credential) =
+        auth_runtime_credential_store::load(app_handle)?.filter(|credential| {
+            stored_auth_runtime_credential_matches_session(credential, auth_session)
+        })
+    {
+        return build_local_auth_runtime_authorization_header(&credential, builder, auth_label);
+    }
+
+    let binding = auth_runtime_binding_store::load(app_handle)?
+        .filter(|binding| stored_auth_runtime_binding_matches_session(binding, auth_session))
+        .ok_or_else(missing_remote_auth_runtime_binding_error)?;
+
+    match build_remote_auth_runtime_authorization_header(
+        app_handle,
+        auth_session,
+        &binding,
+        builder,
+        auth_label,
+    ) {
+        Ok(header) => Ok(header),
+        Err(error)
+            if matches!(
+                binding.access_kind,
+                LoginAccessKind::Bunker | LoginAccessKind::NostrConnect
+            ) =>
+        {
+            Err(error)
+        }
+        Err(_) => Err("Current auth session cannot sign NIP-98 requests.".into()),
     }
 }
 
@@ -999,6 +1079,94 @@ fn handshake_remote_bunker_auth_runtime_binding<R: tauri::Runtime>(
     })
 }
 
+fn build_nip98_http_auth_event_builder(
+    request_url: &str,
+    payload: &[u8],
+) -> Result<NostrEventBuilder, String> {
+    Ok(NostrEventBuilder::new(NostrKind::HttpAuth, "")
+        .tags(build_nip98_http_auth_tags(request_url, payload)?))
+}
+
+fn build_blossom_upload_auth_event_builder(payload: &[u8]) -> Result<NostrEventBuilder, String> {
+    let payload_hash = encode_lower_hex(&Sha256::digest(payload));
+    let expiration = (NostrTimestamp::now() + BLOSSOM_UPLOAD_AUTH_EXPIRATION_WINDOW)
+        .as_secs()
+        .to_string();
+    let size = payload.len().to_string();
+    let tags = vec![
+        NostrTag::parse(["t", "upload"])
+            .map_err(|error| format!("failed to encode Blossom action tag: {error}"))?,
+        NostrTag::parse(["x", payload_hash.as_str()])
+            .map_err(|error| format!("failed to encode Blossom payload tag: {error}"))?,
+        NostrTag::parse(["expiration", expiration.as_str()])
+            .map_err(|error| format!("failed to encode Blossom expiration tag: {error}"))?,
+        NostrTag::parse(["size", size.as_str()])
+            .map_err(|error| format!("failed to encode Blossom size tag: {error}"))?,
+    ];
+
+    Ok(NostrEventBuilder::new(
+        NostrKind::BlossomAuth,
+        format!("Upload blob {payload_hash}"),
+    )
+    .tags(tags))
+}
+
+fn build_local_auth_runtime_authorization_header(
+    credential: &StoredAuthRuntimeCredential,
+    builder: NostrEventBuilder,
+    auth_label: &str,
+) -> Result<String, String> {
+    let keys = NostrKeys::parse(&credential.secret_key_hex)
+        .map_err(|error| format!("Stored auth runtime secret key is invalid: {error}"))?;
+    let event = builder
+        .sign_with_keys(&keys)
+        .map_err(|error| format!("failed to build local {auth_label} auth event: {error}"))?;
+    Ok(encode_nip98_http_authorization(&event))
+}
+
+fn build_remote_auth_runtime_authorization_header<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+    binding: &StoredAuthRuntimeBinding,
+    builder: NostrEventBuilder,
+    auth_label: &str,
+) -> Result<String, String> {
+    let result = match binding.access_kind {
+        LoginAccessKind::Bunker => build_remote_bunker_auth_runtime_authorization_header(
+            app_handle,
+            auth_session,
+            binding,
+            builder,
+            auth_label,
+        ),
+        LoginAccessKind::NostrConnect => Err(unsupported_nostrconnect_client_uri_error()),
+        _ => Err("Stored remote signer binding is not supported.".into()),
+    };
+
+    match result {
+        Ok(header) => {
+            persist_observed_auth_runtime(
+                app_handle,
+                auth_session,
+                Some(AuthRuntimeState::Connected),
+                None,
+                None,
+            )?;
+            Ok(header)
+        }
+        Err(error) => {
+            persist_observed_auth_runtime(
+                app_handle,
+                auth_session,
+                Some(AuthRuntimeState::Connected),
+                Some(error.clone()),
+                None,
+            )?;
+            Err(error)
+        }
+    }
+}
+
 fn sign_remote_bunker_auth_runtime_text_note<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     auth_session: &AuthSessionSummary,
@@ -1030,6 +1198,37 @@ fn sign_remote_bunker_auth_runtime_text_note<R: tauri::Runtime>(
         connect.shutdown().await;
 
         Ok(build_signed_nostr_event_from_remote_event(signed_event?))
+    })
+}
+
+fn build_remote_bunker_auth_runtime_authorization_header<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+    binding: &StoredAuthRuntimeBinding,
+    builder: NostrEventBuilder,
+    auth_label: &str,
+) -> Result<String, String> {
+    let client = load_or_create_auth_runtime_client(app_handle, auth_session)?;
+    let client_keys = auth_runtime_client_keys(&client)?;
+    let uri = NostrConnectURI::parse(&binding.value)
+        .map_err(|error| format!("Stored bunker URI is invalid: {error}"))?;
+
+    if !uri.is_bunker() {
+        return Err("Stored remote signer binding is not a bunker URI.".into());
+    }
+
+    block_on_remote_auth_runtime(async move {
+        let connect = NostrConnect::new(uri, client_keys, REMOTE_SIGNER_HANDSHAKE_TIMEOUT, None)
+            .map_err(|error| {
+                format!("failed to initialize bunker {auth_label} auth client: {error}")
+            })?;
+        let signed_event = builder
+            .sign(&connect)
+            .await
+            .map_err(|error| format!("Remote bunker {auth_label} auth failed: {error}"));
+        connect.shutdown().await;
+
+        Ok(encode_nip98_http_authorization(&signed_event?))
     })
 }
 
@@ -1090,6 +1289,38 @@ fn build_signed_nostr_event_from_remote_event(event: NostrEvent) -> SignedNostrE
         content: event.content,
         signature: event.sig.to_string(),
     }
+}
+
+fn build_nip98_http_auth_tags(request_url: &str, payload: &[u8]) -> Result<Vec<NostrTag>, String> {
+    let mut tags = vec![
+        NostrTag::parse(["u", request_url])
+            .map_err(|error| format!("failed to encode NIP-98 url tag: {error}"))?,
+        NostrTag::parse(["method", "POST"])
+            .map_err(|error| format!("failed to encode NIP-98 method tag: {error}"))?,
+    ];
+    if !payload.is_empty() {
+        let payload_hash = encode_lower_hex(&Sha256::digest(payload));
+        tags.push(
+            NostrTag::parse(["payload", payload_hash.as_str()])
+                .map_err(|error| format!("failed to encode NIP-98 payload tag: {error}"))?,
+        );
+    }
+
+    Ok(tags)
+}
+
+fn encode_nip98_http_authorization(event: &NostrEvent) -> String {
+    format!("Nostr {}", BASE64_STANDARD.encode(event.as_json()))
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+
+    output
 }
 
 fn nostr_text_note_public_key_tags(tags: &[Vec<String>]) -> Vec<NostrTag> {

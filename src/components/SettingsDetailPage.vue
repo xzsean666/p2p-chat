@@ -577,6 +577,89 @@ watch(
           </div>
         </section>
 
+        <section class="section-card">
+          <div class="section-title">Media Upload Backend</div>
+          <div class="option-row">
+            <button
+              type="button"
+              :class="['option-chip', { active: advanced.mediaUploadDriver === 'auto' }]"
+              @click="emit('update-advanced', { mediaUploadDriver: 'auto' })"
+            >
+              Auto
+            </button>
+            <button
+              type="button"
+              :class="['option-chip', { active: advanced.mediaUploadDriver === 'local' }]"
+              @click="emit('update-advanced', { mediaUploadDriver: 'local' })"
+            >
+              Local
+            </button>
+            <button
+              type="button"
+              :class="['option-chip', { active: advanced.mediaUploadDriver === 'filedrop' }]"
+              @click="emit('update-advanced', { mediaUploadDriver: 'filedrop' })"
+            >
+              Filedrop
+            </button>
+            <button
+              type="button"
+              :class="['option-chip', { active: advanced.mediaUploadDriver === 'nip96' }]"
+              @click="emit('update-advanced', { mediaUploadDriver: 'nip96' })"
+            >
+              NIP-96
+            </button>
+            <button
+              type="button"
+              :class="['option-chip', { active: advanced.mediaUploadDriver === 'blossom' }]"
+              @click="emit('update-advanced', { mediaUploadDriver: 'blossom' })"
+            >
+              Blossom
+            </button>
+            <button
+              type="button"
+              :class="['option-chip', { active: advanced.mediaUploadDriver === 'minio' }]"
+              @click="emit('update-advanced', { mediaUploadDriver: 'minio' })"
+            >
+              MinIO
+            </button>
+          </div>
+          <p class="section-note">
+            `Auto` keeps the existing desktop fallback order: persisted config if present, then env, then the
+            loopback `chat-media` file server. `Local` always emits local preview URLs. `Filedrop` posts to the
+            persisted multipart endpoint below. `NIP-96` accepts either a base origin for well-known discovery
+            or a direct upload API URL. `Blossom` signs a native authenticated `PUT /upload` request against
+            the configured server. `MinIO` uses the same endpoint field here, while access key / secret / bucket
+            still come from desktop env for now.
+          </p>
+          <div class="field-stack">
+            <strong class="field-label">Upload Endpoint</strong>
+            <InputText
+              :model-value="advanced.mediaUploadEndpoint"
+              :disabled="
+                advanced.mediaUploadDriver !== 'filedrop' &&
+                advanced.mediaUploadDriver !== 'nip96' &&
+                advanced.mediaUploadDriver !== 'blossom' &&
+                advanced.mediaUploadDriver !== 'minio'
+              "
+              placeholder="https://files.example.com"
+              @update:model-value="
+                emit('update-advanced', {
+                  mediaUploadEndpoint: typeof $event === 'string' ? $event : '',
+                })
+              "
+            />
+            <p class="field-help">
+              For `Filedrop`, enter a base origin like `https://filedrop.example.com` or a full upload path like
+              `https://cdn.example.com/upload`. For `NIP-96`, enter either a server origin like
+              `https://nostr.build` or a direct `api_url`. For `Blossom`, enter a server origin like
+              `https://nosto.re` or a direct upload URL ending in `/upload`. For `MinIO`, enter the S3-compatible
+              origin, then provide credentials through `P2P_CHAT_MEDIA_UPLOAD_MINIO_ACCESS_KEY`,
+              `P2P_CHAT_MEDIA_UPLOAD_MINIO_SECRET_KEY` and `P2P_CHAT_MEDIA_UPLOAD_MINIO_BUCKET`
+              in the desktop environment.
+            </p>
+          </div>
+        </section>
+
         <section v-if="transportSnapshot" class="section-card">
           <div class="section-title">Transport Snapshot</div>
           <div class="info-row">
@@ -1115,6 +1198,22 @@ watch(
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.field-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.field-label {
+  font-size: 0.85rem;
+}
+
+.field-help,
+.section-note {
+  margin: 0;
+  color: var(--shell-text-muted);
+  line-height: 1.6;
 }
 
 .option-chip {

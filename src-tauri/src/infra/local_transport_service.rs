@@ -5,14 +5,16 @@ use crate::domain::chat::{
 };
 use crate::domain::chat_repository::{
     apply_change_set_to_seed, build_remote_delivery_receipt_change_set,
-    merge_remote_messages_into_seed, ChatRepository,
+    merge_remote_messages_into_seed, message_media_label, message_media_local_path,
+    message_media_remote_url, ChatRepository,
 };
 use crate::domain::transport::{
     CircleTransportDiagnostic, RelayProtocol, TransportActivityItem, TransportActivityKind,
     TransportActivityLevel, TransportCapabilities, TransportChatEffects, TransportCircleAction,
     TransportCircleActionInput, TransportEngineKind, TransportHealth, TransportMutationResult,
-    TransportRelaySyncFilter, TransportRuntimeLaunchResult, TransportRuntimeOutboundMessage,
-    TransportRuntimeSession, TransportService, TransportSnapshot, TransportSnapshotInput,
+    TransportRelaySyncFilter, TransportRuntimeBackgroundSyncRequest, TransportRuntimeLaunchResult,
+    TransportRuntimeOutboundMedia, TransportRuntimeOutboundMessage, TransportRuntimeSession,
+    TransportService, TransportSnapshot, TransportSnapshotInput,
 };
 use crate::domain::transport_adapter::TransportRuntimeOptions;
 use crate::domain::transport_engine::{
@@ -27,6 +29,7 @@ use crate::domain::transport_runtime_registry::{
 use crate::infra::local_transport_recovery_worker::{
     collect_local_transport_recovery_actions, recovery_action_input,
 };
+use crate::infra::media_upload;
 use crate::infra::sqlite_chat_repository::SqliteChatRepository;
 use crate::infra::sqlite_transport_repository::SqliteTransportRepository;
 use crate::infra::transport_engine_factory::select_transport_engine;
@@ -73,6 +76,11 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
         reconcile_transport_outbound_dispatches(&mut normalized_previous_cache, &seed);
         reconcile_transport_relay_sync_cursors(&mut normalized_previous_cache, &seed);
         let runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
+        let background_sync_requests = collect_background_relay_sync_requests(
+            &seed,
+            &normalized_previous_cache,
+            current_user_pubkey.as_deref(),
+        );
         let recovery_actions = collect_local_transport_recovery_actions(
             &seed,
             &normalized_previous_cache,
@@ -83,13 +91,21 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
             let mut state = engine.build_state(&seed, &normalized_previous_cache)?;
             let outbound_messages =
                 collect_transport_outbound_messages(&seed, &normalized_previous_cache, None);
+            let outbound_media_messages = collect_transport_outbound_media_messages(
+                &self.app_handle,
+                &seed,
+                &normalized_previous_cache,
+                None,
+            );
             let runtime_chat_effects = runtime_manager.sync_cache(
                 &normalized_previous_cache,
                 &mut state.cache,
                 runtime_profiles,
                 None,
                 &outbound_messages,
+                &outbound_media_messages,
                 &[],
+                &background_sync_requests,
             )?;
             pending_chat_effects.append(runtime_chat_effects);
             state
@@ -126,14 +142,23 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
                 let recovery_runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
                 let outbound_messages =
                     collect_transport_outbound_messages(&seed, &working_cache, Some(&action_input));
-                let relay_sync_filters = relay_sync_filters(&seed, &action_input);
+                let outbound_media_messages = collect_transport_outbound_media_messages(
+                    &self.app_handle,
+                    &seed,
+                    &working_cache,
+                    Some(&action_input),
+                );
+                let relay_sync_filters =
+                    relay_sync_filters(&seed, &action_input, current_user_pubkey.as_deref());
                 let runtime_chat_effects = runtime_manager.sync_cache(
                     &working_cache,
                     &mut next_state.cache,
                     recovery_runtime_profiles,
                     Some(&action_input),
                     &outbound_messages,
+                    &outbound_media_messages,
                     &relay_sync_filters,
+                    &[],
                 )?;
                 pending_chat_effects.append(runtime_chat_effects);
                 next_state
@@ -213,14 +238,22 @@ impl<R: Runtime> TransportService for LocalTransportService<R> {
         let runtime_profiles = runtime.build_profiles(&seed, runtime_options)?;
         let outbound_messages =
             collect_transport_outbound_messages(&seed, &normalized_previous_cache, Some(&input));
-        let relay_sync_filters = relay_sync_filters(&seed, &input);
+        let outbound_media_messages = collect_transport_outbound_media_messages(
+            &self.app_handle,
+            &seed,
+            &normalized_previous_cache,
+            Some(&input),
+        );
+        let relay_sync_filters = relay_sync_filters(&seed, &input, current_user_pubkey.as_deref());
         let runtime_chat_effects = runtime_manager.sync_cache(
             &normalized_previous_cache,
             &mut state.cache,
             runtime_profiles,
             Some(&input),
             &outbound_messages,
+            &outbound_media_messages,
             &relay_sync_filters,
+            &[],
         )?;
         pending_chat_effects.append(runtime_chat_effects);
         state
@@ -313,6 +346,8 @@ impl<R: Runtime> LocalTransportService<R> {
             None,
             &[],
             &[],
+            &[],
+            &[],
         )?;
         Ok((normalized_cache, chat_effects))
     }
@@ -384,6 +419,91 @@ fn collect_transport_outbound_messages(
         .collect()
 }
 
+fn collect_transport_outbound_media_messages<R: Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    seed: &ChatDomainSeed,
+    cache: &TransportCache,
+    action: Option<&TransportCircleActionInput>,
+) -> Vec<TransportRuntimeOutboundMedia> {
+    let allowed_circle_id = match action {
+        Some(action)
+            if matches!(
+                action.action,
+                TransportCircleAction::Sync | TransportCircleAction::SyncSessions
+            ) =>
+        {
+            Some(action.circle_id.as_str())
+        }
+        Some(_) => return Vec::new(),
+        None => None,
+    };
+
+    let dispatched_message_ids = cache
+        .outbound_media_dispatches
+        .iter()
+        .filter(|dispatch| {
+            allowed_circle_id
+                .map(|circle_id| dispatch.circle_id == circle_id)
+                .unwrap_or(true)
+        })
+        .map(|dispatch| {
+            (
+                dispatch.session_id.as_str(),
+                dispatch.message_id.as_str(),
+                dispatch.local_path.as_str(),
+            )
+        })
+        .collect::<HashSet<_>>();
+
+    seed.sessions
+        .iter()
+        .filter(|session| {
+            allowed_circle_id
+                .map(|circle_id| session.circle_id == circle_id)
+                .unwrap_or(true)
+        })
+        .flat_map(|session| {
+            seed.message_store
+                .get(&session.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|message| {
+                    if !message_is_pending_local_outbound_media_publish(message) {
+                        return None;
+                    }
+                    let local_path = message_media_local_path(message)?;
+                    if dispatched_message_ids.contains(&(
+                        session.id.as_str(),
+                        message.id.as_str(),
+                        local_path.as_str(),
+                    )) {
+                        return None;
+                    }
+                    let remote_url = media_upload::resolve_outbound_chat_media_remote_url(
+                        app_handle,
+                        &local_path,
+                        &message.body,
+                    )
+                    .ok()?;
+
+                    Some(TransportRuntimeOutboundMedia {
+                        session_id: session.id.clone(),
+                        message_id: message.id.clone(),
+                        remote_id: message
+                            .remote_id
+                            .clone()
+                            .unwrap_or_else(|| acked_remote_message_id(&message.id)),
+                        kind: message.kind.clone(),
+                        name: message.body.clone(),
+                        label: message_media_label(message)?,
+                        local_path,
+                        remote_url,
+                    })
+                })
+        })
+        .collect()
+}
+
 fn message_is_pending_local_outbound_publish(message: &MessageItem) -> bool {
     matches!(message.author, MessageAuthor::Me)
         && !matches!(
@@ -395,6 +515,22 @@ fn message_is_pending_local_outbound_publish(message: &MessageItem) -> bool {
             Some(MessageDeliveryStatus::Sending)
         )
         && message.signed_nostr_event.is_some()
+}
+
+fn message_is_pending_local_outbound_media_publish(message: &MessageItem) -> bool {
+    matches!(message.author, MessageAuthor::Me)
+        && !matches!(
+            message.sync_source,
+            Some(MessageSyncSource::Relay | MessageSyncSource::System)
+        )
+        && matches!(
+            message.kind,
+            crate::domain::chat::MessageKind::File
+                | crate::domain::chat::MessageKind::Image
+                | crate::domain::chat::MessageKind::Video
+        )
+        && message_media_local_path(message).is_some()
+        && message_media_remote_url(message).is_none()
 }
 
 fn enrich_runtime_sync_action_input(
@@ -409,11 +545,13 @@ fn enrich_runtime_sync_action_input(
 fn relay_sync_filters(
     seed: &ChatDomainSeed,
     input: &TransportCircleActionInput,
+    current_user_pubkey: Option<&str>,
 ) -> Vec<TransportRelaySyncFilter> {
-    if !matches!(input.action, TransportCircleAction::Sync) {
+    if !action_supports_relay_sync(&input.action) {
         return Vec::new();
     }
 
+    let current_user_pubkey = current_user_pubkey.and_then(normalize_nostr_pubkey);
     let contact_pubkeys = seed
         .contacts
         .iter()
@@ -422,7 +560,7 @@ fn relay_sync_filters(
         })
         .collect::<HashMap<_, _>>();
     let mut filters = Vec::new();
-    let mut direct_authors = seed
+    let mut direct_contact_pubkeys = seed
         .sessions
         .iter()
         .filter(|session| {
@@ -433,13 +571,21 @@ fn relay_sync_filters(
         .filter_map(|session| session.contact_id.as_deref())
         .filter_map(|contact_id| contact_pubkeys.get(contact_id).cloned())
         .collect::<Vec<_>>();
-    direct_authors.sort_unstable();
-    direct_authors.dedup();
-    if !direct_authors.is_empty() {
+    direct_contact_pubkeys.sort_unstable();
+    direct_contact_pubkeys.dedup();
+    if !direct_contact_pubkeys.is_empty() {
         filters.push(TransportRelaySyncFilter {
-            authors: direct_authors,
+            authors: direct_contact_pubkeys.clone(),
             tagged_pubkeys: Vec::new(),
         });
+    }
+    if let Some(current_user_pubkey) = current_user_pubkey.as_ref() {
+        if !direct_contact_pubkeys.is_empty() {
+            filters.push(TransportRelaySyncFilter {
+                authors: vec![current_user_pubkey.clone()],
+                tagged_pubkeys: direct_contact_pubkeys.clone(),
+            });
+        }
     }
 
     filters.extend(
@@ -450,11 +596,14 @@ fn relay_sync_filters(
                     && !session.archived.unwrap_or(false)
                     && matches!(session.kind, SessionKind::Group)
             })
-            .filter_map(|session| {
-                let group = seed
+            .flat_map(|session| {
+                let Some(group) = seed
                     .groups
                     .iter()
-                    .find(|group| group.session_id == session.id)?;
+                    .find(|group| group.session_id == session.id)
+                else {
+                    return Vec::new();
+                };
                 let mut member_pubkeys = group
                     .members
                     .iter()
@@ -463,19 +612,41 @@ fn relay_sync_filters(
                 member_pubkeys.sort_unstable();
                 member_pubkeys.dedup();
                 if member_pubkeys.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
 
-                Some(TransportRelaySyncFilter {
-                    tagged_pubkeys: if member_pubkeys.len() >= 2 {
-                        member_pubkeys.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    authors: member_pubkeys,
-                })
+                let tagged_pubkeys = if member_pubkeys.len() >= 2 {
+                    member_pubkeys.clone()
+                } else {
+                    Vec::new()
+                };
+                let mut session_filters = vec![TransportRelaySyncFilter {
+                    tagged_pubkeys: tagged_pubkeys.clone(),
+                    authors: member_pubkeys.clone(),
+                }];
+                if let Some(current_user_pubkey) = current_user_pubkey.as_ref() {
+                    session_filters.push(TransportRelaySyncFilter {
+                        authors: vec![current_user_pubkey.clone()],
+                        tagged_pubkeys: member_pubkeys,
+                    });
+                }
+
+                session_filters
             }),
     );
+    let has_self_chat_session = seed.sessions.iter().any(|session| {
+        session.circle_id == input.circle_id
+            && !session.archived.unwrap_or(false)
+            && matches!(session.kind, SessionKind::SelfChat)
+    });
+    if has_self_chat_session {
+        if let Some(current_user_pubkey) = current_user_pubkey {
+            filters.push(TransportRelaySyncFilter {
+                authors: vec![current_user_pubkey],
+                tagged_pubkeys: Vec::new(),
+            });
+        }
+    }
     filters.sort_by(|left, right| {
         left.authors
             .cmp(&right.authors)
@@ -490,13 +661,62 @@ fn relay_sync_since_created_at(
     cache: &TransportCache,
     input: &TransportCircleActionInput,
 ) -> Option<u64> {
-    if !matches!(input.action, TransportCircleAction::Sync) {
+    if !action_supports_relay_sync(&input.action) {
         return None;
     }
 
     relay_sync_cursor_created_at(cache, &input.circle_id)
         .or_else(|| latest_peer_relay_created_at(seed, &input.circle_id))
         .map(|created_at| created_at.saturating_sub(RELAY_SYNC_OVERLAP_SECS))
+}
+
+fn action_supports_relay_sync(action: &TransportCircleAction) -> bool {
+    matches!(
+        action,
+        TransportCircleAction::Sync | TransportCircleAction::SyncSessions
+    )
+}
+
+fn collect_background_relay_sync_requests(
+    seed: &ChatDomainSeed,
+    cache: &TransportCache,
+    current_user_pubkey: Option<&str>,
+) -> Vec<TransportRuntimeBackgroundSyncRequest> {
+    seed.circles
+        .iter()
+        .filter(|circle| relay_supports_background_sync(circle.relay.as_str()))
+        .filter_map(|circle| {
+            let has_visible_session = seed.sessions.iter().any(|session| {
+                session.circle_id == circle.id && !session.archived.unwrap_or(false)
+            });
+            if !has_visible_session {
+                return None;
+            }
+
+            let action_input = TransportCircleActionInput {
+                circle_id: circle.id.clone(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some(circle.id.clone()),
+                use_tor_network: false,
+                experimental_transport: false,
+                sync_since_created_at: None,
+            };
+            let relay_sync_filters = relay_sync_filters(seed, &action_input, current_user_pubkey);
+            if relay_sync_filters.is_empty() {
+                return None;
+            }
+
+            Some(TransportRuntimeBackgroundSyncRequest {
+                circle_id: circle.id.clone(),
+                sync_since_created_at: relay_sync_since_created_at(seed, cache, &action_input),
+                relay_sync_filters,
+            })
+        })
+        .collect()
+}
+
+fn relay_supports_background_sync(relay: &str) -> bool {
+    relay.starts_with("ws://") || relay.starts_with("wss://")
 }
 
 fn relay_sync_cursor_created_at(cache: &TransportCache, circle_id: &str) -> Option<u64> {
@@ -602,6 +822,40 @@ fn reconcile_transport_outbound_dispatches(cache: &mut TransportCache, seed: &Ch
             dispatch.session_id.clone(),
             dispatch.message_id.clone(),
             dispatch.event_id.clone(),
+        )) && runtime_generations
+            .get(dispatch.circle_id.as_str())
+            .map(|generation| *generation == dispatch.runtime_generation)
+            .unwrap_or(true)
+    });
+
+    let valid_media_dispatches = seed
+        .message_store
+        .iter()
+        .flat_map(|(session_id, messages)| {
+            let circle_id = session_circle_ids.get(session_id.as_str()).copied();
+            messages.iter().filter_map(move |message| {
+                let circle_id = circle_id?;
+                if !message_is_pending_local_outbound_media_publish(message) {
+                    return None;
+                }
+                let local_path = message_media_local_path(message)?;
+
+                Some((
+                    circle_id.to_string(),
+                    session_id.clone(),
+                    message.id.clone(),
+                    local_path,
+                ))
+            })
+        })
+        .collect::<HashSet<_>>();
+
+    cache.outbound_media_dispatches.retain(|dispatch| {
+        valid_media_dispatches.contains(&(
+            dispatch.circle_id.clone(),
+            dispatch.session_id.clone(),
+            dispatch.message_id.clone(),
+            dispatch.local_path.clone(),
         )) && runtime_generations
             .get(dispatch.circle_id.as_str())
             .map(|generation| *generation == dispatch.runtime_generation)
@@ -1415,25 +1669,35 @@ fn trim_transport_activities(activities: Vec<TransportActivityItem>) -> Vec<Tran
 
 #[cfg(test)]
 mod tests {
+    use crate::app::chat_mutations;
     use super::*;
     use crate::domain::chat::{
-        CircleItem, CircleType, ContactItem, GroupMember, GroupProfile, GroupRole,
-        MergeRemoteMessagesInput, MessageAuthor, MessageDeliveryStatus, MessageItem, MessageKind,
-        MessageSyncSource, SessionItem, SessionKind, SignedNostrEvent,
+        AuthRuntimeState, AuthRuntimeSummary, AuthSessionSummary, CircleItem, CircleType,
+        ContactItem, GroupMember, GroupProfile, GroupRole, LoginAccessKind, LoginAccessSummary,
+        LoginCircleSelectionMode, LoginMethod, MergeRemoteMessagesInput, MessageAuthor,
+        MessageDeliveryStatus, MessageItem, MessageKind, MessageSyncSource, SendMessageInput,
+        SessionItem, SessionKind, ShellStateSnapshot, SignedNostrEvent,
     };
     use crate::domain::transport::{
         TransportActivityKind, TransportActivityLevel, TransportCircleAction,
-        TransportCircleActionInput, TransportOutboundDispatch, TransportRelaySyncFilter,
-        TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchResult,
-        TransportRuntimeLaunchStatus, TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy,
-        TransportRuntimeRegistryEntry, TransportRuntimeState,
+        TransportCircleActionInput, TransportOutboundDispatch, TransportOutboundMediaDispatch,
+        TransportRelaySyncFilter, TransportRuntimeAdapterKind, TransportRuntimeDesiredState,
+        TransportRuntimeLaunchResult, TransportRuntimeLaunchStatus, TransportRuntimeQueueState,
+        TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry, TransportRuntimeState,
+        TransportSnapshotInput,
     };
-    use crate::domain::transport_repository::TransportRelaySyncCursor;
+    use crate::domain::transport_repository::{
+        TransportRelayBackgroundSyncMarker, TransportRelaySyncCursor,
+    };
+    use crate::infra::{auth_runtime_credential_store, shell_state_store};
     use secp256k1::{Secp256k1, SecretKey};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::str::FromStr;
     use std::sync::MutexGuard;
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestAppGuard {
@@ -1441,6 +1705,11 @@ mod tests {
         app: tauri::App<tauri::test::MockRuntime>,
         config_root: PathBuf,
         previous_xdg_config_home: Option<String>,
+        previous_tmpdir: Option<String>,
+        previous_tmp: Option<String>,
+        previous_temp: Option<String>,
+        previous_upload_driver: Option<String>,
+        previous_upload_endpoint: Option<String>,
     }
 
     impl Drop for TestAppGuard {
@@ -1449,6 +1718,31 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", previous);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            if let Some(previous) = &self.previous_tmpdir {
+                std::env::set_var("TMPDIR", previous);
+            } else {
+                std::env::remove_var("TMPDIR");
+            }
+            if let Some(previous) = &self.previous_tmp {
+                std::env::set_var("TMP", previous);
+            } else {
+                std::env::remove_var("TMP");
+            }
+            if let Some(previous) = &self.previous_temp {
+                std::env::set_var("TEMP", previous);
+            } else {
+                std::env::remove_var("TEMP");
+            }
+            if let Some(previous) = &self.previous_upload_driver {
+                std::env::set_var("P2P_CHAT_MEDIA_UPLOAD_DRIVER", previous);
+            } else {
+                std::env::remove_var("P2P_CHAT_MEDIA_UPLOAD_DRIVER");
+            }
+            if let Some(previous) = &self.previous_upload_endpoint {
+                std::env::set_var("P2P_CHAT_MEDIA_UPLOAD_ENDPOINT", previous);
+            } else {
+                std::env::remove_var("P2P_CHAT_MEDIA_UPLOAD_ENDPOINT");
             }
 
             let _ = std::fs::remove_dir_all(&self.config_root);
@@ -1466,9 +1760,21 @@ mod tests {
         let config_root =
             std::env::temp_dir().join(format!("p2p-chat-transport-service-test-{unique}"));
         std::fs::create_dir_all(&config_root).expect("failed to create test config root");
+        let runtime_tmp_root = config_root.join("tmp");
+        std::fs::create_dir_all(&runtime_tmp_root).expect("failed to create runtime temp root");
 
         let previous_xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+        let previous_tmpdir = std::env::var("TMPDIR").ok();
+        let previous_tmp = std::env::var("TMP").ok();
+        let previous_temp = std::env::var("TEMP").ok();
+        let previous_upload_driver = std::env::var("P2P_CHAT_MEDIA_UPLOAD_DRIVER").ok();
+        let previous_upload_endpoint = std::env::var("P2P_CHAT_MEDIA_UPLOAD_ENDPOINT").ok();
         std::env::set_var("XDG_CONFIG_HOME", &config_root);
+        std::env::set_var("TMPDIR", &runtime_tmp_root);
+        std::env::set_var("TMP", &runtime_tmp_root);
+        std::env::set_var("TEMP", &runtime_tmp_root);
+        std::env::remove_var("P2P_CHAT_MEDIA_UPLOAD_DRIVER");
+        std::env::remove_var("P2P_CHAT_MEDIA_UPLOAD_ENDPOINT");
 
         let app = tauri::test::mock_app();
         TestAppGuard {
@@ -1476,6 +1782,11 @@ mod tests {
             app,
             config_root,
             previous_xdg_config_home,
+            previous_tmpdir,
+            previous_tmp,
+            previous_temp,
+            previous_upload_driver,
+            previous_upload_endpoint,
         }
     }
 
@@ -1594,6 +1905,55 @@ mod tests {
         }
     }
 
+    fn load_seed_from_store(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+    ) -> ChatDomainSeed {
+        SqliteChatRepository::new(app_handle)
+            .load_domain_seed()
+            .expect("failed to load domain seed")
+    }
+
+    fn save_seed_to_store(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        seed: ChatDomainSeed,
+    ) {
+        SqliteChatRepository::new(app_handle)
+            .save_domain_seed(seed)
+            .expect("failed to save domain seed");
+    }
+
+    fn load_transport_cache_from_store(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+    ) -> TransportCache {
+        SqliteTransportRepository::new(app_handle)
+            .load_transport_cache()
+            .expect("failed to load transport cache")
+    }
+
+    fn set_circle_relay(seed: &mut ChatDomainSeed, circle_id: &str, relay: &str) {
+        let circle = seed
+            .circles
+            .iter_mut()
+            .find(|circle| circle.id == circle_id)
+            .expect("missing circle");
+        circle.relay = relay.into();
+    }
+
+    fn set_contact_pubkey(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        contact_id: &str,
+        pubkey: &str,
+    ) {
+        let mut seed = load_seed_from_store(app_handle);
+        let contact = seed
+            .contacts
+            .iter_mut()
+            .find(|contact| contact.id == contact_id)
+            .expect("missing contact");
+        contact.pubkey = pubkey.into();
+        save_seed_to_store(app_handle, seed);
+    }
+
     fn valid_sender_pubkey_hex() -> String {
         valid_pubkey_hex("1111111111111111111111111111111111111111111111111111111111111111")
     }
@@ -1616,6 +1976,100 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
+    }
+
+    fn seed_authenticated_local_secret_runtime(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        session_id: &str,
+    ) {
+        const LOCAL_SECRET_KEY_HEX: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        let current_user_pubkey = valid_pubkey_hex(LOCAL_SECRET_KEY_HEX);
+        let seed = load_seed_from_store(app_handle);
+        let active_circle_id = seed
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.circle_id.clone())
+            .unwrap_or_else(|| "main-circle".into());
+
+        let mut shell = ShellStateSnapshot::from(seed);
+        shell.is_authenticated = true;
+        shell.auth_session = Some(AuthSessionSummary {
+            login_method: LoginMethod::ExistingAccount,
+            access: LoginAccessSummary {
+                kind: LoginAccessKind::HexKey,
+                label: "npub1local".into(),
+                pubkey: Some(current_user_pubkey.clone()),
+            },
+            circle_selection_mode: LoginCircleSelectionMode::Existing,
+            logged_in_at: "2026-04-21T10:00:00Z".into(),
+        });
+        shell.auth_runtime = Some(AuthRuntimeSummary {
+            state: AuthRuntimeState::Connected,
+            login_method: LoginMethod::ExistingAccount,
+            access_kind: LoginAccessKind::HexKey,
+            label: "npub1local".into(),
+            pubkey: Some(current_user_pubkey.clone()),
+            error: None,
+            can_send_messages: true,
+            send_blocked_reason: None,
+            persisted_in_native_store: true,
+            credential_persisted_in_native_store: true,
+            updated_at: "2026-04-21T10:00:00Z".into(),
+        });
+        shell.active_circle_id = active_circle_id;
+        shell.selected_session_id = session_id.into();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(shell).expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state");
+        auth_runtime_credential_store::save(
+            app_handle,
+            &auth_runtime_credential_store::StoredAuthRuntimeCredential {
+                login_method: LoginMethod::ExistingAccount,
+                access_kind: LoginAccessKind::HexKey,
+                secret_key_hex: LOCAL_SECRET_KEY_HEX.into(),
+                pubkey: current_user_pubkey,
+                stored_at: "2026-04-21T10:00:00Z".into(),
+            },
+        )
+        .expect("failed to seed local auth credential");
+    }
+
+    fn manual_live_service_relay_url() -> String {
+        std::env::var("P2P_CHAT_LIVE_RELAY_URL")
+            .ok()
+            .or_else(|| {
+                std::env::var("P2P_CHAT_LIVE_RELAY_URLS").ok().and_then(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .find(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| "wss://nos.lol".into())
+    }
+
+    fn ensure_live_runtime_binary_ready() {
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let output = Command::new("cargo")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(&manifest_path)
+            .arg("--bin")
+            .arg("p2p-chat-runtime")
+            .output()
+            .expect("failed to invoke cargo build for p2p-chat-runtime");
+        assert!(
+            output.status.success(),
+            "cargo build --bin p2p-chat-runtime failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn text_message(
@@ -1697,6 +2151,45 @@ mod tests {
                 content: body.into(),
                 signature: "d".repeat(128),
             }),
+            reply_to: None,
+        }
+    }
+
+    fn local_media_message(
+        id: &str,
+        kind: MessageKind,
+        body: &str,
+        label: &str,
+        local_path: &str,
+    ) -> MessageItem {
+        let meta = match kind {
+            MessageKind::File => serde_json::json!({
+                "version": 1,
+                "label": label,
+                "localPath": local_path,
+            })
+            .to_string(),
+            MessageKind::Image | MessageKind::Video => serde_json::json!({
+                "version": 2,
+                "label": label,
+                "localPath": local_path,
+            })
+            .to_string(),
+            _ => label.to_string(),
+        };
+
+        MessageItem {
+            id: id.into(),
+            kind,
+            author: MessageAuthor::Me,
+            body: body.into(),
+            time: "now".into(),
+            meta: Some(meta),
+            delivery_status: Some(MessageDeliveryStatus::Sent),
+            remote_id: Some(format!("relay-ack:{id}")),
+            sync_source: Some(MessageSyncSource::Local),
+            acked_at: Some("now".into()),
+            signed_nostr_event: None,
             reply_to: None,
         }
     }
@@ -1979,6 +2472,246 @@ mod tests {
     }
 
     #[test]
+    fn collect_transport_outbound_media_messages_filters_to_local_media_without_remote_url() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.circles.push(CircleItem {
+            id: "circle-2".into(),
+            name: "Circle 2".into(),
+            relay: "wss://relay-2.example.com".into(),
+            circle_type: CircleType::Default,
+            status: CircleStatus::Open,
+            latency: "18 ms".into(),
+            description: "test".into(),
+        });
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.sessions.push(direct_session("session-2", "circle-2"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![
+                local_media_message(
+                    "message-image",
+                    MessageKind::Image,
+                    "preview.png",
+                    "PNG · 32 KB",
+                    "/tmp/chat-media/images/preview.png",
+                ),
+                MessageItem {
+                    meta: Some(
+                        serde_json::json!({
+                            "version": 3,
+                            "label": "PNG · uploaded",
+                            "localPath": "/tmp/chat-media/images/already-uploaded.png",
+                            "remoteUrl": "https://cdn.example.test/chat-media/already-uploaded.png",
+                        })
+                        .to_string(),
+                    ),
+                    ..local_media_message(
+                        "message-image-uploaded",
+                        MessageKind::Image,
+                        "already-uploaded.png",
+                        "PNG · uploaded",
+                        "/tmp/chat-media/images/already-uploaded.png",
+                    )
+                },
+            ],
+        );
+        seed.message_store.insert(
+            "session-2".into(),
+            vec![local_media_message(
+                "message-video-other-circle",
+                MessageKind::Video,
+                "clip.mp4",
+                "MP4 · 0:08",
+                "/tmp/chat-media/videos/clip.mp4",
+            )],
+        );
+
+        let guard = test_app();
+        let outbound_media_messages = collect_transport_outbound_media_messages(
+            guard.app.handle(),
+            &seed,
+            &TransportCache {
+                outbound_media_dispatches: vec![TransportOutboundMediaDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-image-uploaded".into(),
+                    remote_id: "relay-ack:message-image-uploaded".into(),
+                    local_path: "/tmp/chat-media/images/already-uploaded.png".into(),
+                    runtime_generation: 1,
+                    request_id: "sync:circle-1:media-uploaded".into(),
+                    dispatched_at: "now".into(),
+                }],
+                ..TransportCache::default()
+            },
+            Some(&TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            }),
+        );
+
+        assert_eq!(outbound_media_messages.len(), 1);
+        assert_eq!(outbound_media_messages[0].session_id, "session-1");
+        assert_eq!(outbound_media_messages[0].message_id, "message-image");
+        assert!(matches!(
+            outbound_media_messages[0].kind,
+            MessageKind::Image
+        ));
+        assert_eq!(outbound_media_messages[0].label, "PNG · 32 KB");
+        assert_eq!(
+            outbound_media_messages[0].local_path,
+            "/tmp/chat-media/images/preview.png"
+        );
+        assert!(outbound_media_messages[0]
+            .remote_url
+            .starts_with("http://127.0.0.1:45115/chat-media/asset/"));
+    }
+
+    #[test]
+    fn collect_transport_outbound_media_messages_skips_already_dispatched_local_media() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![local_media_message(
+                "message-image",
+                MessageKind::Image,
+                "preview.png",
+                "PNG · 32 KB",
+                "/tmp/chat-media/images/preview.png",
+            )],
+        );
+
+        let guard = test_app();
+        let outbound_media_messages = collect_transport_outbound_media_messages(
+            guard.app.handle(),
+            &seed,
+            &TransportCache {
+                outbound_media_dispatches: vec![TransportOutboundMediaDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-image".into(),
+                    remote_id: "relay-ack:message-image".into(),
+                    local_path: "/tmp/chat-media/images/preview.png".into(),
+                    runtime_generation: 1,
+                    request_id: "publish:circle-1:1".into(),
+                    dispatched_at: "now".into(),
+                }],
+                ..TransportCache::default()
+            },
+            None,
+        );
+
+        assert!(outbound_media_messages.is_empty());
+    }
+
+    #[test]
+    fn collect_transport_outbound_media_messages_uses_configured_upload_backend() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let stored = crate::infra::media_store::store_chat_media_asset(
+            app_handle,
+            crate::domain::chat::StoreChatMediaAssetInput {
+                kind: crate::domain::chat::ChatMediaKind::Image,
+                name: "preview.png".into(),
+                data_url: "data:image/png;base64,aGVsbG8=".into(),
+            },
+        )
+        .expect("media should be stored");
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("upload server should bind");
+        let address = listener
+            .local_addr()
+            .expect("upload server address should resolve");
+        std::env::set_var("P2P_CHAT_MEDIA_UPLOAD_DRIVER", "filedrop");
+        std::env::set_var(
+            "P2P_CHAT_MEDIA_UPLOAD_ENDPOINT",
+            format!("http://{address}"),
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("upload server should accept");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = std::io::Read::read(&mut stream, &mut buffer)
+                    .expect("upload request should read");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                {
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if !name.eq_ignore_ascii_case("content-length") {
+                                return None;
+                            }
+                            value.trim().parse::<usize>().ok()
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            let response_body =
+                r#"{"url":"https://cdn.example.test/chat-media/uploaded-preview.png"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes())
+                .expect("upload response should be written");
+        });
+
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![local_media_message(
+                "message-image",
+                MessageKind::Image,
+                "preview.png",
+                "PNG · 32 KB",
+                &stored.local_path,
+            )],
+        );
+
+        let outbound_media_messages = collect_transport_outbound_media_messages(
+            app_handle,
+            &seed,
+            &TransportCache::default(),
+            Some(&TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::Sync,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            }),
+        );
+        server.join().expect("upload server should exit cleanly");
+        std::env::remove_var("P2P_CHAT_MEDIA_UPLOAD_DRIVER");
+        std::env::remove_var("P2P_CHAT_MEDIA_UPLOAD_ENDPOINT");
+
+        assert_eq!(outbound_media_messages.len(), 1);
+        assert_eq!(
+            outbound_media_messages[0].remote_url,
+            "https://cdn.example.test/chat-media/uploaded-preview.png"
+        );
+    }
+
+    #[test]
     fn collect_transport_outbound_messages_keeps_legacy_pending_local_signed_messages() {
         let mut seed = seed(CircleStatus::Open, "18 ms");
         seed.sessions.push(direct_session("session-1", "circle-1"));
@@ -2129,6 +2862,7 @@ mod tests {
                 experimental_transport: true,
                 sync_since_created_at: None,
             },
+            None,
         );
         let mut expected_group_pubkeys = vec![group_sender_pubkey, other_group_pubkey];
         expected_group_pubkeys.sort_unstable();
@@ -2164,6 +2898,7 @@ mod tests {
                 experimental_transport: true,
                 sync_since_created_at: None,
             },
+            None,
         );
 
         assert_eq!(
@@ -2173,6 +2908,70 @@ mod tests {
                 tagged_pubkeys: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn relay_sync_filters_include_self_authored_direct_group_and_self_chat_queries() {
+        let current_user_pubkey =
+            valid_pubkey_hex("9999999999999999999999999999999999999999999999999999999999999999");
+        let direct_pubkey = valid_sender_pubkey_hex();
+        let group_sender_pubkey = valid_group_member_pubkey_hex();
+        let other_group_pubkey =
+            valid_pubkey_hex("4444444444444444444444444444444444444444444444444444444444444444");
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.contacts
+            .push(contact("direct-contact", &direct_pubkey));
+        seed.contacts
+            .push(contact("bob-contact", &group_sender_pubkey));
+        seed.contacts
+            .push(contact("carol-contact", &other_group_pubkey));
+        seed.sessions.push(direct_session_with_contact(
+            "direct-1",
+            "circle-1",
+            "direct-contact",
+        ));
+        seed.sessions
+            .push(group_session("group-1", "circle-1", "Design Crew"));
+        seed.sessions
+            .push(self_session("self-circle-1", "circle-1"));
+        seed.groups
+            .push(group_profile("group-1", &["bob-contact", "carol-contact"]));
+
+        let filters = relay_sync_filters(
+            &seed,
+            &TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::SyncSessions,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            },
+            Some(current_user_pubkey.as_str()),
+        );
+        let mut expected_group_pubkeys = vec![group_sender_pubkey, other_group_pubkey];
+        expected_group_pubkeys.sort_unstable();
+
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: vec![direct_pubkey.clone()],
+            tagged_pubkeys: Vec::new(),
+        }));
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: vec![current_user_pubkey.clone()],
+            tagged_pubkeys: vec![direct_pubkey],
+        }));
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: expected_group_pubkeys.clone(),
+            tagged_pubkeys: expected_group_pubkeys.clone(),
+        }));
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: vec![current_user_pubkey.clone()],
+            tagged_pubkeys: expected_group_pubkeys,
+        }));
+        assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: vec![current_user_pubkey],
+            tagged_pubkeys: Vec::new(),
+        }));
     }
 
     #[test]
@@ -2210,6 +3009,37 @@ mod tests {
         );
 
         assert_eq!(since, Some(1_735_689_900));
+    }
+
+    #[test]
+    fn relay_sync_since_created_at_supports_sync_sessions_actions() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        let mut relay_peer =
+            inbound_relay_message("relay-event-1", &sender_pubkey, "older relay peer");
+        relay_peer
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .created_at = 1_735_689_600;
+        seed.message_store
+            .insert("session-1".into(), vec![relay_peer]);
+
+        let since = relay_sync_since_created_at(
+            &seed,
+            &TransportCache::default(),
+            &TransportCircleActionInput {
+                circle_id: "circle-1".into(),
+                action: TransportCircleAction::SyncSessions,
+                active_circle_id: Some("circle-1".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            },
+        );
+
+        assert_eq!(since, Some(1_735_689_300));
     }
 
     #[test]
@@ -2306,6 +3136,62 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_transport_repository_roundtrips_relay_background_sync_markers() {
+        let guard = test_app();
+        let repository = SqliteTransportRepository::new(guard.app.handle());
+        let expected = vec![
+            TransportRelayBackgroundSyncMarker {
+                circle_id: "circle-1".into(),
+                last_requested_at_ms: 1_735_689_300,
+            },
+            TransportRelayBackgroundSyncMarker {
+                circle_id: "circle-2".into(),
+                last_requested_at_ms: 1_735_690_100,
+            },
+        ];
+
+        repository
+            .save_transport_cache(TransportCache {
+                relay_background_sync_markers: expected.clone(),
+                ..TransportCache::default()
+            })
+            .expect("transport cache should save");
+        let cache = repository
+            .load_transport_cache()
+            .expect("transport cache should load");
+
+        assert_eq!(cache.relay_background_sync_markers, expected);
+    }
+
+    #[test]
+    fn sqlite_transport_repository_roundtrips_outbound_media_dispatches() {
+        let guard = test_app();
+        let repository = SqliteTransportRepository::new(guard.app.handle());
+        let expected = vec![TransportOutboundMediaDispatch {
+            circle_id: "circle-1".into(),
+            session_id: "session-1".into(),
+            message_id: "message-media-1".into(),
+            remote_id: "relay-ack:message-media-1".into(),
+            local_path: "/tmp/chat-media/images/preview.png".into(),
+            runtime_generation: 3,
+            request_id: "publish:circle-1:123".into(),
+            dispatched_at: "now".into(),
+        }];
+
+        repository
+            .save_transport_cache(TransportCache {
+                outbound_media_dispatches: expected.clone(),
+                ..TransportCache::default()
+            })
+            .expect("transport cache should save");
+        let cache = repository
+            .load_transport_cache()
+            .expect("transport cache should load");
+
+        assert_eq!(cache.outbound_media_dispatches, expected);
+    }
+
+    #[test]
     fn reconcile_transport_outbound_dispatches_drops_missing_replaced_and_stale_generation_records()
     {
         let mut seed = seed(CircleStatus::Open, "18 ms");
@@ -2377,6 +3263,100 @@ mod tests {
         assert_eq!(cache.outbound_dispatches.len(), 1);
         assert_eq!(cache.outbound_dispatches[0].message_id, "message-queued");
         assert_eq!(cache.outbound_dispatches[0].event_id, "event-queued");
+    }
+
+    #[test]
+    fn reconcile_transport_outbound_dispatches_drops_uploaded_missing_and_stale_media_records() {
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions.push(direct_session("session-1", "circle-1"));
+        seed.message_store.insert(
+            "session-1".into(),
+            vec![
+                local_media_message(
+                    "message-image-queued",
+                    MessageKind::Image,
+                    "queued.png",
+                    "PNG · queued",
+                    "/tmp/chat-media/images/queued.png",
+                ),
+                MessageItem {
+                    meta: Some(
+                        serde_json::json!({
+                            "version": 3,
+                            "label": "PNG · uploaded",
+                            "localPath": "/tmp/chat-media/images/uploaded.png",
+                            "remoteUrl": "https://cdn.example.test/chat-media/uploaded.png",
+                        })
+                        .to_string(),
+                    ),
+                    ..local_media_message(
+                        "message-image-uploaded",
+                        MessageKind::Image,
+                        "uploaded.png",
+                        "PNG · uploaded",
+                        "/tmp/chat-media/images/uploaded.png",
+                    )
+                },
+            ],
+        );
+        let mut cache = TransportCache {
+            runtime_registry: vec![runtime_entry(TransportRuntimeState::Active)],
+            outbound_media_dispatches: vec![
+                TransportOutboundMediaDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-image-queued".into(),
+                    remote_id: "relay-ack:message-image-queued".into(),
+                    local_path: "/tmp/chat-media/images/queued.png".into(),
+                    runtime_generation: 1,
+                    request_id: "publish:circle-1:queued".into(),
+                    dispatched_at: "now".into(),
+                },
+                TransportOutboundMediaDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-image-uploaded".into(),
+                    remote_id: "relay-ack:message-image-uploaded".into(),
+                    local_path: "/tmp/chat-media/images/uploaded.png".into(),
+                    runtime_generation: 1,
+                    request_id: "publish:circle-1:uploaded".into(),
+                    dispatched_at: "now".into(),
+                },
+                TransportOutboundMediaDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-image-queued".into(),
+                    remote_id: "relay-ack:message-image-queued".into(),
+                    local_path: "/tmp/chat-media/images/queued.png".into(),
+                    runtime_generation: 0,
+                    request_id: "publish:circle-1:stale-generation".into(),
+                    dispatched_at: "now".into(),
+                },
+                TransportOutboundMediaDispatch {
+                    circle_id: "circle-1".into(),
+                    session_id: "session-1".into(),
+                    message_id: "message-image-missing".into(),
+                    remote_id: "relay-ack:message-image-missing".into(),
+                    local_path: "/tmp/chat-media/images/missing.png".into(),
+                    runtime_generation: 1,
+                    request_id: "publish:circle-1:missing".into(),
+                    dispatched_at: "now".into(),
+                },
+            ],
+            ..TransportCache::default()
+        };
+
+        reconcile_transport_outbound_dispatches(&mut cache, &seed);
+
+        assert_eq!(cache.outbound_media_dispatches.len(), 1);
+        assert_eq!(
+            cache.outbound_media_dispatches[0].message_id,
+            "message-image-queued"
+        );
+        assert_eq!(
+            cache.outbound_media_dispatches[0].local_path,
+            "/tmp/chat-media/images/queued.png"
+        );
     }
 
     #[test]
@@ -2893,6 +3873,318 @@ mod tests {
             .find(|item| item.session_id == "alice")
             .expect("missing alice sync item");
         assert_eq!(alice_sync.pending_messages, 0);
+    }
+
+    #[test]
+    #[ignore = "manual live public relay service smoke test"]
+    fn manual_live_public_relay_snapshot_autostart_publish_smoke() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        ensure_live_runtime_binary_ready();
+        let relay_url = manual_live_service_relay_url();
+        let contact_pubkey = valid_pubkey_hex(
+            "6666666666666666666666666666666666666666666666666666666666666666",
+        );
+
+        let mut seed = load_seed_from_store(app_handle);
+        set_circle_relay(&mut seed, "main-circle", &relay_url);
+        save_seed_to_store(app_handle, seed);
+        set_contact_pubkey(app_handle, "mika-contact", &contact_pubkey);
+        seed_authenticated_local_secret_runtime(app_handle, "mika");
+
+        let sent_seed = chat_mutations::send_message(
+            app_handle,
+            SendMessageInput {
+                session_id: "mika".into(),
+                body: "Local transport service live smoke should autostart publish.".into(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to send local autostart smoke message");
+        let sent_message = sent_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("missing outbound local autostart smoke message");
+        assert!(matches!(
+            sent_message.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+
+        let service = LocalTransportService::new(app_handle);
+        let snapshot_input = TransportSnapshotInput {
+            active_circle_id: Some("main-circle".into()),
+            use_tor_network: false,
+            experimental_transport: true,
+        };
+
+        let initial_snapshot = service
+            .load_snapshot(snapshot_input.clone())
+            .expect("initial snapshot should auto-launch the live runtime");
+        let initial_runtime = initial_snapshot
+            .runtime_sessions
+            .iter()
+            .find(|session| session.circle_id == "main-circle")
+            .expect("missing runtime session for main-circle");
+        assert!(matches!(
+            initial_runtime.desired_state,
+            TransportRuntimeDesiredState::Running
+        ));
+        assert!(
+            matches!(
+                initial_runtime.last_launch_result,
+                Some(TransportRuntimeLaunchResult::Spawned)
+                    | Some(TransportRuntimeLaunchResult::Reused)
+            ) || matches!(
+                initial_runtime.state,
+                TransportRuntimeState::Starting | TransportRuntimeState::Active
+            ),
+            "initial snapshot should have auto-started or observed a live runtime; runtime={initial_runtime:?}"
+        );
+
+        let mut background_sync_scheduled = false;
+        let mut published = false;
+        let mut latest_runtime = initial_runtime.clone();
+
+        for _ in 0..50 {
+            thread::sleep(Duration::from_millis(500));
+            let snapshot = service
+                .load_snapshot(snapshot_input.clone())
+                .expect("live autostart smoke snapshot refresh should load");
+            if let Some(runtime) = snapshot
+                .runtime_sessions
+                .iter()
+                .find(|session| session.circle_id == "main-circle")
+            {
+                latest_runtime = runtime.clone();
+            }
+
+            let seed = load_seed_from_store(app_handle);
+            let cache = load_transport_cache_from_store(app_handle);
+            background_sync_scheduled |= cache
+                .relay_background_sync_markers
+                .iter()
+                .any(|marker| marker.circle_id == "main-circle");
+            published = seed
+                .message_store
+                .get("mika")
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .find(|message| message.id == sent_message.id)
+                })
+                .is_some_and(|message| {
+                    matches!(message.delivery_status, Some(MessageDeliveryStatus::Sent))
+                        && message.remote_id == sent_message.remote_id
+                        && message
+                            .signed_nostr_event
+                            .as_ref()
+                            .map(|event| event.event_id.as_str())
+                            == sent_message
+                                .signed_nostr_event
+                                .as_ref()
+                                .map(|event| event.event_id.as_str())
+                });
+
+            if published
+                || (background_sync_scheduled
+                    && matches!(latest_runtime.state, TransportRuntimeState::Inactive))
+            {
+                break;
+            }
+        }
+
+        let _ = service.apply_circle_action(TransportCircleActionInput {
+            circle_id: "main-circle".into(),
+            action: TransportCircleAction::Disconnect,
+            active_circle_id: Some("main-circle".into()),
+            use_tor_network: false,
+            experimental_transport: true,
+            sync_since_created_at: None,
+        });
+
+        let final_seed = load_seed_from_store(app_handle);
+        let final_cache = load_transport_cache_from_store(app_handle);
+        let final_message = final_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.iter().find(|message| message.id == sent_message.id))
+            .cloned();
+
+        assert!(
+            matches!(
+                latest_runtime.state,
+                TransportRuntimeState::Active | TransportRuntimeState::Starting
+            ),
+            "latest runtime session={latest_runtime:?}"
+        );
+        assert!(
+            background_sync_scheduled,
+            "load_snapshot should schedule automatic background relay sync for the auto-started live runtime; markers={:?}",
+            final_cache.relay_background_sync_markers
+        );
+        assert!(
+            published,
+            "local signed message should publish through the auto-started runtime on `{relay_url}`; latest_runtime={latest_runtime:?}; final_message={final_message:?}; dispatches={:?}; activities={:?}",
+            final_cache.outbound_dispatches,
+            final_cache.activities
+        );
+    }
+
+    #[test]
+    #[ignore = "manual live public relay service smoke test"]
+    fn manual_live_public_relay_connect_publish_smoke() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        ensure_live_runtime_binary_ready();
+        let relay_url = manual_live_service_relay_url();
+        let contact_pubkey = valid_pubkey_hex(
+            "6666666666666666666666666666666666666666666666666666666666666666",
+        );
+
+        let mut seed = load_seed_from_store(app_handle);
+        set_circle_relay(&mut seed, "main-circle", &relay_url);
+        save_seed_to_store(app_handle, seed);
+        set_contact_pubkey(app_handle, "mika-contact", &contact_pubkey);
+        seed_authenticated_local_secret_runtime(app_handle, "mika");
+
+        let sent_seed = chat_mutations::send_message(
+            app_handle,
+            SendMessageInput {
+                session_id: "mika".into(),
+                body: "Local transport service live smoke should auto-publish.".into(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to send local smoke message");
+        let sent_message = sent_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("missing outbound local smoke message");
+        assert!(matches!(
+            sent_message.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+
+        let service = LocalTransportService::new(app_handle);
+        let snapshot_input = TransportSnapshotInput {
+            active_circle_id: Some("main-circle".into()),
+            use_tor_network: false,
+            experimental_transport: true,
+        };
+
+        let connect = service
+            .apply_circle_action(TransportCircleActionInput {
+                circle_id: "main-circle".into(),
+                action: TransportCircleAction::Connect,
+                active_circle_id: Some("main-circle".into()),
+                use_tor_network: false,
+                experimental_transport: true,
+                sync_since_created_at: None,
+            })
+            .expect("connect action should launch the live runtime");
+        let initial_runtime = connect
+            .snapshot
+            .runtime_sessions
+            .iter()
+            .find(|session| session.circle_id == "main-circle")
+            .expect("missing runtime session for main-circle");
+        assert!(matches!(
+            initial_runtime.desired_state,
+            TransportRuntimeDesiredState::Running
+        ));
+        assert!(matches!(
+            initial_runtime.state,
+            TransportRuntimeState::Starting | TransportRuntimeState::Active
+        ));
+
+        let mut background_sync_scheduled = false;
+        let mut published = false;
+        let mut latest_runtime = initial_runtime.clone();
+
+        for _ in 0..50 {
+            thread::sleep(Duration::from_millis(500));
+            let snapshot = service
+                .load_snapshot(snapshot_input.clone())
+                .expect("live smoke snapshot refresh should load");
+            if let Some(runtime) = snapshot
+                .runtime_sessions
+                .iter()
+                .find(|session| session.circle_id == "main-circle")
+            {
+                latest_runtime = runtime.clone();
+            }
+
+            let seed = load_seed_from_store(app_handle);
+            let cache = load_transport_cache_from_store(app_handle);
+            background_sync_scheduled |= cache
+                .relay_background_sync_markers
+                .iter()
+                .any(|marker| marker.circle_id == "main-circle");
+            published = seed
+                .message_store
+                .get("mika")
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .find(|message| message.id == sent_message.id)
+                })
+                .is_some_and(|message| {
+                    matches!(message.delivery_status, Some(MessageDeliveryStatus::Sent))
+                        && message.remote_id == sent_message.remote_id
+                        && message
+                            .signed_nostr_event
+                            .as_ref()
+                            .map(|event| event.event_id.as_str())
+                            == sent_message
+                                .signed_nostr_event
+                                .as_ref()
+                                .map(|event| event.event_id.as_str())
+                });
+
+            if published
+                || (background_sync_scheduled
+                    && matches!(latest_runtime.state, TransportRuntimeState::Inactive))
+            {
+                break;
+            }
+        }
+
+        let _ = service.apply_circle_action(TransportCircleActionInput {
+            circle_id: "main-circle".into(),
+            action: TransportCircleAction::Disconnect,
+            active_circle_id: Some("main-circle".into()),
+            use_tor_network: false,
+            experimental_transport: true,
+            sync_since_created_at: None,
+        });
+
+        let final_seed = load_seed_from_store(app_handle);
+        let final_cache = load_transport_cache_from_store(app_handle);
+        let final_message = final_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.iter().find(|message| message.id == sent_message.id))
+            .cloned();
+
+        assert!(matches!(
+            latest_runtime.state,
+            TransportRuntimeState::Active | TransportRuntimeState::Starting
+        ), "latest runtime session={latest_runtime:?}");
+        assert!(
+            background_sync_scheduled,
+            "load_snapshot should schedule automatic background relay sync for the connected live runtime; markers={:?}",
+            final_cache.relay_background_sync_markers
+        );
+        assert!(
+            published,
+            "local signed message should publish through the connected runtime on `{relay_url}`; latest_runtime={latest_runtime:?}; final_message={final_message:?}; dispatches={:?}; activities={:?}",
+            final_cache.outbound_dispatches,
+            final_cache.activities
+        );
     }
 
     #[test]

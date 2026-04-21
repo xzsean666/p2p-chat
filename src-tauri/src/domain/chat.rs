@@ -12,7 +12,7 @@ pub enum SessionKind {
     SelfChat,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageKind {
     Text,
@@ -520,6 +520,21 @@ pub struct CachedChatMessageMediaResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateChatMessageMediaRemoteUrlInput {
+    pub session_id: String,
+    pub message_id: String,
+    pub remote_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedChatMessageMediaRemoteUrlResult {
+    pub seed: ChatDomainSeed,
+    pub remote_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateSessionDraftInput {
     pub session_id: String,
     pub draft: String,
@@ -672,6 +687,10 @@ pub struct AdvancedPreferences {
     pub use_tor_network: bool,
     pub relay_diagnostics: bool,
     pub experimental_transport: bool,
+    #[serde(default = "default_media_upload_driver")]
+    pub media_upload_driver: String,
+    #[serde(default)]
+    pub media_upload_endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,8 +818,14 @@ pub fn default_advanced_preferences() -> AdvancedPreferences {
         show_message_info: false,
         use_tor_network: false,
         relay_diagnostics: true,
-        experimental_transport: false,
+        experimental_transport: true,
+        media_upload_driver: default_media_upload_driver(),
+        media_upload_endpoint: String::new(),
     }
+}
+
+pub fn default_media_upload_driver() -> String {
+    "auto".into()
 }
 
 pub fn default_user_profile() -> UserProfile {

@@ -9,10 +9,17 @@ use reqwest::header::CONTENT_TYPE;
 use serde_json::Value as JsonValue;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Manager, Runtime};
+
+const LOCAL_CHAT_MEDIA_SERVER_PORT: u16 = 45115;
+const LOCAL_CHAT_MEDIA_ROUTE_PREFIX: &str = "/chat-media/asset/";
 
 pub fn store_chat_media_asset<R: Runtime>(
     app_handle: &tauri::AppHandle<R>,
@@ -24,7 +31,13 @@ pub fn store_chat_media_asset<R: Runtime>(
     }
 
     let parsed = decode_data_url(&input.data_url)?;
-    persist_media_asset_bytes(app_handle, &input.kind, file_name, parsed.mime_type.as_deref(), &parsed.bytes)
+    persist_media_asset_bytes(
+        app_handle,
+        &input.kind,
+        file_name,
+        parsed.mime_type.as_deref(),
+        &parsed.bytes,
+    )
 }
 
 pub fn download_chat_media_asset<R: Runtime>(
@@ -70,7 +83,13 @@ pub fn download_chat_media_asset<R: Runtime>(
         return Err("media payload is empty".into());
     }
 
-    persist_media_asset_bytes(app_handle, kind, file_name, mime_type.as_deref(), bytes.as_ref())
+    persist_media_asset_bytes(
+        app_handle,
+        kind,
+        file_name,
+        mime_type.as_deref(),
+        bytes.as_ref(),
+    )
 }
 
 pub fn cleanup_chat_media_assets<R: Runtime>(
@@ -89,9 +108,62 @@ pub fn cleanup_chat_media_assets<R: Runtime>(
     Ok(CleanupChatMediaAssetsResult { removed_count })
 }
 
+pub fn local_chat_media_file_url(local_path: &str) -> Result<String, String> {
+    let normalized_path = local_path.trim();
+    if normalized_path.is_empty() {
+        return Err("local media path is empty".into());
+    }
+
+    let asset_path = PathBuf::from(normalized_path);
+    if !path_contains_chat_media_component(&asset_path) {
+        return Err("local media path must be stored under chat-media".into());
+    }
+
+    let server = local_chat_media_server()?;
+    let encoded_path = hex_encode(normalized_path.as_bytes());
+    let file_name = sanitize_route_file_name(
+        asset_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("asset.bin"),
+    );
+
+    Ok(format!(
+        "{}{}{}/{}",
+        server.base_url, LOCAL_CHAT_MEDIA_ROUTE_PREFIX, encoded_path, file_name
+    ))
+}
+
 struct ParsedDataUrl {
     mime_type: Option<String>,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct LocalChatMediaServer {
+    base_url: String,
+}
+
+impl LocalChatMediaServer {
+    fn start() -> Result<Self, String> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", LOCAL_CHAT_MEDIA_SERVER_PORT))
+            .map_err(|error| format!("failed to bind local chat media server: {error}"))?;
+        let address = listener.local_addr().map_err(|error| {
+            format!("failed to resolve local chat media server address: {error}")
+        })?;
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = handle_local_chat_media_request(&mut stream);
+            }
+        });
+
+        Ok(Self {
+            base_url: format!("http://{}", address),
+        })
+    }
 }
 
 fn persist_media_asset_bytes<R: Runtime>(
@@ -110,6 +182,20 @@ fn persist_media_asset_bytes<R: Runtime>(
     Ok(StoredChatMediaAsset {
         local_path: asset_path.to_string_lossy().into_owned(),
     })
+}
+
+fn local_chat_media_server() -> Result<&'static LocalChatMediaServer, String> {
+    static LOCAL_CHAT_MEDIA_SERVER: OnceLock<LocalChatMediaServer> = OnceLock::new();
+
+    if let Some(server) = LOCAL_CHAT_MEDIA_SERVER.get() {
+        return Ok(server);
+    }
+
+    let server = LocalChatMediaServer::start()?;
+    let _ = LOCAL_CHAT_MEDIA_SERVER.set(server);
+    LOCAL_CHAT_MEDIA_SERVER
+        .get()
+        .ok_or_else(|| "local chat media server was not initialized".to_string())
 }
 
 fn chat_media_root<R: Runtime>(app_handle: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
@@ -184,6 +270,192 @@ fn collect_referenced_media_paths(
         .map(PathBuf::from)
         .filter(|path| path.starts_with(media_root))
         .collect()
+}
+
+fn path_contains_chat_media_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(segment) => segment == OsStr::new("chat-media"),
+        _ => false,
+    })
+}
+
+fn sanitize_route_file_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                Some(character)
+            } else {
+                None
+            }
+        })
+        .take(96)
+        .collect::<String>();
+
+    if sanitized.is_empty() {
+        "asset.bin".into()
+    } else {
+        sanitized
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() || value.len() % 2 != 0 {
+        return Err("local media asset token is invalid".into());
+    }
+
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let chunk = std::str::from_utf8(chunk)
+                .map_err(|_| "local media asset token is invalid".to_string())?;
+            u8::from_str_radix(chunk, 16)
+                .map_err(|_| "local media asset token is invalid".to_string())
+        })
+        .collect()
+}
+
+fn handle_local_chat_media_request(stream: &mut TcpStream) -> Result<(), String> {
+    let mut buffer = [0u8; 8192];
+    let bytes_read = stream
+        .read(&mut buffer)
+        .map_err(|error| format!("failed to read local media request: {error}"))?;
+    if bytes_read == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    if method != "GET" && method != "HEAD" {
+        write_http_response(
+            stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            if method == "HEAD" {
+                &[]
+            } else {
+                b"method not allowed"
+            },
+        )?;
+        return Ok(());
+    }
+
+    let Some(encoded_path) = path
+        .strip_prefix(LOCAL_CHAT_MEDIA_ROUTE_PREFIX)
+        .and_then(|value| value.split('/').next())
+    else {
+        write_http_response(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            if method == "HEAD" {
+                &[]
+            } else {
+                b"asset not found"
+            },
+        )?;
+        return Ok(());
+    };
+
+    let asset_path = hex_decode(encoded_path)
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| "local media asset token is invalid".to_string())
+        })
+        .map(PathBuf::from)?;
+    if !path_contains_chat_media_component(&asset_path) {
+        write_http_response(
+            stream,
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            if method == "HEAD" {
+                &[]
+            } else {
+                b"asset path is not allowed"
+            },
+        )?;
+        return Ok(());
+    }
+
+    let bytes = match fs::read(&asset_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_http_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                if method == "HEAD" {
+                    &[]
+                } else {
+                    b"asset not found"
+                },
+            )?;
+            return Ok(());
+        }
+        Err(error) => return Err(format!("failed to read local media asset: {error}")),
+    };
+    let content_type = media_content_type_from_path(&asset_path);
+    if method == "HEAD" {
+        write_http_response(stream, "200 OK", content_type, &[])?;
+    } else {
+        write_http_response(stream, "200 OK", content_type, &bytes)?;
+    }
+
+    Ok(())
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|error| format!("failed to write local media response head: {error}"))?;
+    if !body.is_empty() {
+        stream
+            .write_all(body)
+            .map_err(|error| format!("failed to write local media response body: {error}"))?;
+    }
+    Ok(())
+}
+
+fn media_content_type_from_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 fn meta_local_path(meta: &str) -> Option<String> {
@@ -422,6 +694,52 @@ mod tests {
         .expect_err("invalid data url should be rejected");
 
         assert!(error.contains("media data url is invalid"));
+    }
+
+    #[test]
+    fn local_chat_media_file_url_exposes_stored_media_over_http() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let stored = store_chat_media_asset(
+            app_handle,
+            StoreChatMediaAssetInput {
+                kind: ChatMediaKind::Image,
+                name: "harbor-sunrise.png".into(),
+                data_url: "data:image/png;base64,aGVsbG8=".into(),
+            },
+        )
+        .expect("media should be stored");
+
+        let remote_url =
+            local_chat_media_file_url(&stored.local_path).expect("local media url should resolve");
+        assert!(remote_url.starts_with("http://127.0.0.1:45115/chat-media/asset/"));
+
+        let response =
+            reqwest::blocking::get(&remote_url).expect("local media file server should respond");
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.bytes().expect("local media bytes should load"),
+            b"hello".as_slice()
+        );
+    }
+
+    #[test]
+    fn local_chat_media_file_url_rejects_paths_outside_chat_media() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "p2p-chat-non-media-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be after unix epoch")
+                .as_nanos()
+        ));
+        fs::write(&temp_path, b"outside").expect("temp file should be created");
+
+        let error = local_chat_media_file_url(temp_path.to_string_lossy().as_ref())
+            .expect_err("outside path should be rejected");
+        assert!(error.contains("chat-media"));
+
+        let _ = fs::remove_file(temp_path);
     }
 
     #[test]

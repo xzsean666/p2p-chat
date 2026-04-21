@@ -8,6 +8,7 @@ pub mod local_transport_runtime_adapter;
 pub mod local_transport_runtime_manager;
 pub mod local_transport_service;
 pub mod media_store;
+pub mod media_upload;
 pub mod mock_transport_adapters;
 pub mod mock_transport_engine;
 pub mod mock_transport_runtime;

@@ -108,6 +108,19 @@ function normalizeAdvancedPreferences(
       typeof value?.experimentalTransport === "boolean"
         ? value.experimentalTransport
         : fallback.experimentalTransport,
+    mediaUploadDriver:
+      value?.mediaUploadDriver === "auto" ||
+      value?.mediaUploadDriver === "local" ||
+      value?.mediaUploadDriver === "filedrop" ||
+      value?.mediaUploadDriver === "nip96" ||
+      value?.mediaUploadDriver === "blossom" ||
+      value?.mediaUploadDriver === "minio"
+        ? value.mediaUploadDriver
+        : fallback.mediaUploadDriver,
+    mediaUploadEndpoint:
+      typeof value?.mediaUploadEndpoint === "string"
+        ? value.mediaUploadEndpoint.trim()
+        : fallback.mediaUploadEndpoint,
   };
 }
 

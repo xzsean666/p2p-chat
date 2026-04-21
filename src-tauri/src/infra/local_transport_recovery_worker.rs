@@ -1,7 +1,8 @@
 use crate::domain::chat::ChatDomainSeed;
 use crate::domain::transport::{
-    TransportCircleAction, TransportCircleActionInput, TransportRuntimeDesiredState,
-    TransportRuntimeLaunchStatus, TransportRuntimeRecoveryPolicy, TransportRuntimeState,
+    TransportCircleAction, TransportCircleActionInput, TransportRuntimeAdapterKind,
+    TransportRuntimeDesiredState, TransportRuntimeLaunchStatus, TransportRuntimeRecoveryPolicy,
+    TransportRuntimeRegistryEntry, TransportRuntimeState,
 };
 use crate::domain::transport_adapter::TransportRuntimeOptions;
 use crate::domain::transport_repository::TransportCache;
@@ -64,7 +65,9 @@ pub fn collect_local_transport_recovery_actions(
                 return None;
             }
 
-            let action = if matches!(runtime.state, TransportRuntimeState::Starting) {
+            let action = if needs_bootstrap_connect(runtime) {
+                Some(TransportCircleAction::Connect)
+            } else if matches!(runtime.state, TransportRuntimeState::Starting) {
                 Some(TransportCircleAction::Sync)
             } else if matches!(runtime.state, TransportRuntimeState::Inactive)
                 && runtime
@@ -83,6 +86,14 @@ pub fn collect_local_transport_recovery_actions(
             })
         })
         .collect()
+}
+
+fn needs_bootstrap_connect(runtime: &TransportRuntimeRegistryEntry) -> bool {
+    matches!(runtime.adapter_kind, TransportRuntimeAdapterKind::LocalCommand)
+        && matches!(runtime.launch_status, TransportRuntimeLaunchStatus::Ready)
+        && runtime.last_launch_result.is_none()
+        && runtime.last_launch_pid.is_none()
+        && runtime.last_launch_at.is_none()
 }
 
 fn current_time_millis() -> u64 {
@@ -112,9 +123,10 @@ mod tests {
     use super::*;
     use crate::domain::chat::{ChatDomainSeed, CircleItem, CircleStatus, CircleType};
     use crate::domain::transport::{
-        TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchStatus,
-        TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry,
-        TransportRuntimeSession, TransportRuntimeState,
+        TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchResult,
+        TransportRuntimeLaunchStatus, TransportRuntimeQueueState,
+        TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry, TransportRuntimeSession,
+        TransportRuntimeState,
     };
     use crate::domain::transport_repository::TransportCache;
     use crate::domain::transport_runtime_registry::TransportRuntimeLabels;
@@ -180,14 +192,19 @@ mod tests {
 
     #[test]
     fn closed_auto_runtime_waits_until_retry_deadline() {
+        let mut runtime = auto_runtime(
+            TransportRuntimeState::Inactive,
+            Some("in 3s"),
+            Some(u64::MAX),
+        );
+        runtime.last_launch_result = Some(TransportRuntimeLaunchResult::Spawned);
+        runtime.last_launch_pid = Some(7);
+        runtime.last_launch_at = Some("now".into());
+
         let actions = collect_local_transport_recovery_actions(
             &seed(CircleStatus::Closed),
             &TransportCache {
-                runtime_registry: vec![auto_runtime(
-                    TransportRuntimeState::Inactive,
-                    Some("in 3s"),
-                    Some(u64::MAX),
-                )],
+                runtime_registry: vec![runtime],
                 ..TransportCache::default()
             },
             &[ready_profile(TransportRuntimeState::Inactive)],
@@ -199,6 +216,27 @@ mod tests {
 
     #[test]
     fn connecting_auto_runtime_requests_sync() {
+        let mut runtime = auto_runtime(TransportRuntimeState::Starting, None, None);
+        runtime.last_launch_result = Some(TransportRuntimeLaunchResult::Spawned);
+        runtime.last_launch_pid = Some(42);
+        runtime.last_launch_at = Some("now".into());
+
+        let actions = collect_local_transport_recovery_actions(
+            &seed(CircleStatus::Connecting),
+            &TransportCache {
+                runtime_registry: vec![runtime],
+                ..TransportCache::default()
+            },
+            &[ready_profile(TransportRuntimeState::Starting)],
+            true,
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0].action, TransportCircleAction::Sync));
+    }
+
+    #[test]
+    fn connecting_auto_runtime_without_launch_markers_requests_connect() {
         let actions = collect_local_transport_recovery_actions(
             &seed(CircleStatus::Connecting),
             &TransportCache {
@@ -210,7 +248,7 @@ mod tests {
         );
 
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0].action, TransportCircleAction::Sync));
+        assert!(matches!(actions[0].action, TransportCircleAction::Connect));
     }
 
     #[test]

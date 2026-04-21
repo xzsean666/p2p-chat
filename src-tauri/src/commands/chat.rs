@@ -2,15 +2,16 @@ use crate::app::{chat_mutations, chat_queries};
 use crate::domain::chat::{
     AddCircleInput, AddCircleResult, CacheChatMessageMediaInput, CachedChatMessageMediaResult,
     ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage,
-    ChatShellSnapshot, CleanupChatMediaAssetsResult,
-    CreateGroupConversationInput, LoadSessionMessageUpdatesInput, LoadSessionMessagesInput,
-    LoginCompletionInput, MergeRemoteDeliveryReceiptsInput, MergeRemoteMessagesInput,
-    RestoreCircleInput, RetryMessageDeliveryInput, SendFileMessageInput, SendImageMessageInput,
-    SendMessageInput, SendVideoMessageInput, SessionActionInput, ShellStateSnapshot,
-    StartConversationInput, StartConversationResult, StartLookupConversationInput,
-    StartSelfConversationInput, StoreChatMediaAssetInput, StoredChatMediaAsset,
-    UpdateAuthRuntimeInput, UpdateCircleInput, UpdateContactRemarkInput, UpdateGroupMembersInput,
-    UpdateGroupNameInput, UpdateMessageDeliveryStatusInput, UpdateSessionDraftInput,
+    ChatShellSnapshot, CleanupChatMediaAssetsResult, CreateGroupConversationInput,
+    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCompletionInput,
+    MergeRemoteDeliveryReceiptsInput, MergeRemoteMessagesInput, RestoreCircleInput,
+    RetryMessageDeliveryInput, SendFileMessageInput, SendImageMessageInput, SendMessageInput,
+    SendVideoMessageInput, SessionActionInput, ShellStateSnapshot, StartConversationInput,
+    StartConversationResult, StartLookupConversationInput, StartSelfConversationInput,
+    StoreChatMediaAssetInput, StoredChatMediaAsset, UpdateAuthRuntimeInput,
+    UpdateChatMessageMediaRemoteUrlInput, UpdateCircleInput, UpdateContactRemarkInput,
+    UpdateGroupMembersInput, UpdateGroupNameInput, UpdateMessageDeliveryStatusInput,
+    UpdateSessionDraftInput, UpdatedChatMessageMediaRemoteUrlResult,
 };
 
 #[tauri::command]
@@ -143,6 +144,14 @@ pub fn cache_chat_message_media(
     input: CacheChatMessageMediaInput,
 ) -> Result<CachedChatMessageMediaResult, String> {
     chat_mutations::cache_chat_message_media(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn update_chat_message_media_remote_url(
+    app_handle: tauri::AppHandle,
+    input: UpdateChatMessageMediaRemoteUrlInput,
+) -> Result<UpdatedChatMessageMediaRemoteUrlResult, String> {
+    chat_mutations::update_chat_message_media_remote_url(&app_handle, input)
 }
 
 #[tauri::command]

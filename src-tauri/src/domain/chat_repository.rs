@@ -367,7 +367,8 @@ pub(crate) fn merge_message_records(existing: MessageItem, incoming: MessageItem
             incoming.sync_source.as_ref(),
             Some(MessageSyncSource::Relay)
         );
-    let merged_meta = merge_message_meta(&incoming.kind, existing.meta.clone(), incoming.meta.clone());
+    let merged_meta =
+        merge_message_meta(&incoming.kind, existing.meta.clone(), incoming.meta.clone());
 
     MessageItem {
         id: if preserve_existing_id {
@@ -448,15 +449,27 @@ fn merge_structured_media_message_meta(
         preview_data_url: incoming_meta
             .as_ref()
             .and_then(|meta| meta.preview_data_url.clone())
-            .or_else(|| existing_meta.as_ref().and_then(|meta| meta.preview_data_url.clone())),
+            .or_else(|| {
+                existing_meta
+                    .as_ref()
+                    .and_then(|meta| meta.preview_data_url.clone())
+            }),
         local_path: incoming_meta
             .as_ref()
             .and_then(|meta| meta.local_path.clone())
-            .or_else(|| existing_meta.as_ref().and_then(|meta| meta.local_path.clone())),
+            .or_else(|| {
+                existing_meta
+                    .as_ref()
+                    .and_then(|meta| meta.local_path.clone())
+            }),
         remote_url: incoming_meta
             .as_ref()
             .and_then(|meta| meta.remote_url.clone())
-            .or_else(|| existing_meta.as_ref().and_then(|meta| meta.remote_url.clone())),
+            .or_else(|| {
+                existing_meta
+                    .as_ref()
+                    .and_then(|meta| meta.remote_url.clone())
+            }),
     };
 
     encode_structured_media_meta(kind, merged)
@@ -470,13 +483,46 @@ pub(crate) fn message_media_remote_url(message: &MessageItem) -> Option<String> 
     decode_structured_media_meta(&message.kind, message.meta.as_deref()?)?.remote_url
 }
 
+pub(crate) fn message_media_label(message: &MessageItem) -> Option<String> {
+    normalized_message_media_meta(message).map(|meta| meta.label)
+}
+
 pub(crate) fn message_media_meta_with_local_path(
     message: &MessageItem,
     local_path: String,
 ) -> Option<String> {
-    let mut meta = decode_structured_media_meta(&message.kind, message.meta.as_deref()?)?;
+    let mut meta = normalized_message_media_meta(message)?;
     meta.local_path = Some(local_path);
     encode_structured_media_meta(&message.kind, meta)
+}
+
+pub(crate) fn message_media_meta_with_remote_url(
+    message: &MessageItem,
+    remote_url: String,
+) -> Option<String> {
+    let mut meta = normalized_message_media_meta(message)?;
+    meta.remote_url = Some(remote_url);
+    encode_structured_media_meta(&message.kind, meta)
+}
+
+fn normalized_message_media_meta(message: &MessageItem) -> Option<NormalizedMediaMeta> {
+    decode_structured_media_meta(&message.kind, message.meta.as_deref()?).or_else(|| {
+        if !matches!(message.kind, MessageKind::File) {
+            return None;
+        }
+
+        let label = message
+            .meta
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some(message.body.trim()).filter(|value| !value.is_empty()))?;
+
+        Some(NormalizedMediaMeta {
+            label: label.to_string(),
+            ..Default::default()
+        })
+    })
 }
 
 fn decode_structured_media_meta(kind: &MessageKind, value: &str) -> Option<NormalizedMediaMeta> {
@@ -822,8 +868,9 @@ mod tests {
     }
 
     fn assert_json_meta_eq(actual: Option<&str>, expected: &str) {
-        let actual_value = actual
-            .map(|value| serde_json::from_str::<JsonValue>(value).expect("actual json should parse"));
+        let actual_value = actual.map(|value| {
+            serde_json::from_str::<JsonValue>(value).expect("actual json should parse")
+        });
         let expected_value =
             serde_json::from_str::<JsonValue>(expected).expect("expected json should parse");
         assert_eq!(actual_value, Some(expected_value));
@@ -902,6 +949,49 @@ mod tests {
         assert_json_meta_eq(
             merged.meta.as_deref(),
             r#"{"version":2,"label":"PDF · shared","localPath":"/tmp/chat-media/files/contract.pdf","remoteUrl":"https://cdn.example.test/chat-media/contract.pdf"}"#,
+        );
+    }
+
+    #[test]
+    fn message_media_meta_with_remote_url_promotes_plain_file_meta() {
+        let message = MessageItem {
+            body: "roadmap.pdf".into(),
+            meta: Some("PDF · 2.4 MB".into()),
+            ..test_message(MessageKind::File, None)
+        };
+
+        let updated = message_media_meta_with_remote_url(
+            &message,
+            "https://cdn.example.test/chat-media/roadmap.pdf".into(),
+        )
+        .expect("plain file meta should promote to remote-capable shape");
+
+        assert_json_meta_eq(
+            Some(updated.as_str()),
+            r#"{"version":2,"label":"PDF · 2.4 MB","remoteUrl":"https://cdn.example.test/chat-media/roadmap.pdf"}"#,
+        );
+    }
+
+    #[test]
+    fn message_media_meta_with_remote_url_keeps_existing_local_image_path() {
+        let message = MessageItem {
+            body: "roadmap.png".into(),
+            meta: Some(
+                r#"{"version":2,"label":"PNG · 1280 x 720","localPath":"/tmp/chat-media/images/roadmap.png"}"#
+                    .into(),
+            ),
+            ..test_message(MessageKind::Image, None)
+        };
+
+        let updated = message_media_meta_with_remote_url(
+            &message,
+            "https://cdn.example.test/chat-media/roadmap.png".into(),
+        )
+        .expect("local image meta should keep local path while adding remote url");
+
+        assert_json_meta_eq(
+            Some(updated.as_str()),
+            r#"{"version":3,"label":"PNG · 1280 x 720","localPath":"/tmp/chat-media/images/roadmap.png","remoteUrl":"https://cdn.example.test/chat-media/roadmap.png"}"#,
         );
     }
 }

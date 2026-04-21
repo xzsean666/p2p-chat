@@ -48,6 +48,13 @@ export type SettingPageId = "preferences" | "notifications" | "advanced" | "rest
 export type ThemePreference = "system" | "light" | "ink";
 export type LanguagePreference = "system" | "en" | "zh-CN";
 export type TextSizePreference = "compact" | "default" | "large";
+export type MediaUploadDriverPreference =
+  | "auto"
+  | "local"
+  | "filedrop"
+  | "nip96"
+  | "blossom"
+  | "minio";
 
 export interface UserProfile {
   name: string;
@@ -251,6 +258,8 @@ export interface AdvancedPreferences {
   useTorNetwork: boolean;
   relayDiagnostics: boolean;
   experimentalTransport: boolean;
+  mediaUploadDriver: MediaUploadDriverPreference;
+  mediaUploadEndpoint: string;
 }
 
 export interface ChatDomainSeed {
@@ -381,6 +390,17 @@ export interface CacheChatMessageMediaInput {
 export interface CachedChatMessageMediaResult {
   seed: ChatDomainSeed;
   localPath: string;
+}
+
+export interface UpdateChatMessageMediaRemoteUrlInput {
+  sessionId: string;
+  messageId: string;
+  remoteUrl: string;
+}
+
+export interface UpdatedChatMessageMediaRemoteUrlResult {
+  seed: ChatDomainSeed;
+  remoteUrl: string;
 }
 
 export interface UpdateSessionDraftInput {

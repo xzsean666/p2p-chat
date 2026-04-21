@@ -156,6 +156,15 @@ type DomainSeedMessageMode = "full" | "preview";
 
 const SESSION_MESSAGE_PAGE_SIZE = 30;
 const AUTH_RUNTIME_SYNC_INTERVAL_MS = 2500;
+const TRANSPORT_RELAY_HEARTBEAT_INTERVAL_MS = 8_000;
+const TRANSPORT_RELAY_DIAGNOSTIC_HEARTBEAT_INTERVAL_MS = 12_000;
+const TRANSPORT_RUNTIME_RECOVERY_HEARTBEAT_INTERVAL_MS = 3_000;
+const TRANSPORT_PUBLISH_WARN_TITLES = new Set([
+  "Relay rejected event",
+  "Relay closed publish connection",
+  "Relay publish timed out",
+  "Relay publish failed",
+]);
 
 function cloneState<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -792,11 +801,45 @@ export function useChatShell() {
     return null;
   }
 
+  function buildTransportActivityNotice(
+    previousSnapshot: TransportSnapshot,
+    snapshot: TransportSnapshot,
+  ): TransportNotice | null {
+    const previousActivityIds = new Set(previousSnapshot.activities.map((activity) => activity.id));
+    const nextActivity = [...snapshot.activities]
+      .reverse()
+      .find((activity) => {
+        return (
+          !previousActivityIds.has(activity.id) &&
+          activity.kind === "runtime" &&
+          activity.level === "warn" &&
+          TRANSPORT_PUBLISH_WARN_TITLES.has(activity.title)
+        );
+      });
+    if (!nextActivity) {
+      return null;
+    }
+
+    return {
+      id: `transport-activity-${nextActivity.id}`,
+      tone: "warn",
+      title: `${circleLabelForRuntimeNotice(nextActivity.circleId)}: ${nextActivity.title}`,
+      detail: nextActivity.detail,
+      circleId: nextActivity.circleId,
+    };
+  }
+
   function maybeShowTransportNoticeFromSnapshot(
     previousSnapshot: TransportSnapshot | null,
     snapshot: TransportSnapshot,
   ) {
     if (!previousSnapshot) {
+      return;
+    }
+
+    const activityNotice = buildTransportActivityNotice(previousSnapshot, snapshot);
+    if (activityNotice) {
+      showTransportNotice(activityNotice);
       return;
     }
 
@@ -1640,12 +1683,17 @@ export function useChatShell() {
       await refreshSessionMessageUpdates(selectedSession.value?.id);
     }
 
-    if (result.source !== "fallback" || desktopLoadFailed) {
+    if (desktopLoadFailed) {
       return;
     }
 
     const recoveryAction = deriveRuntimeRecoveryAction(result.snapshot, circles.value);
     if (!recoveryAction || transportBusyCircleId.value) {
+      return;
+    }
+
+    if (result.source === "tauri") {
+      await runTransportCircleAction(recoveryAction.circleId, recoveryAction.action);
       return;
     }
 
@@ -1661,15 +1709,24 @@ export function useChatShell() {
     activeTransportHeartbeatIntervalMs = 0;
   }
 
+  function relaySupportsTransportHeartbeat(relay: string) {
+    return /^(ws|wss):\/\//i.test(relay.trim());
+  }
+
+  function hasRelayTransportHeartbeatTarget() {
+    if (transportSnapshot.value?.runtimeSessions.some((session) => relaySupportsTransportHeartbeat(session.endpoint))) {
+      return true;
+    }
+
+    return circles.value.some((circle) => relaySupportsTransportHeartbeat(circle.relay));
+  }
+
   function desiredTransportHeartbeatIntervalMs() {
     if (!isAuthenticated.value) {
       return 0;
     }
 
-    if (
-      !advancedPreferences.value.relayDiagnostics &&
-      !advancedPreferences.value.experimentalTransport
-    ) {
+    if (!hasRelayTransportHeartbeatTarget()) {
       return 0;
     }
 
@@ -1677,10 +1734,12 @@ export function useChatShell() {
       return session.queueState === "queued" || session.queueState === "backoff";
     });
     if (runtimeRecoveryActive) {
-      return 3_000;
+      return TRANSPORT_RUNTIME_RECOVERY_HEARTBEAT_INTERVAL_MS;
     }
 
-    return advancedPreferences.value.relayDiagnostics ? 12_000 : 16_000;
+    return advancedPreferences.value.relayDiagnostics
+      ? TRANSPORT_RELAY_DIAGNOSTIC_HEARTBEAT_INTERVAL_MS
+      : TRANSPORT_RELAY_HEARTBEAT_INTERVAL_MS;
   }
 
   function restartTransportHeartbeat() {
@@ -4765,6 +4824,25 @@ export function useChatShell() {
       .replace(/^-+|-+$/g, "") || "circle";
   }
 
+  function normalizeCustomRelayInput(value: string) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    const candidate = trimmed.includes("://") ? trimmed : `wss://${trimmed}`;
+    try {
+      const parsed = new URL(candidate);
+      if ((parsed.protocol === "ws:" || parsed.protocol === "wss:") && parsed.hostname) {
+        return candidate;
+      }
+    } catch {
+      return trimmed;
+    }
+
+    return trimmed;
+  }
+
   function buildUniqueCircleId(baseLabel: string) {
     const baseId = buildCircleSlug(baseLabel);
     let candidate = baseId;
@@ -4791,7 +4869,7 @@ export function useChatShell() {
       payload.mode === "private"
         ? `wss://${buildCircleSlug(normalizedName)}.private.circle.local`
         : payload.mode === "custom"
-          ? payload.relay?.trim() ?? ""
+          ? normalizeCustomRelayInput(payload.relay ?? "")
           : payload.inviteCode?.trim().includes("://")
             ? payload.inviteCode.trim()
             : `invite://${payload.inviteCode?.trim() ?? ""}`;
@@ -5219,9 +5297,24 @@ export function useChatShell() {
   }
 
   function updateAdvancedPreferences(patch: Partial<AdvancedPreferences>) {
+    const mediaUploadDriver =
+      patch.mediaUploadDriver === "auto" ||
+      patch.mediaUploadDriver === "local" ||
+      patch.mediaUploadDriver === "filedrop" ||
+      patch.mediaUploadDriver === "nip96" ||
+      patch.mediaUploadDriver === "blossom" ||
+      patch.mediaUploadDriver === "minio"
+        ? patch.mediaUploadDriver
+        : undefined;
+    const mediaUploadEndpoint =
+      typeof patch.mediaUploadEndpoint === "string"
+        ? patch.mediaUploadEndpoint.trim()
+        : undefined;
     advancedPreferences.value = {
       ...advancedPreferences.value,
       ...patch,
+      ...(mediaUploadDriver ? { mediaUploadDriver } : {}),
+      ...(mediaUploadEndpoint !== undefined ? { mediaUploadEndpoint } : {}),
     };
   }
 

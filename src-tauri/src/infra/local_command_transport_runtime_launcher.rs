@@ -151,7 +151,11 @@ pub fn probe_local_command_runtime(
         .lock()
         .map_err(|_| "local command runtime registry lock poisoned".to_string())?;
     let Some(process) = registry.get_mut(circle_id) else {
-        return Ok(None);
+        return Ok(Some(TransportRuntimeProcessProbe {
+            detail: format!(
+                "local runtime handle for circle `{circle_id}` is not registered in this app session"
+            ),
+        }));
     };
 
     let pid = process.pid;
@@ -498,6 +502,16 @@ mod tests {
     }
 
     #[test]
+    fn probe_reports_missing_handle_when_circle_is_unmanaged() {
+        let circle_id = unique_circle_id("probe-missing");
+        let probe = probe_local_command_runtime(&circle_id).expect("probe should succeed");
+
+        let TransportRuntimeProcessProbe { detail } =
+            probe.expect("missing handle should surface a process probe");
+        assert!(detail.contains("is not registered in this app session"));
+    }
+
+    #[test]
     fn probe_returns_exit_detail_after_process_finishes() {
         let circle_id = unique_circle_id("probe-exit");
         let current_executable =
@@ -525,10 +539,11 @@ mod tests {
 
         let TransportRuntimeProcessProbe { detail } = probe;
         assert!(detail.contains("exited with status"));
-        assert_eq!(
-            probe_local_command_runtime(&circle_id).expect("probe should succeed"),
-            None
-        );
+        let followup_probe =
+            probe_local_command_runtime(&circle_id).expect("probe should succeed");
+        let TransportRuntimeProcessProbe { detail } =
+            followup_probe.expect("released handle should report missing registration");
+        assert!(detail.contains("is not registered in this app session"));
     }
 
     #[test]
@@ -540,6 +555,7 @@ mod tests {
                 request_id: "sync-sessions:circle-1:1".into(),
                 circle_id: circle_id.clone(),
                 action: TransportCircleAction::SyncSessions,
+                background: false,
                 primary_session_id: Some("session-1".into()),
                 session_ids: vec!["session-1".into()],
                 unread_session_ids: vec!["session-1".into()],
@@ -548,6 +564,7 @@ mod tests {
                 sync_since_created_at: None,
                 relay_sync_filters: Vec::new(),
                 outbound_messages: Vec::new(),
+                outbound_media_messages: Vec::new(),
             }),
         )
         .expect("queue event should be written");

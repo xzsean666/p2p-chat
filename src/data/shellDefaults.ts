@@ -31,7 +31,9 @@ export const defaultAdvancedPreferences: AdvancedPreferences = {
   showMessageInfo: false,
   useTorNetwork: false,
   relayDiagnostics: true,
-  experimentalTransport: false,
+  experimentalTransport: true,
+  mediaUploadDriver: "auto",
+  mediaUploadEndpoint: "",
 };
 
 export const defaultUserProfile: UserProfile = {

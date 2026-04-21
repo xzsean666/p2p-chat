@@ -1060,6 +1060,11 @@ export function deriveRuntimeRetryAction(
     return null;
   }
 
+  const needsBootstrapConnect = runtimeNeedsBootstrapConnect(session);
+  if (needsBootstrapConnect) {
+    return "connect";
+  }
+
   if (circle.status === "connecting" && session.state === "starting") {
     return "sync";
   }
@@ -1073,6 +1078,16 @@ export function deriveRuntimeRetryAction(
   }
 
   return null;
+}
+
+function runtimeNeedsBootstrapConnect(session: TransportRuntimeSession) {
+  return (
+    session.adapterKind === "localCommand" &&
+    session.launchStatus === "ready" &&
+    !session.lastLaunchAt &&
+    !session.lastLaunchPid &&
+    !session.lastLaunchResult
+  );
 }
 
 export function deriveCircleRuntimeRetryAction(
@@ -1115,8 +1130,8 @@ export function deriveRuntimeRecoveryAction(
     if (
       action === "connect" &&
       circle.status === "closed" &&
-      session.nextRetryAtMs !== undefined &&
-      session.nextRetryAtMs <= nowMs
+      (runtimeNeedsBootstrapConnect(session) ||
+        (session.nextRetryAtMs !== undefined && session.nextRetryAtMs <= nowMs))
     ) {
       return {
         circleId: session.circleId,

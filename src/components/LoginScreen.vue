@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import Button from "primevue/button";
-import Checkbox from "primevue/checkbox";
 import InputText from "primevue/inputtext";
-import Message from "primevue/message";
-import Tag from "primevue/tag";
 import Textarea from "primevue/textarea";
+import onboardingWelcomeImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-welcome.png";
+import onboardingNostrImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-nostr.png";
+import onboardingCircleImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-circle.png";
+import onboardingRelaysImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-relays.png";
 import type {
   CircleItem,
   LoginAccessInput,
@@ -15,6 +15,9 @@ import type {
   RestorableCircleEntry,
   UserProfile,
 } from "../types/chat";
+
+type CircleSheetMode = "invite" | "custom";
+type InfoSheetKind = "nostr" | "relay";
 
 const props = defineProps<{
   circles: CircleItem[];
@@ -26,49 +29,56 @@ const emit = defineEmits<{
   (event: "complete", payload: LoginCompletionInput): void;
 }>();
 
-const steps = [
-  { label: "Entry", title: "Choose how to enter XChat" },
-  { label: "Access", title: "Confirm your account access" },
-  { label: "Profile", title: "Set the local profile shell" },
-  { label: "Circle", title: "Choose the first circle context" },
-] as const;
-
 const slides = [
   {
-    title: "Desktop onboarding now follows the original rhythm",
-    text: "The rebuild keeps account entry, profile setup and circle selection as separate steps instead of collapsing everything into one button.",
+    title: "Welcome to XChat",
+    text: "Welcome to our secure, decentralized communication platform. Your journey to true privacy starts here.",
+    image: onboardingWelcomeImage,
   },
   {
-    title: "Circle context stays visible before chat even opens",
-    text: "Pick a saved relay, restore from an invite code or enter a custom endpoint before landing in the session shell.",
+    title: "Open Protocol",
+    text: "Built on the Nostr protocol. Decentralized communication where you control your identity.",
+    image: onboardingNostrImage,
   },
   {
-    title: "Signer and key import are first-class desktop paths",
-    text: "The local flow now distinguishes quick start, existing Nostr credentials and remote signer style entry points.",
+    title: "Private Circles",
+    text: "Switch seamlessly between different circles. Your conversations stay private.",
+    image: onboardingCircleImage,
   },
-];
+  {
+    title: "Custom Servers",
+    text: "Customize your relays and file servers. You have complete control over where your data is stored.",
+    image: onboardingRelaysImage,
+  },
+] as const;
+
+const NOSTR_BECH32_DATA_CHARS = "[023456789acdefghjklmnpqrstuvwxyz]+";
+const NSEC_PATTERN = new RegExp(`^nsec1${NOSTR_BECH32_DATA_CHARS}$`, "i");
+const NPUB_PATTERN = new RegExp(`^npub1${NOSTR_BECH32_DATA_CHARS}$`, "i");
+const HEX_KEY_PATTERN = /^[a-f0-9]{64}$/i;
+const HEX_PUBKEY_PATTERN = /^[a-f0-9]{64}$/i;
 
 const currentSlide = ref(0);
 const currentStep = ref(0);
 const selectedMethod = ref<LoginMethod>("quickStart");
-const agreementAccepted = ref(true);
 const accountKey = ref("");
-const signerUri = ref("");
-const displayName = ref(props.profile.name);
 const handle = ref(props.profile.handle);
 const profileStatus = ref(props.profile.status);
-const circleMode = ref<LoginCircleSelectionMode>(props.circles.length ? "existing" : "custom");
+const circleMode = ref<LoginCircleSelectionMode>(defaultCircleModeForMethod("quickStart"));
 const selectedCircleId = ref(props.circles[0]?.id ?? "");
 const selectedRestoreRelay = ref(props.restorableCircles[0]?.relay ?? "");
 const inviteCode = ref("");
 const inviteName = ref("");
-const customCircleName = ref("My Circle");
+const customCircleName = ref("");
 const customRelay = ref("");
-let timer: number | undefined;
+const activeCircleSheet = ref<CircleSheetMode | null>(null);
+const activeInfoSheet = ref<InfoSheetKind | null>(null);
 
-const selectedCircle = computed(() => {
-  return props.circles.find((circle) => circle.id === selectedCircleId.value) ?? null;
-});
+const seededName = splitName(props.profile.name);
+const firstName = ref(seededName.first);
+const lastName = ref(seededName.last);
+
+let timer: number | undefined;
 
 const selectedRestorableCircle = computed(() => {
   return props.restorableCircles.find((circle) => circle.relay === selectedRestoreRelay.value) ?? null;
@@ -78,9 +88,27 @@ const hasRestorableCircles = computed(() => {
   return props.restorableCircles.length > 0;
 });
 
+const displayName = computed(() => {
+  return [firstName.value.trim(), lastName.value.trim()].filter(Boolean).join(" ").trim();
+});
+
 const normalizedHandle = computed(() => {
-  const raw = handle.value.trim().replace(/^@+/, "").toLowerCase().replace(/[^a-z0-9._-]+/g, "");
-  return raw ? `@${raw}` : "";
+  const generated = `${firstName.value}${lastName.value}`.trim();
+  const preferred = handle.value.trim() || generated || "xchatuser";
+  const raw = preferred.replace(/^@+/, "").toLowerCase().replace(/[^a-z0-9._-]+/g, "");
+  return raw ? `@${raw}` : "@xchatuser";
+});
+
+const normalizedAccountKey = computed(() => {
+  return accountKey.value.trim();
+});
+
+const accountKeyAccessKind = computed<LoginAccessInput["kind"] | null>(() => {
+  if (selectedMethod.value !== "existingAccount") {
+    return null;
+  }
+
+  return deriveAccountKeyAccessKind(normalizedAccountKey.value);
 });
 
 const credentialValid = computed(() => {
@@ -88,132 +116,113 @@ const credentialValid = computed(() => {
     return true;
   }
 
-  if (selectedMethod.value === "existingAccount") {
-    const value = accountKey.value.trim();
-    return /^(nsec|npub|bunker:\/\/)/i.test(value) || /^[a-f0-9]{32,}$/i.test(value);
+  return accountKeyAccessKind.value !== null;
+});
+
+const remoteSignerSelected = computed(() => {
+  return accountKeyAccessKind.value === "bunker" || accountKeyAccessKind.value === "nostrConnect";
+});
+
+const nostrConnectSelected = computed(() => {
+  return accountKeyAccessKind.value === "nostrConnect";
+});
+
+const invalidRemoteSignerHintVisible = computed(() => {
+  const value = normalizedAccountKey.value.toLowerCase();
+  if (accountKeyAccessKind.value !== null) {
+    return false;
   }
 
-  return /^(bunker:\/\/|nostrconnect:\/\/)/i.test(signerUri.value.trim());
+  return value.startsWith("bunker://") || value.startsWith("nostrconnect://");
+});
+
+const npubSelected = computed(() => {
+  return accountKeyAccessKind.value === "npub";
+});
+
+const invalidNsecHintVisible = computed(() => {
+  const value = normalizedAccountKey.value.toLowerCase();
+  return value.startsWith("nsec") && value.length >= 10 && accountKeyAccessKind.value !== "nsec";
 });
 
 const canRestoreCirclesAfterLogin = computed(() => {
   return selectedMethod.value !== "quickStart" && hasRestorableCircles.value;
 });
 
-const profileValid = computed(() => {
-  return displayName.value.trim().length >= 2 && normalizedHandle.value.length >= 4;
+const canReuseExistingCircleImmediately = computed(() => {
+  return selectedMethod.value === "existingAccount" && props.circles.length > 0;
 });
 
-const circleValid = computed(() => {
+const needsCircleSelectionStep = computed(() => {
+  if (selectedMethod.value === "quickStart") {
+    return true;
+  }
+
+  return !canReuseExistingCircleImmediately.value;
+});
+
+const profileValid = computed(() => {
+  return displayName.value.length >= 2;
+});
+
+const circleStepReady = computed(() => {
   if (circleMode.value === "restore") {
     return canRestoreCirclesAfterLogin.value && !!selectedRestorableCircle.value;
   }
 
   if (circleMode.value === "existing") {
-    return !!selectedCircle.value;
+    return !!selectedCircleId.value;
   }
 
-  if (circleMode.value === "invite") {
+  return true;
+});
+
+const circleSheetValid = computed(() => {
+  if (activeCircleSheet.value === "invite") {
     return inviteCode.value.trim().length >= 6;
   }
 
-  return customCircleName.value.trim().length >= 2 && relayLooksValid(customRelay.value);
+  if (activeCircleSheet.value === "custom") {
+    return relayLooksValid(customRelay.value);
+  }
+
+  return false;
+});
+
+const normalizedCustomRelayPreview = computed(() => {
+  return normalizeRelayLikeValue(customRelay.value);
 });
 
 const stepValid = computed(() => {
   switch (currentStep.value) {
-    case 0:
-      return agreementAccepted.value;
     case 1:
       return credentialValid.value;
     case 2:
       return profileValid.value;
+    case 3:
+      return circleStepReady.value;
     default:
-      return circleValid.value;
+      return true;
   }
 });
 
-const credentialTitle = computed(() => {
-  switch (selectedMethod.value) {
-    case "existingAccount":
-      return "Import existing Nostr credentials";
-    case "signer":
-      return "Attach a remote signer";
-    default:
-      return "Quick start keeps the shell local";
-  }
-});
-
-const credentialCopy = computed(() => {
-  switch (selectedMethod.value) {
-    case "existingAccount":
-      return "Paste an `nsec`, `npub`, `bunker://` handoff or raw hex key. The desktop shell validates the shape before entry.";
-    case "signer":
-      return "Provide a `bunker://` or `nostrconnect://` signer URI. This rebuild stores the choice locally and keeps the next runtime integration boundary stable.";
-    default:
-      return "No remote credential is required for quick start. The desktop shell will continue with a local profile and circle selection flow.";
-  }
-});
-
-const selectedCircleSummary = computed(() => {
-  if (circleMode.value === "existing") {
-    if (!selectedCircle.value) {
-      return {
-        title: "Choose a saved circle",
-        detail: "Pick one of the saved relay contexts before opening the chat shell.",
-      };
-    }
-
-    return {
-      title: selectedCircle.value.name,
-      detail: `${selectedCircle.value.relay} · ${selectedCircle.value.type}`,
-    };
+const primaryActionLabel = computed(() => {
+  if (currentStep.value === 1) {
+    return "LOGIN";
   }
 
-  if (circleMode.value === "invite") {
-    return {
-      title: inviteName.value.trim() || "Invite Circle",
-      detail: inviteCode.value.trim() || "Enter the invite code to create the relay context.",
-    };
+  if (currentStep.value === 3) {
+    return "Connect";
   }
 
-  if (circleMode.value === "restore") {
-    if (!selectedRestorableCircle.value) {
-      return {
-        title: "Restore Saved Circles",
-        detail: hasRestorableCircles.value
-          ? "Select an archived circle from the local restore catalog."
-          : "No archived circles are available in the local restore catalog yet.",
-      };
-    }
-
-    return {
-      title: selectedRestorableCircle.value.name,
-      detail: `${selectedRestorableCircle.value.relay} · ${selectedRestorableCircle.value.type}`,
-    };
-  }
-
-  return {
-    title: customCircleName.value.trim() || "Custom Relay",
-    detail: customRelay.value.trim() || "Enter a relay endpoint such as wss://relay.example.com",
-  };
+  return "Continue";
 });
 
 watch(
-  [selectedMethod, () => props.circles.length, () => props.restorableCircles.length],
-  ([method, circleCount, restorableCount]) => {
-    if (!circleCount && method !== "quickStart" && restorableCount > 0 && circleMode.value === "existing") {
-      circleMode.value = "restore";
-      return;
-    }
-
+  [selectedMethod, () => props.restorableCircles.length],
+  ([method, restorableCount]) => {
     if (circleMode.value === "restore" && (method === "quickStart" || restorableCount === 0)) {
-      circleMode.value = circleCount ? "existing" : "custom";
-      return;
-    }
-
-    if (circleCount && circleMode.value === "restore" && restorableCount === 0) {
-      circleMode.value = "existing";
+      circleMode.value = "invite";
     }
   },
   { immediate: true },
@@ -226,9 +235,7 @@ watch(
       selectedCircleId.value = "";
       if (circleMode.value === "existing") {
         circleMode.value =
-          selectedMethod.value !== "quickStart" && props.restorableCircles.length
-            ? "restore"
-            : "custom";
+          selectedMethod.value !== "quickStart" && props.restorableCircles.length ? "restore" : "invite";
       }
       return;
     }
@@ -246,7 +253,7 @@ watch(
     if (!restorableCircles.length) {
       selectedRestoreRelay.value = "";
       if (circleMode.value === "restore") {
-        circleMode.value = props.circles.length ? "existing" : "custom";
+        circleMode.value = "invite";
       }
       return;
     }
@@ -261,8 +268,10 @@ watch(
 watch(
   () => props.profile,
   (profile) => {
-    if (!displayName.value.trim()) {
-      displayName.value = profile.name;
+    if (!firstName.value.trim() && !lastName.value.trim()) {
+      const nextName = splitName(profile.name);
+      firstName.value = nextName.first;
+      lastName.value = nextName.last;
     }
 
     if (!handle.value.trim()) {
@@ -277,9 +286,10 @@ watch(
 );
 
 onMounted(() => {
+  resetLoginFlow();
   timer = window.setInterval(() => {
     currentSlide.value = (currentSlide.value + 1) % slides.length;
-  }, 3200);
+  }, 5000);
 });
 
 onBeforeUnmount(() => {
@@ -289,66 +299,174 @@ onBeforeUnmount(() => {
 });
 
 function relayLooksValid(value: string) {
-  const normalized = value.trim();
-  return !!normalized && (normalized.includes("://") || normalized.includes("."));
-}
-
-function stepTone(index: number) {
-  if (index < currentStep.value) {
-    return "done";
+  const candidate = normalizeRelayLikeValue(value);
+  if (!candidate) {
+    return false;
   }
 
-  if (index === currentStep.value) {
-    return "active";
+  try {
+    const parsed = new URL(candidate);
+    return (parsed.protocol === "ws:" || parsed.protocol === "wss:") && !!parsed.hostname;
+  } catch {
+    return false;
   }
-
-  return "idle";
 }
 
-function selectMethod(method: LoginMethod) {
-  selectedMethod.value = method;
+function relayQueryLooksValid(value: string) {
+  try {
+    const relay = new URL(value);
+    return (relay.protocol === "ws:" || relay.protocol === "wss:") && !!relay.hostname;
+  } catch {
+    return false;
+  }
+}
 
+function splitName(value: string) {
+  const tokens = value.trim().split(/\s+/).filter(Boolean);
+  return {
+    first: tokens[0] ?? "",
+    last: tokens.slice(1).join(" "),
+  };
+}
+
+function normalizeRelayLikeValue(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  return trimmed.includes("://") ? trimmed : `wss://${trimmed}`;
+}
+
+function defaultCircleModeForMethod(method: LoginMethod): LoginCircleSelectionMode {
   if (method === "quickStart") {
-    if (!displayName.value.trim()) {
-      displayName.value = props.profile.name;
-    }
-
-    if (!handle.value.trim()) {
-      handle.value = props.profile.handle;
-    }
-
-    if (circleMode.value === "restore") {
-      circleMode.value = props.circles.length ? "existing" : "custom";
-    }
-
-    return;
+    return "invite";
   }
 
-  if (!props.circles.length && props.restorableCircles.length) {
-    circleMode.value = "restore";
+  return props.restorableCircles.length > 0 ? "restore" : "invite";
+}
+
+function resetLoginFlow() {
+  const nextName = splitName(props.profile.name);
+  currentSlide.value = 0;
+  currentStep.value = 0;
+  selectedMethod.value = "quickStart";
+  accountKey.value = "";
+  handle.value = props.profile.handle;
+  profileStatus.value = props.profile.status;
+  circleMode.value = defaultCircleModeForMethod("quickStart");
+  selectedCircleId.value = props.circles[0]?.id ?? "";
+  selectedRestoreRelay.value = props.restorableCircles[0]?.relay ?? "";
+  inviteCode.value = "";
+  inviteName.value = "";
+  customCircleName.value = "";
+  customRelay.value = "";
+  activeCircleSheet.value = null;
+  activeInfoSheet.value = null;
+  firstName.value = nextName.first;
+  lastName.value = nextName.last;
+}
+
+function deriveAccountKeyAccessKind(value: string): LoginAccessInput["kind"] | null {
+  const trimmed = value.trim();
+  const lowered = trimmed.toLowerCase();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (lowered.startsWith("nsec")) {
+    return NSEC_PATTERN.test(trimmed) ? "nsec" : null;
+  }
+
+  if (lowered.startsWith("npub")) {
+    return NPUB_PATTERN.test(trimmed) ? "npub" : null;
+  }
+
+  if (lowered.startsWith("bunker://")) {
+    return remoteSignerUriLooksValid(trimmed, "bunker", false) ? "bunker" : null;
+  }
+
+  if (lowered.startsWith("nostrconnect://")) {
+    return remoteSignerUriLooksValid(trimmed, "nostrconnect", true) ? "nostrConnect" : null;
+  }
+
+  return HEX_KEY_PATTERN.test(trimmed) ? "hexKey" : null;
+}
+
+function remoteSignerUriLooksValid(value: string, scheme: "bunker" | "nostrconnect", requireSecret: boolean) {
+  try {
+    const uri = new URL(value);
+    if (uri.protocol.toLowerCase() !== `${scheme}:`) {
+      return false;
+    }
+
+    if (!HEX_PUBKEY_PATTERN.test(uri.hostname)) {
+      return false;
+    }
+
+    const relays = uri.searchParams.getAll("relay").filter(relayQueryLooksValid);
+    if (!relays.length) {
+      return false;
+    }
+
+    if (requireSecret && !uri.searchParams.get("secret")?.trim()) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
   }
 }
 
-function canJumpTo(index: number) {
-  return index <= currentStep.value;
+function openQuickStart() {
+  selectedMethod.value = "quickStart";
+  currentStep.value = 2;
+  circleMode.value = defaultCircleModeForMethod("quickStart");
+  activeCircleSheet.value = null;
+  activeInfoSheet.value = null;
 }
 
-function goToStep(index: number) {
-  if (canJumpTo(index)) {
-    currentStep.value = index;
-  }
+function openExistingAccount() {
+  selectedMethod.value = "existingAccount";
+  currentStep.value = 1;
+  circleMode.value = defaultCircleModeForMethod("existingAccount");
+  activeCircleSheet.value = null;
+  activeInfoSheet.value = null;
 }
 
 function goBack() {
-  currentStep.value = Math.max(currentStep.value - 1, 0);
+  activeCircleSheet.value = null;
+  activeInfoSheet.value = null;
+  if (currentStep.value === 1 || currentStep.value === 2) {
+    currentStep.value = 0;
+    return;
+  }
+
+  currentStep.value = selectedMethod.value === "quickStart" ? 2 : 1;
 }
 
-function goNext() {
+function handlePrimaryAction() {
   if (!stepValid.value) {
     return;
   }
 
-  currentStep.value = Math.min(currentStep.value + 1, steps.length - 1);
+  if (currentStep.value === 1) {
+    if (needsCircleSelectionStep.value) {
+      currentStep.value = 3;
+      return;
+    }
+
+    submit();
+    return;
+  }
+
+  if (currentStep.value === 2) {
+    currentStep.value = 3;
+    return;
+  }
+
+  handleCircleConnect();
 }
 
 function buildInitials(name: string) {
@@ -378,16 +496,19 @@ function buildInviteCircleName() {
   return suffix ? `Invite ${suffix}` : "Invite Circle";
 }
 
-function restoreTypeTone(type: RestorableCircleEntry["type"]) {
-  if (type === "paid") {
-    return "warn";
+function buildCustomCircleName() {
+  const trimmed = customCircleName.value.trim();
+  if (trimmed) {
+    return trimmed;
   }
 
-  if (type === "custom") {
-    return "contrast";
-  }
+  const relayLabel = customRelay.value
+    .trim()
+    .replace(/^wss?:\/\//i, "")
+    .split(/[/?#]/)[0]
+    ?.trim();
 
-  return "secondary";
+  return relayLabel || "Custom Relay";
 }
 
 function archivedAtCopy(value: string) {
@@ -399,30 +520,77 @@ function archivedAtCopy(value: string) {
   return parsed.toLocaleString();
 }
 
-function deriveExistingAccountAccessKind(value: string): LoginAccessInput["kind"] {
-  const trimmed = value.trim().toLowerCase();
-  if (trimmed.startsWith("nsec")) {
-    return "nsec";
-  }
-
-  if (trimmed.startsWith("npub")) {
-    return "npub";
-  }
-
-  if (trimmed.startsWith("bunker://")) {
-    return "bunker";
-  }
-
-  return "hexKey";
+function buildCircleMeta(circle: CircleItem | RestorableCircleEntry) {
+  return `${circle.type} circle`;
 }
 
-function deriveSignerAccessKind(value: string): LoginAccessInput["kind"] {
-  const trimmed = value.trim().toLowerCase();
-  if (trimmed.startsWith("nostrconnect://")) {
-    return "nostrConnect";
+function selectCircleMode(mode: LoginCircleSelectionMode) {
+  circleMode.value = mode;
+  if (mode !== "invite" && mode !== "custom") {
+    activeCircleSheet.value = null;
+  }
+}
+
+function openCircleSheet(mode: CircleSheetMode) {
+  circleMode.value = mode;
+  activeCircleSheet.value = mode;
+}
+
+function closeCircleSheet() {
+  activeCircleSheet.value = null;
+}
+
+function openInfoSheet(kind: InfoSheetKind) {
+  activeInfoSheet.value = kind;
+}
+
+function closeInfoSheet() {
+  activeInfoSheet.value = null;
+}
+
+function applyRelaySuggestion(value: string) {
+  customRelay.value = value;
+}
+
+function handleCircleConnect() {
+  if (circleMode.value === "restore" || circleMode.value === "existing") {
+    submit();
+    return;
   }
 
-  return "bunker";
+  if (circleMode.value === "invite") {
+    if (inviteCode.value.trim().length < 6) {
+      openCircleSheet("invite");
+      return;
+    }
+
+    submit();
+    return;
+  }
+
+  if (!relayLooksValid(customRelay.value)) {
+    openCircleSheet("custom");
+    return;
+  }
+
+  submit();
+}
+
+function confirmCircleSheet() {
+  if (!circleSheetValid.value || !activeCircleSheet.value) {
+    return;
+  }
+
+  activeCircleSheet.value = null;
+  submit();
+}
+
+function deriveSubmittedMethod(accessKind: LoginAccessInput["kind"]): LoginMethod {
+  if (selectedMethod.value === "existingAccount" && (accessKind === "bunker" || accessKind === "nostrConnect")) {
+    return "signer";
+  }
+
+  return selectedMethod.value;
 }
 
 function submit() {
@@ -430,52 +598,49 @@ function submit() {
     return;
   }
 
+  const resolvedAccessKind = accountKeyAccessKind.value;
   const access: LoginAccessInput =
     selectedMethod.value === "quickStart"
       ? {
           kind: "localProfile",
         }
-      : selectedMethod.value === "existingAccount"
-        ? {
-            kind: deriveExistingAccountAccessKind(accountKey.value),
-            value: accountKey.value.trim(),
-          }
-        : {
-            kind: deriveSignerAccessKind(signerUri.value),
-            value: signerUri.value.trim(),
-          };
+      : {
+          kind: resolvedAccessKind ?? "hexKey",
+          value: normalizedAccountKey.value,
+        };
+  const method = deriveSubmittedMethod(access.kind);
 
   const payload: LoginCompletionInput = {
-    method: selectedMethod.value,
+    method,
     access,
     userProfile: {
-      name: displayName.value.trim(),
+      name: displayName.value || props.profile.name || "XChat User",
       handle: normalizedHandle.value,
-      initials: buildInitials(displayName.value),
+      initials: buildInitials(displayName.value || props.profile.name),
       status: profileStatus.value.trim() || "Circle member",
     },
     circleSelection:
-      circleMode.value === "existing"
+      selectedMethod.value === "existingAccount" && canReuseExistingCircleImmediately.value
         ? {
             mode: "existing",
-            circleId: selectedCircleId.value,
+            circleId: selectedCircleId.value || props.circles[0]?.id || "",
           }
         : circleMode.value === "invite"
-          ? {
-            mode: "invite",
-            inviteCode: inviteCode.value.trim(),
-            name: buildInviteCircleName(),
-          }
-        : circleMode.value === "restore"
-          ? {
-              mode: "restore",
-              relay: selectedRestorableCircle.value?.relay,
-            }
-          : {
-              mode: "custom",
-              name: customCircleName.value.trim(),
-              relay: customRelay.value.trim(),
-            },
+            ? {
+                mode: "invite",
+                inviteCode: inviteCode.value.trim(),
+                name: buildInviteCircleName(),
+              }
+            : circleMode.value === "restore"
+              ? {
+                  mode: "restore",
+                  relay: selectedRestorableCircle.value?.relay,
+                }
+              : {
+                  mode: "custom",
+                  name: buildCustomCircleName(),
+                  relay: customRelay.value.trim(),
+                },
   };
 
   emit("complete", payload);
@@ -484,692 +649,1154 @@ function submit() {
 
 <template>
   <section class="login-screen">
-    <div class="login-card">
-      <div class="login-hero">
-        <p class="eyebrow">Welcome to XChat</p>
-        <h1>{{ slides[currentSlide].title }}</h1>
-        <p class="hero-copy">{{ slides[currentSlide].text }}</p>
+    <div v-if="currentStep === 0" class="entry-shell">
+      <div class="entry-carousel">
+        <div class="entry-art-wrap">
+          <img :src="slides[currentSlide].image" :alt="slides[currentSlide].title" class="entry-art" />
+        </div>
 
-          <div class="hero-metrics">
-            <div class="metric-chip">
-              <strong>{{ props.circles.length }}</strong>
-              <span>saved circles</span>
-            </div>
-            <div class="metric-chip">
-              <strong>{{ props.restorableCircles.length }}</strong>
-              <span>restore entries</span>
-            </div>
-            <div class="metric-chip">
-              <strong>4</strong>
-              <span>entry steps</span>
-            </div>
-          </div>
+        <div class="entry-copy">
+          <h1>{{ slides[currentSlide].title }}</h1>
+          <p>{{ slides[currentSlide].text }}</p>
+        </div>
 
-        <div class="slide-markers">
+        <div class="slide-dots">
           <button
             v-for="(_, index) in slides"
             :key="index"
             type="button"
-            :class="['marker', { active: index === currentSlide }]"
+            :class="['slide-dot', { active: index === currentSlide }]"
+            :aria-label="`Open slide ${index + 1}`"
             @click="currentSlide = index"
           />
         </div>
       </div>
 
-      <div class="login-flow">
-        <div class="stepper-row">
-          <button
-            v-for="(step, index) in steps"
-            :key="step.label"
-            type="button"
-            :disabled="!canJumpTo(index)"
-            :class="['step-pill', stepTone(index)]"
-            @click="goToStep(index)"
-          >
-            <span>{{ step.label }}</span>
-            <strong>{{ index + 1 }}</strong>
-          </button>
-        </div>
+      <div class="entry-footer">
+        <button type="button" class="action-button action-primary" @click="openQuickStart">
+          Get Started
+        </button>
+        <button type="button" class="action-button action-secondary" @click="openExistingAccount">
+          I have a Nostr account
+        </button>
 
-        <div class="flow-copy">
-          <p class="flow-kicker">Onboarding</p>
-          <h2>{{ steps[currentStep].title }}</h2>
-        </div>
-
-        <div class="flow-body">
-          <template v-if="currentStep === 0">
-            <div class="selection-grid">
-              <button
-                type="button"
-                :class="['selection-card', { active: selectedMethod === 'quickStart' }]"
-                @click="selectMethod('quickStart')"
-              >
-                <div class="card-head">
-                  <strong>Quick Start</strong>
-                  <Tag value="Local" severity="success" rounded />
-                </div>
-                <p>Generate a desktop-local identity shell, then continue into profile setup and circle selection.</p>
-              </button>
-
-              <button
-                type="button"
-                :class="['selection-card', { active: selectedMethod === 'existingAccount' }]"
-                @click="selectMethod('existingAccount')"
-              >
-                <div class="card-head">
-                  <strong>Existing Nostr Account</strong>
-                  <Tag value="Import" severity="info" rounded />
-                </div>
-                <p>Bring in a key or imported account handoff before opening the main chat shell.</p>
-              </button>
-
-              <button
-                type="button"
-                :class="['selection-card', { active: selectedMethod === 'signer' }]"
-                @click="selectMethod('signer')"
-              >
-                <div class="card-head">
-                  <strong>Remote Signer</strong>
-                  <Tag value="NIP-46" severity="warn" rounded />
-                </div>
-                <p>Keep signing outside the desktop shell and attach through a signer URI style flow.</p>
-              </button>
-            </div>
-
-            <div class="agreement-row">
-              <Checkbox v-model="agreementAccepted" binary input-id="agreement" />
-              <label for="agreement">
-                Continue with the local privacy policy and terms flow enabled.
-              </label>
-            </div>
-          </template>
-
-          <template v-else-if="currentStep === 1">
-            <section class="section-card">
-              <div class="section-copy">
-                <strong>{{ credentialTitle }}</strong>
-                <p>{{ credentialCopy }}</p>
-              </div>
-
-              <Message v-if="selectedMethod === 'quickStart'" severity="info" :closable="false">
-                Quick start does not require a key today. The profile and circle choices will be stored locally so the next runtime/auth integration can reuse the same shell contract.
-              </Message>
-
-              <template v-else-if="selectedMethod === 'existingAccount'">
-                <label class="field-label" for="account-key">Account key or import handoff</label>
-                <Textarea
-                  id="account-key"
-                  v-model="accountKey"
-                  rows="5"
-                  auto-resize
-                  class="wide-input"
-                  placeholder="nsec1..., npub1..., bunker://..., or raw hex"
-                />
-                <Message v-if="accountKey.trim() && !credentialValid" severity="warn" :closable="false">
-                  The input does not look like a supported key or import handoff yet.
-                </Message>
-              </template>
-
-              <template v-else>
-                <label class="field-label" for="signer-uri">Signer URI</label>
-                <InputText
-                  id="signer-uri"
-                  v-model="signerUri"
-                  class="wide-input"
-                  placeholder="bunker://... or nostrconnect://..."
-                />
-                <Message v-if="signerUri.trim() && !credentialValid" severity="warn" :closable="false">
-                  Use a `bunker://` or `nostrconnect://` signer URI.
-                </Message>
-              </template>
-            </section>
-          </template>
-
-          <template v-else-if="currentStep === 2">
-            <section class="section-card profile-card">
-              <div class="profile-preview">
-                <div class="preview-avatar">{{ buildInitials(displayName || "XC") }}</div>
-                <div class="preview-copy">
-                  <strong>{{ displayName || "Your Name" }}</strong>
-                  <p>{{ normalizedHandle || "@handle" }}</p>
-                  <span>{{ profileStatus || "Circle member" }}</span>
-                </div>
-              </div>
-
-              <label class="field-label" for="display-name">Display name</label>
-              <InputText
-                id="display-name"
-                v-model="displayName"
-                class="wide-input"
-                placeholder="Sean Chen"
-              />
-
-              <label class="field-label" for="handle">Handle</label>
-              <InputText
-                id="handle"
-                v-model="handle"
-                class="wide-input"
-                placeholder="@seanchen"
-              />
-              <p class="field-help">Saved as {{ normalizedHandle || "@handle" }}</p>
-
-              <label class="field-label" for="status-line">Status line</label>
-              <InputText
-                id="status-line"
-                v-model="profileStatus"
-                class="wide-input"
-                placeholder="Circle owner"
-              />
-            </section>
-          </template>
-
-          <template v-else>
-            <section class="section-card">
-              <div class="mode-row">
-                <button
-                  v-if="selectedMethod !== 'quickStart'"
-                  type="button"
-                  :class="['mode-chip', { active: circleMode === 'restore' }]"
-                  :disabled="!canRestoreCirclesAfterLogin"
-                  @click="circleMode = 'restore'"
-                >
-                  Restore Catalog
-                </button>
-                <button
-                  type="button"
-                  :class="['mode-chip', { active: circleMode === 'existing' }]"
-                  :disabled="!props.circles.length"
-                  @click="circleMode = 'existing'"
-                >
-                  Saved Circles
-                </button>
-                <button
-                  type="button"
-                  :class="['mode-chip', { active: circleMode === 'invite' }]"
-                  @click="circleMode = 'invite'"
-                >
-                  Invite Code
-                </button>
-                <button
-                  type="button"
-                  :class="['mode-chip', { active: circleMode === 'custom' }]"
-                  @click="circleMode = 'custom'"
-                >
-                  Custom Relay
-                </button>
-              </div>
-
-              <div v-if="circleMode === 'existing'" class="selection-grid">
-                <button
-                  v-for="circle in props.circles"
-                  :key="circle.id"
-                  type="button"
-                  :class="['selection-card', { active: selectedCircleId === circle.id }]"
-                  @click="selectedCircleId = circle.id"
-                >
-                  <div class="card-head">
-                    <strong>{{ circle.name }}</strong>
-                    <Tag :value="circle.type" :severity="circle.type === 'paid' ? 'warn' : 'secondary'" rounded />
-                  </div>
-                  <p>{{ circle.description }}</p>
-                  <span class="card-meta">{{ circle.relay }} · {{ circle.status }}</span>
-                </button>
-
-                <Message v-if="!props.circles.length" severity="secondary" :closable="false">
-                  No saved circles are available yet. Switch to invite code or custom relay.
-                </Message>
-              </div>
-
-              <div v-else-if="circleMode === 'restore'" class="field-grid">
-                <Message
-                  v-if="selectedMethod === 'quickStart'"
-                  severity="secondary"
-                  :closable="false"
-                >
-                  Restore catalog is only available for existing-account and signer entry paths.
-                </Message>
-                <template v-else-if="props.restorableCircles.length">
-                  <Message severity="info" :closable="false">
-                    Pick one archived circle from the local restore catalog. The desktop shell will restore it immediately after authentication completes.
-                  </Message>
-                  <div class="selection-grid">
-                    <button
-                      v-for="circle in props.restorableCircles"
-                      :key="circle.relay"
-                      type="button"
-                      :class="['selection-card', { active: selectedRestoreRelay === circle.relay }]"
-                      @click="selectedRestoreRelay = circle.relay"
-                    >
-                      <div class="card-head">
-                        <strong>{{ circle.name }}</strong>
-                        <Tag :value="circle.type" :severity="restoreTypeTone(circle.type)" rounded />
-                      </div>
-                      <p>{{ circle.description || 'No archived description available.' }}</p>
-                      <span class="card-meta">{{ circle.relay }}</span>
-                      <span class="card-meta">Archived {{ archivedAtCopy(circle.archivedAt) }}</span>
-                    </button>
-                  </div>
-                </template>
-                <Message v-else severity="secondary" :closable="false">
-                  No archived circles are available yet. Use invite code or custom relay instead.
-                </Message>
-              </div>
-
-              <div v-else-if="circleMode === 'invite'" class="field-grid">
-                <label class="field-label" for="invite-code">Invite code</label>
-                <InputText
-                  id="invite-code"
-                  v-model="inviteCode"
-                  class="wide-input"
-                  placeholder="circle://..., invite://..., or invitation code"
-                />
-
-                <label class="field-label" for="invite-name">Circle name</label>
-                <InputText
-                  id="invite-name"
-                  v-model="inviteName"
-                  class="wide-input"
-                  placeholder="Invite Circle"
-                />
-              </div>
-
-              <div v-else class="field-grid">
-                <label class="field-label" for="custom-circle-name">Circle name</label>
-                <InputText
-                  id="custom-circle-name"
-                  v-model="customCircleName"
-                  class="wide-input"
-                  placeholder="My Circle"
-                />
-
-                <label class="field-label" for="custom-relay">Relay endpoint</label>
-                <InputText
-                  id="custom-relay"
-                  v-model="customRelay"
-                  class="wide-input"
-                  placeholder="wss://relay.example.com"
-                />
-              </div>
-
-              <div class="summary-card">
-                <strong>{{ selectedCircleSummary.title }}</strong>
-                <p>{{ selectedCircleSummary.detail }}</p>
-              </div>
-            </section>
-          </template>
-        </div>
-
-        <div class="footer-actions">
-          <Button
-            label="Back"
-            text
-            severity="secondary"
-            :disabled="currentStep === 0"
-            @click="goBack"
-          />
-          <Button
-            v-if="currentStep < steps.length - 1"
-            label="Continue"
-            severity="contrast"
-            :disabled="!stepValid"
-            @click="goNext"
-          />
-          <Button
-            v-else
-            label="Enter XChat"
-            severity="contrast"
-            :disabled="!stepValid"
-            @click="submit"
-          />
+        <div class="terms-row">
+          <span class="terms-check" aria-hidden="true"></span>
+          <p>
+            By continuing, you agree to our
+            <span class="terms-link">Privacy Policy</span>
+            and
+            <span class="terms-link">Terms of Use</span>
+          </p>
         </div>
       </div>
     </div>
+
+    <div v-else class="mobile-page">
+      <header class="mobile-topbar">
+        <button type="button" class="topbar-back" aria-label="Go back" @click="goBack">
+          <span class="topbar-chevron">‹</span>
+        </button>
+        <h1 class="topbar-title">{{ currentStep === 1 ? "LOGIN" : "" }}</h1>
+        <span class="topbar-side" aria-hidden="true"></span>
+      </header>
+
+      <div class="mobile-body">
+        <template v-if="currentStep === 1">
+          <section class="page-section auth-section">
+            <h2 class="page-title page-title-left">Use Nostr key or remote signer to login:</h2>
+
+            <Textarea
+              id="account-key"
+              v-model="accountKey"
+              rows="4"
+              auto-resize
+              class="wide-input"
+              placeholder="Enter nsec, npub, hex, or signer URI"
+            />
+
+            <p class="section-footnote">
+              Enter your nostr private key or remote signer URI link.
+              <button type="button" class="inline-link-button" @click="openInfoSheet('nostr')">Learn more</button>
+            </p>
+
+            <p v-if="invalidNsecHintVisible" class="inline-hint tone-error">
+              The NSEC you entered is invalid. Please enter it again.
+            </p>
+            <p v-else-if="invalidRemoteSignerHintVisible" class="inline-hint tone-error">
+              Signer URI must include a 64-character pubkey and at least one <code>ws://</code> or <code>wss://</code> relay. <code>nostrconnect://</code> also requires a secret.
+            </p>
+            <p v-else-if="npubSelected" class="inline-hint tone-warn">
+              <code>npub</code> import is read-only and cannot send messages yet.
+            </p>
+            <p v-else-if="nostrConnectSelected" class="inline-hint tone-warn">
+              <code>nostrconnect://</code> login can bootstrap signer state, but desktop send is still blocked on the local client-URI flow.
+            </p>
+            <p v-else-if="remoteSignerSelected" class="inline-hint tone-info">
+              Remote signer login will continue through signer bootstrap after you tap LOGIN.
+            </p>
+            <p v-else-if="canReuseExistingCircleImmediately" class="inline-hint tone-info">
+              Saved circles already exist in this shell. Login will return directly to the current circle.
+            </p>
+          </section>
+        </template>
+
+        <template v-else-if="currentStep === 2">
+          <section class="page-section profile-section">
+            <div class="page-copy centered-copy">
+              <h2 class="page-title">Create Your Profile</h2>
+              <p class="page-subtitle">
+                Enter your name to get started. Your nostr account is being created automatically.
+              </p>
+            </div>
+
+            <button type="button" class="avatar-preview" aria-label="Profile preview">
+              <span class="profile-avatar">{{ buildInitials(displayName || "XC") }}</span>
+              <span class="avatar-badge">
+                <i class="pi pi-camera" />
+              </span>
+            </button>
+
+            <div class="input-stack">
+              <InputText id="first-name" v-model="firstName" class="wide-input" placeholder="First Name" />
+              <InputText id="last-name" v-model="lastName" class="wide-input" placeholder="Last Name (Optional)" />
+            </div>
+
+            <p class="section-footnote">This is how others will see you. You can change this anytime.</p>
+            <p class="inline-hint tone-muted">Username will be saved as {{ normalizedHandle }}</p>
+          </section>
+        </template>
+
+        <template v-else>
+          <section class="page-section circle-section">
+            <div class="page-copy centered-copy">
+              <h2 class="page-title">Add Circle</h2>
+              <p class="page-subtitle">Connect to your circle using an invite link or choose a relay provider.</p>
+            </div>
+
+            <div class="option-stack">
+              <button
+                type="button"
+                :class="['option-card', { active: circleMode === 'invite' }]"
+                @click="selectCircleMode('invite')"
+              >
+                <span class="option-icon">
+                  <i class="pi pi-link" />
+                </span>
+                <span class="option-copy">
+                  <strong>I have an invite</strong>
+                  <small>Scan QR code or enter invitation link</small>
+                </span>
+                <i class="pi pi-angle-right option-arrow" />
+              </button>
+
+              <div class="option-divider">
+                <span></span>
+                <p>OR CONNECT VIA</p>
+                <span></span>
+              </div>
+
+              <div class="recommended-card">
+                <span class="recommended-badge">RECOMMENDED</span>
+                <button type="button" class="option-card option-card-disabled" disabled>
+                  <span class="option-icon">
+                    <i class="pi pi-diamond" />
+                  </span>
+                  <span class="option-copy">
+                    <strong>Get Private Circle</strong>
+                    <small>Hosted dedicated high-speed relay with built-in secure media server</small>
+                  </span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                :class="['option-card', { active: circleMode === 'custom' }]"
+                @click="selectCircleMode('custom')"
+              >
+                <span class="option-icon">
+                  <i class="pi pi-server" />
+                </span>
+                <span class="option-copy">
+                  <strong>Custom Relay</strong>
+                  <small>Community or Self-hosted nodes</small>
+                </span>
+                <i class="pi pi-angle-right option-arrow" />
+              </button>
+            </div>
+
+            <p class="inline-hint tone-muted">
+              Private Circle stays paused in this desktop rebuild because it depends on backend services.
+            </p>
+
+            <button
+              type="button"
+              :class="['restore-link', { active: circleMode === 'restore', disabled: !canRestoreCirclesAfterLogin }]"
+              :disabled="!canRestoreCirclesAfterLogin"
+              @click="selectCircleMode('restore')"
+            >
+              Restore private circle
+            </button>
+
+            <div v-if="circleMode === 'restore'" class="detail-panel">
+              <div v-if="props.restorableCircles.length" class="selection-list">
+                <button
+                  v-for="circle in props.restorableCircles"
+                  :key="circle.relay"
+                  type="button"
+                  :class="['selection-card', { active: selectedRestoreRelay === circle.relay }]"
+                  @click="selectedRestoreRelay = circle.relay"
+                >
+                  <div class="selection-head">
+                    <strong>{{ circle.name }}</strong>
+                    <span class="selection-pill">{{ buildCircleMeta(circle) }}</span>
+                  </div>
+                  <p>{{ circle.description || "No archived description available." }}</p>
+                  <span class="selection-meta">{{ circle.relay }}</span>
+                  <span class="selection-meta">Archived {{ archivedAtCopy(circle.archivedAt) }}</span>
+                </button>
+              </div>
+              <p v-else class="inline-hint tone-muted">No private circle is available to restore right now.</p>
+            </div>
+          </section>
+        </template>
+      </div>
+
+      <footer class="mobile-footer">
+        <button type="button" class="action-button action-dark" :disabled="!stepValid" @click="handlePrimaryAction">
+          {{ primaryActionLabel }}
+        </button>
+      </footer>
+    </div>
+
+    <Transition name="sheet-fade">
+      <div v-if="activeCircleSheet" class="circle-sheet-layer" @click.self="closeCircleSheet">
+        <div class="circle-sheet-card" role="dialog" aria-modal="true">
+          <span class="circle-sheet-grabber" aria-hidden="true"></span>
+
+          <div class="circle-sheet-copy">
+            <h3>{{ activeCircleSheet === "invite" ? "Enter Invitation Link" : "Add Relay" }}</h3>
+            <p v-if="activeCircleSheet === 'invite'">
+              Paste your invite link or invitation code, then continue into the selected circle.
+            </p>
+            <p v-else>
+              Enter the relay address to join.
+              <button type="button" class="inline-link-button" @click="openInfoSheet('relay')">What is a Relay?</button>
+            </p>
+          </div>
+
+          <div class="circle-sheet-body">
+            <template v-if="activeCircleSheet === 'invite'">
+              <label class="field-label" for="invite-code-sheet">Invitation Link</label>
+              <InputText
+                id="invite-code-sheet"
+                v-model="inviteCode"
+                class="wide-input"
+                placeholder="circle://..., invite://..., or invitation code"
+              />
+            </template>
+
+            <template v-else>
+              <label class="field-label" for="custom-relay-sheet">Relay URL or name</label>
+              <InputText
+                id="custom-relay-sheet"
+                v-model="customRelay"
+                class="wide-input"
+                placeholder="wss://relay.example.com"
+              />
+
+              <div class="relay-suggestions">
+                <button type="button" class="relay-chip" @click="applyRelaySuggestion('0xchat')">0xchat</button>
+                <button type="button" class="relay-chip" @click="applyRelaySuggestion('damus')">damus</button>
+              </div>
+
+              <p class="section-footnote sheet-footnote">
+                You can enter a full URL like <code>wss://relay.example.com</code> or use a shortcut relay name
+                such as <code>0xchat</code> or <code>damus</code>.
+              </p>
+
+              <p v-if="normalizedCustomRelayPreview" class="inline-hint tone-muted">
+                Relay will be saved as {{ normalizedCustomRelayPreview }}
+              </p>
+            </template>
+          </div>
+
+          <div class="circle-sheet-actions">
+            <button type="button" class="sheet-button sheet-button-secondary" @click="closeCircleSheet">Cancel</button>
+            <button
+              type="button"
+              class="sheet-button sheet-button-primary"
+              :disabled="!circleSheetValid"
+              @click="confirmCircleSheet"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="sheet-fade">
+      <div v-if="activeInfoSheet" class="circle-sheet-layer" @click.self="closeInfoSheet">
+        <div class="circle-sheet-card info-sheet-card" role="dialog" aria-modal="true">
+          <span class="circle-sheet-grabber" aria-hidden="true"></span>
+
+          <div class="circle-sheet-copy">
+            <h3>{{ activeInfoSheet === "nostr" ? "Understanding Nostr" : "What is a Circle?" }}</h3>
+            <p v-if="activeInfoSheet === 'nostr'">
+              Learn about Nostr keys, signer URIs, and the safest way to authenticate on this device.
+            </p>
+            <p v-else>
+              Your circle is the relay hub that stores encrypted messages until you and your contacts sync them.
+            </p>
+          </div>
+
+          <div class="circle-sheet-body info-sheet-body">
+            <template v-if="activeInfoSheet === 'nostr'">
+              <article class="info-card">
+                <h4>What is Nostr?</h4>
+                <p>
+                  Nostr is a decentralized protocol that uses cryptographic keys for identity, signing, and message
+                  exchange without a central account server.
+                </p>
+              </article>
+
+              <article class="info-card">
+                <h4>Private keys and <code>nsec</code></h4>
+                <p>
+                  Your private key proves your identity and signs outgoing events. A normal login key usually starts
+                  with <code>nsec1...</code>, while this desktop rebuild also accepts raw 64-character hex keys.
+                </p>
+              </article>
+
+              <article class="info-card">
+                <h4>Remote signer</h4>
+                <p>
+                  A remote signer keeps the private key off-device and signs on your behalf through
+                  <code>bunker://</code> or <code>nostrconnect://</code> links.
+                </p>
+              </article>
+
+              <article class="info-card">
+                <h4>How to use it</h4>
+                <ol class="info-step-list">
+                  <li class="info-step-item">Enter your <code>nsec</code> or 64-character hex key for direct login.</li>
+                  <li class="info-step-item">Or paste a valid <code>bunker://</code> or <code>nostrconnect://</code> signer URI.</li>
+                  <li class="info-step-item">The app will authenticate and continue into profile or circle setup.</li>
+                </ol>
+              </article>
+            </template>
+
+            <template v-else>
+              <article class="info-card">
+                <h4>Your private communication hub</h4>
+                <p>
+                  A circle is the relay address your chats use for delivery, storage, and sync. Messages stay
+                  encrypted, so the relay moves data without being able to read it.
+                </p>
+              </article>
+
+              <article class="info-card">
+                <h4>Think of it like a mailroom</h4>
+                <p>The relay receives messages, holds them until recipients sync, and forwards them to the right contacts.</p>
+                <p>Community circles are shared public relays. Private circles are dedicated relays with more control.</p>
+              </article>
+
+              <article class="info-card">
+                <h4>How it works</h4>
+                <ol class="info-step-list">
+                  <li class="info-step-item">You send a message to the circle relay.</li>
+                  <li class="info-step-item">The relay stores the encrypted event until recipients fetch it.</li>
+                  <li class="info-step-item">Your contacts sync from the same relay and decrypt locally.</li>
+                  <li class="info-step-item">You can enter a full <code>wss://</code> URL or a shortcut like <code>0xchat</code>.</li>
+                </ol>
+              </article>
+            </template>
+          </div>
+
+          <div class="circle-sheet-actions sheet-button-single">
+            <button type="button" class="sheet-button sheet-button-primary" @click="closeInfoSheet">Close</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </section>
 </template>
 
 <style scoped>
 .login-screen {
+  min-height: calc(100vh - 24px);
   display: grid;
   place-items: center;
-  min-height: calc(100vh - 36px);
+  padding: 12px;
 }
 
-.login-card {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
-  gap: 20px;
-  width: min(1180px, calc(100vw - 36px));
-  min-height: min(760px, calc(100vh - 36px));
-  padding: 22px;
-  border-radius: 32px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(210, 220, 232, 0.9);
-  box-shadow: 0 24px 60px rgba(24, 46, 84, 0.1);
+.entry-shell {
+  width: min(430px, calc(100vw - 32px));
+  min-height: min(820px, calc(100vh - 32px));
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  color: #f6f8ff;
+  padding: 20px 32px 16px;
 }
 
-.login-hero,
-.login-flow,
-.hero-metrics,
-.flow-body,
-.section-card,
-.selection-grid,
-.field-grid,
-.profile-card {
+.entry-carousel,
+.entry-footer,
+.mobile-page,
+.input-stack,
+.selection-list,
+.option-stack,
+.detail-panel,
+.page-section {
   display: grid;
 }
 
-.login-hero,
-.login-flow {
-  border-radius: 28px;
+.entry-carousel {
+  gap: 14px;
+  justify-items: center;
+  align-self: center;
+  width: 100%;
+  margin-top: auto;
+  margin-bottom: auto;
 }
 
-.login-hero {
-  align-content: end;
-  gap: 18px;
-  padding: 34px;
-  background:
-    radial-gradient(circle at top left, rgba(106, 168, 255, 0.28), transparent 24%),
-    radial-gradient(circle at right bottom, rgba(76, 215, 166, 0.24), transparent 20%),
-    linear-gradient(180deg, #233966 0%, #1a2947 100%);
-  color: #f5f8fe;
+.entry-art-wrap {
+  width: 100%;
+  min-height: 300px;
+  display: grid;
+  place-items: center;
 }
 
-.login-flow {
-  gap: 18px;
-  padding: 28px;
-  background: linear-gradient(180deg, #f8fbfe 0%, #f2f7fb 100%);
+.entry-art {
+  width: min(280px, 65vw);
+  max-width: 280px;
+  filter: drop-shadow(0 22px 52px rgba(10, 24, 48, 0.16));
 }
 
-.eyebrow,
-.hero-copy,
-.flow-kicker,
-.flow-copy h2,
-.section-copy p,
-.section-copy strong,
-.agreement-row label,
-.field-help,
-.summary-card p {
-  margin: 0;
-}
-
-.eyebrow,
-.flow-kicker {
-  text-transform: uppercase;
-  letter-spacing: 0.18em;
-  font-size: 0.76rem;
-}
-
-.eyebrow {
-  color: rgba(245, 248, 254, 0.74);
-}
-
-.flow-kicker {
-  color: #6b7d97;
-}
-
-.login-hero h1,
-.flow-copy h2 {
-  margin: 0;
-}
-
-.login-hero h1 {
-  font-size: clamp(2.2rem, 4.8vw, 4rem);
-  line-height: 0.98;
-  letter-spacing: -0.05em;
-  max-width: 12ch;
-}
-
-.hero-copy,
-.section-copy p,
-.agreement-row label,
-.field-help,
-.summary-card p {
-  line-height: 1.65;
-}
-
-.hero-copy {
-  max-width: 44ch;
-  color: rgba(245, 248, 254, 0.84);
-}
-
-.hero-metrics {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.entry-copy {
+  display: grid;
   gap: 10px;
+  text-align: center;
 }
 
-.metric-chip {
+.entry-copy h1,
+.entry-copy p,
+.page-title,
+.page-subtitle,
+.section-footnote,
+.inline-hint,
+.selection-card p,
+.restore-link {
+  margin: 0;
+}
+
+.entry-copy h1 {
+  font-size: clamp(1.55rem, 3vw, 1.8rem);
+  line-height: 1.2;
+  letter-spacing: -0.04em;
+  font-weight: 700;
+}
+
+.entry-copy p {
+  max-width: 30ch;
+  line-height: 1.55;
+  color: rgba(246, 248, 255, 0.8);
+}
+
+.slide-dots {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.slide-dot {
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.28);
+  cursor: pointer;
+}
+
+.slide-dot.active {
+  width: 22px;
+  background: #ffffff;
+}
+
+.entry-footer {
+  gap: 16px;
+}
+
+.action-button {
+  width: 100%;
+  min-height: 48px;
+  border: 0;
+  border-radius: 999px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+
+.action-button:hover:enabled {
+  transform: translateY(-1px);
+}
+
+.action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.action-primary {
+  background: #ffffff;
+  color: #214481;
+  box-shadow: 0 16px 40px rgba(9, 28, 56, 0.2);
+}
+
+.action-secondary {
+  background: transparent;
+  color: #ffffff;
+}
+
+.action-dark {
+  background: #0f1729;
+  color: #ffffff;
+}
+
+.terms-row {
   display: grid;
-  gap: 4px;
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.09);
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  color: rgba(246, 248, 255, 0.72);
+  font-size: 0.8rem;
+  line-height: 1.6;
 }
 
-.metric-chip strong {
-  font-size: 1.1rem;
+.terms-row p {
+  margin: 0;
 }
 
-.metric-chip span {
-  color: rgba(245, 248, 254, 0.72);
-  font-size: 0.85rem;
+.terms-link {
+  text-decoration: underline;
+  text-underline-offset: 0.14em;
 }
 
-.slide-markers,
-.stepper-row,
-.card-head,
-.agreement-row,
-.footer-actions,
-.mode-row {
+.terms-check {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 4px;
+  margin-top: 2px;
+}
+
+.terms-check::after {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.mobile-page {
+  width: min(430px, calc(100vw - 24px));
+  min-height: min(820px, calc(100vh - 24px));
+  background: #ffffff;
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
+  overflow: hidden;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.mobile-topbar,
+.selection-head,
+.option-card {
   display: flex;
   align-items: center;
 }
 
-.slide-markers {
-  gap: 8px;
+.mobile-topbar {
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  display: grid;
+  align-items: center;
+  padding: 16px 18px 10px;
 }
 
-.marker {
-  width: 34px;
-  height: 6px;
+.topbar-back {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
   border: 0;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.22);
+  background: transparent;
   cursor: pointer;
 }
 
-.marker.active {
-  background: #ffffff;
-}
-
-.stepper-row,
-.mode-row,
-.footer-actions {
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.step-pill,
-.mode-chip,
-.selection-card {
-  border: 1px solid rgba(208, 218, 228, 0.95);
-  background: #ffffff;
-}
-
-.step-pill {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  min-width: 110px;
-  padding: 10px 14px;
-  border-radius: 999px;
-  color: #52667f;
-  cursor: pointer;
-}
-
-.step-pill strong {
-  font-size: 0.86rem;
-}
-
-.step-pill.active {
-  border-color: rgba(83, 132, 193, 0.8);
-  background: linear-gradient(180deg, #f3f8ff 0%, #f5fbf8 100%);
-  color: #17345c;
-}
-
-.step-pill.done {
-  border-color: rgba(75, 164, 126, 0.48);
-  color: #2b6b55;
-}
-
-.step-pill:disabled {
-  cursor: default;
-  opacity: 0.72;
-}
-
-.flow-copy {
-  display: grid;
-  gap: 8px;
-}
-
-.flow-copy h2 {
+.topbar-chevron {
   font-size: 1.7rem;
-  color: #18253d;
+  line-height: 1;
+  color: #5f728d;
+  transform: translateY(-1px);
 }
 
-.flow-body {
-  gap: 16px;
-  min-height: 0;
+.topbar-title {
+  min-height: 24px;
+  text-align: center;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: #223553;
 }
 
-.section-card,
-.summary-card {
-  gap: 12px;
-  padding: 18px;
-  border-radius: 24px;
-  background: #ffffff;
-  border: 1px solid rgba(214, 223, 233, 0.84);
+.topbar-side {
+  width: 40px;
+  height: 40px;
 }
 
-.selection-grid,
-.field-grid,
-.profile-card {
-  gap: 12px;
+.mobile-body {
+  overflow: auto;
+  padding: 10px 30px 24px;
 }
 
-.selection-card {
+.page-section {
+  gap: 18px;
+}
+
+.page-copy {
   display: grid;
-  gap: 10px;
-  width: 100%;
-  padding: 18px;
-  border-radius: 22px;
+  gap: 12px;
+}
+
+.centered-copy {
+  justify-items: center;
+  text-align: center;
+}
+
+.page-title {
+  color: #20324f;
+  font-size: 1.95rem;
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+  font-weight: 700;
+}
+
+.page-title-left {
+  font-size: 1.45rem;
+  line-height: 1.24;
+}
+
+.page-subtitle,
+.section-footnote {
+  color: #7b8ca5;
+  line-height: 1.6;
+  font-size: 0.94rem;
+}
+
+.inline-link {
+  color: #2b6fce;
+}
+
+.inline-link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2b6fce;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.avatar-preview {
+  width: 88px;
+  height: 88px;
+  margin: 4px auto 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  position: relative;
+  cursor: default;
+}
+
+.profile-avatar {
+  width: 80px;
+  height: 80px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #dbe9ff 0%, #ddf8ef 100%);
   color: #17345c;
+  font-size: 1.35rem;
+  font-weight: 700;
+  margin: 0 auto;
+}
+
+.avatar-badge {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #224481;
+  color: #ffffff;
+  border: 2px solid #ffffff;
+  font-size: 0.72rem;
+}
+
+.input-stack,
+.detail-panel,
+.selection-list {
+  gap: 12px;
+}
+
+.field-label {
+  color: #485b75;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.inline-hint {
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.tone-error {
+  color: #c95353;
+}
+
+.tone-warn {
+  color: #9a6820;
+}
+
+.tone-info {
+  color: #4f6e98;
+}
+
+.tone-muted {
+  color: #7b8ca5;
+}
+
+.option-stack {
+  gap: 16px;
+}
+
+.option-card {
+  width: 100%;
+  gap: 16px;
+  padding: 18px 20px;
+  border-radius: 18px;
+  border: 1px solid rgba(210, 221, 233, 0.86);
+  background: #f8fbff;
   text-align: left;
   cursor: pointer;
 }
 
-.selection-card.active {
-  border-color: rgba(83, 132, 193, 0.82);
-  background: linear-gradient(180deg, #f4f8ff 0%, #f5fbf8 100%);
+.option-card.active {
+  border-color: #6fa0ea;
+  box-shadow: inset 0 0 0 1px rgba(111, 160, 234, 0.3);
 }
 
-.selection-card p,
-.card-meta,
-.preview-copy p,
-.preview-copy span {
-  margin: 0;
-  color: #6c8098;
+.option-card-disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
 }
 
-.card-head {
-  justify-content: space-between;
-  gap: 12px;
+.option-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 12px;
+  color: #2d6bd0;
+  font-size: 1.05rem;
 }
 
-.agreement-row {
-  gap: 10px;
-  color: #6c8098;
+.option-copy {
+  display: grid;
+  gap: 4px;
+  flex: 1;
+}
+
+.option-copy strong {
+  color: #21324f;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.option-copy small {
+  color: #73859d;
+  font-size: 0.87rem;
+  line-height: 1.45;
+}
+
+.option-arrow {
+  color: #8ba0bc;
   font-size: 0.92rem;
 }
 
-.field-label {
-  color: #4d6178;
-  font-size: 0.9rem;
-  font-weight: 600;
+.option-divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 14px;
+  align-items: center;
+}
+
+.option-divider span {
+  display: block;
+  height: 1px;
+  background: rgba(144, 162, 187, 0.22);
+}
+
+.option-divider p {
+  margin: 0;
+  color: #91a0b7;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.recommended-card {
+  position: relative;
+}
+
+.recommended-badge {
+  position: absolute;
+  top: -8px;
+  right: 10px;
+  z-index: 1;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: #214481;
+  color: #ffffff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.restore-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2b6fce;
+  font-size: 0.95rem;
+  justify-self: center;
+  cursor: pointer;
+}
+
+.restore-link.disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.restore-link.active {
+  color: #1b56a7;
 }
 
 .wide-input {
   width: 100%;
 }
 
-.field-help {
-  color: #6c8098;
-  font-size: 0.88rem;
-}
-
-.profile-preview {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 14px;
-  border-radius: 20px;
-  background: linear-gradient(180deg, #f4f8ff 0%, #f5fbf8 100%);
-}
-
-.preview-avatar {
-  display: grid;
-  place-items: center;
-  width: 50px;
-  height: 50px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
-  font-weight: 700;
-}
-
-.preview-copy {
-  display: grid;
-  gap: 2px;
-}
-
-.mode-chip {
-  padding: 10px 14px;
-  border-radius: 999px;
-  color: #52667f;
+.selection-card {
+  width: 100%;
+  border: 1px solid rgba(211, 221, 232, 0.95);
+  border-radius: 16px;
+  background: #ffffff;
+  text-align: left;
   cursor: pointer;
 }
 
-.mode-chip.active {
+.selection-card.active {
   border-color: rgba(83, 132, 193, 0.82);
-  background: linear-gradient(180deg, #f4f8ff 0%, #f5fbf8 100%);
-  color: #17345c;
+  background: linear-gradient(180deg, #f8fbff 0%, #f6fbf8 100%);
 }
 
-.mode-chip:disabled {
-  cursor: not-allowed;
-  opacity: 0.52;
+.selection-card {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
 }
 
-.summary-card strong {
-  color: #17345c;
-}
-
-.footer-actions {
+.selection-head {
   justify-content: space-between;
-  margin-top: auto;
+  gap: 12px;
 }
 
-@media (max-width: 980px) {
-  .login-card {
-    grid-template-columns: 1fr;
-    min-height: auto;
+.selection-head strong {
+  color: #20324f;
+}
+
+.selection-meta,
+.selection-card p {
+  color: #6d8098;
+}
+
+.selection-meta {
+  font-size: 0.84rem;
+}
+
+.selection-card p,
+.summary-card p {
+  line-height: 1.6;
+}
+
+.selection-pill {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(41, 87, 153, 0.08);
+  color: #44628c;
+  font-size: 0.72rem;
+  text-transform: capitalize;
+}
+
+.mobile-footer {
+  padding: 16px 30px 24px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 24%);
+}
+
+.circle-sheet-layer {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  align-items: end;
+  background: rgba(15, 23, 41, 0.36);
+  padding: 16px;
+}
+
+.circle-sheet-card,
+.circle-sheet-copy,
+.circle-sheet-body,
+.circle-sheet-actions,
+.relay-suggestions {
+  display: grid;
+}
+
+.circle-sheet-card {
+  width: min(430px, calc(100vw - 32px));
+  margin: 0 auto;
+  gap: 18px;
+  padding: 14px 20px 20px;
+  border-radius: 28px;
+  background: #ffffff;
+  box-shadow: 0 24px 64px rgba(15, 23, 41, 0.18);
+}
+
+.circle-sheet-grabber {
+  width: 44px;
+  height: 5px;
+  justify-self: center;
+  border-radius: 999px;
+  background: rgba(124, 140, 164, 0.34);
+}
+
+.circle-sheet-copy {
+  gap: 8px;
+}
+
+.circle-sheet-copy h3,
+.circle-sheet-copy p,
+.circle-sheet-actions {
+  margin: 0;
+}
+
+.circle-sheet-copy h3 {
+  color: #20324f;
+  font-size: 1.2rem;
+  line-height: 1.2;
+  font-weight: 700;
+}
+
+.circle-sheet-copy p {
+  color: #73859d;
+  line-height: 1.6;
+}
+
+.circle-sheet-body {
+  gap: 12px;
+}
+
+.sheet-footnote {
+  margin: 0;
+}
+
+.relay-suggestions {
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 8px;
+}
+
+.relay-chip,
+.sheet-button {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.relay-chip {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #eef4fb;
+  color: #315279;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.circle-sheet-actions {
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.sheet-button {
+  min-height: 46px;
+  border-radius: 999px;
+  font-weight: 700;
+}
+
+.sheet-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.sheet-button-secondary {
+  background: #eef4fb;
+  color: #315279;
+}
+
+.sheet-button-primary {
+  background: #0f1729;
+  color: #ffffff;
+}
+
+.info-sheet-card {
+  gap: 20px;
+}
+
+.info-sheet-body {
+  gap: 14px;
+}
+
+.info-card {
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(210, 221, 233, 0.82);
+  background: linear-gradient(180deg, #f9fbff 0%, #f4f8fd 100%);
+}
+
+.info-card h4,
+.info-card p,
+.info-step-list {
+  margin: 0;
+}
+
+.info-card h4 {
+  color: #20324f;
+  font-size: 0.98rem;
+  line-height: 1.35;
+  font-weight: 700;
+}
+
+.info-card p,
+.info-step-list {
+  color: #667a94;
+  line-height: 1.6;
+  font-size: 0.92rem;
+}
+
+.info-step-list {
+  display: grid;
+  gap: 10px;
+  padding-left: 1.2rem;
+}
+
+.sheet-button-single {
+  grid-template-columns: 1fr;
+}
+
+.sheet-fade-enter-active,
+.sheet-fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.sheet-fade-enter-active .circle-sheet-card,
+.sheet-fade-leave-active .circle-sheet-card {
+  transition:
+    transform 0.18s ease,
+    opacity 0.18s ease;
+}
+
+.sheet-fade-enter-from,
+.sheet-fade-leave-to {
+  opacity: 0;
+}
+
+.sheet-fade-enter-from .circle-sheet-card,
+.sheet-fade-leave-to .circle-sheet-card {
+  transform: translateY(16px);
+  opacity: 0.96;
+}
+
+:deep(.p-inputtext),
+:deep(.p-inputtextarea) {
+  width: 100%;
+  border-radius: 16px;
+  border-color: rgba(208, 218, 228, 0.95);
+  box-shadow: none;
+  padding: 0.95rem 1rem;
+  font-size: 0.98rem;
+  color: #20324f;
+}
+
+:deep(.p-inputtext:enabled:focus),
+:deep(.p-inputtextarea:enabled:focus) {
+  border-color: #5d8dd6;
+  box-shadow: 0 0 0 4px rgba(93, 141, 214, 0.12);
+}
+
+code {
+  font-family: inherit;
+  font-size: 0.92em;
+  padding: 0 0.22em;
+  border-radius: 6px;
+  background: rgba(16, 24, 40, 0.08);
+}
+
+@media (max-width: 720px) {
+  .entry-shell,
+  .mobile-page {
+    width: calc(100vw - 16px);
+    min-height: calc(100vh - 16px);
   }
 
-  .hero-metrics {
-    grid-template-columns: 1fr;
+  .entry-shell {
+    padding-left: 24px;
+    padding-right: 24px;
   }
 
-  .login-screen {
-    min-height: calc(100vh - 24px);
+  .mobile-body,
+  .mobile-footer {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+
+  .circle-sheet-layer {
+    padding: 10px;
+  }
+
+  .circle-sheet-card {
+    width: calc(100vw - 20px);
   }
 }
 </style>

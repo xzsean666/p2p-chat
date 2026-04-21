@@ -131,7 +131,9 @@ fn build_transport_cache(
         session_sync,
         activities,
         outbound_dispatches: previous_cache.outbound_dispatches.clone(),
+        outbound_media_dispatches: previous_cache.outbound_media_dispatches.clone(),
         relay_sync_cursors: previous_cache.relay_sync_cursors.clone(),
+        relay_background_sync_markers: previous_cache.relay_background_sync_markers.clone(),
         runtime_registry: Vec::new(),
         runtime_sessions: Vec::new(),
     }

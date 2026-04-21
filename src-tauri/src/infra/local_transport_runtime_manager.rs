@@ -1,7 +1,8 @@
 use crate::domain::transport::{
     SessionSyncState, TransportActivityItem, TransportChatEffects, TransportCircleAction,
-    TransportCircleActionInput, TransportOutboundDispatch, TransportRelaySyncFilter,
-    TransportRuntimeActionRequest, TransportRuntimeEffects, TransportRuntimeInputEvent,
+    TransportCircleActionInput, TransportOutboundDispatch, TransportOutboundMediaDispatch,
+    TransportRelaySyncFilter, TransportRuntimeActionRequest, TransportRuntimeBackgroundSyncRequest,
+    TransportRuntimeEffects, TransportRuntimeInputEvent, TransportRuntimeOutboundMedia,
     TransportRuntimeOutboundMessage, TransportRuntimePublishRequest,
 };
 use crate::domain::transport_repository::TransportCache;
@@ -20,6 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct LocalTransportRuntimeManager;
 
+const BACKGROUND_RELAY_SYNC_INTERVAL_MS: u64 = 5_000;
+
 impl TransportRuntimeManager for LocalTransportRuntimeManager {
     fn sync_cache(
         &self,
@@ -28,7 +31,9 @@ impl TransportRuntimeManager for LocalTransportRuntimeManager {
         profiles: Vec<TransportRuntimeProfile>,
         action: Option<&TransportCircleActionInput>,
         outbound_messages: &[TransportRuntimeOutboundMessage],
+        outbound_media_messages: &[TransportRuntimeOutboundMedia],
         relay_sync_filters: &[TransportRelaySyncFilter],
+        background_sync_requests: &[TransportRuntimeBackgroundSyncRequest],
     ) -> Result<TransportChatEffects, String> {
         let now_ms = current_time_millis();
         let mut chat_effects = TransportChatEffects::default();
@@ -68,7 +73,9 @@ impl TransportRuntimeManager for LocalTransportRuntimeManager {
                         &profile,
                         cache,
                         action,
+                        process_probe.as_ref(),
                         outbound_messages,
+                        outbound_media_messages,
                         relay_sync_filters,
                     )
                 })
@@ -83,6 +90,15 @@ impl TransportRuntimeManager for LocalTransportRuntimeManager {
                     &profile,
                     &process_probe,
                     outbound_messages,
+                    outbound_media_messages,
+                )?;
+                Self::enqueue_background_relay_sync_request(
+                    previous,
+                    cache,
+                    &profile,
+                    &process_probe,
+                    background_sync_requests,
+                    now_ms,
                 )?;
             }
 
@@ -114,8 +130,9 @@ impl LocalTransportRuntimeManager {
         profile: &TransportRuntimeProfile,
         process_probe: &Option<TransportRuntimeProcessProbe>,
         outbound_messages: &[TransportRuntimeOutboundMessage],
+        outbound_media_messages: &[TransportRuntimeOutboundMedia],
     ) -> Result<(), String> {
-        if outbound_messages.is_empty()
+        if (outbound_messages.is_empty() && outbound_media_messages.is_empty())
             || !matches!(
                 profile.adapter_kind,
                 crate::domain::transport::TransportRuntimeAdapterKind::LocalCommand
@@ -138,11 +155,21 @@ impl LocalTransportRuntimeManager {
             &profile.circle_id,
             outbound_messages,
         );
-        if profile_outbound_messages.is_empty() {
+        let profile_outbound_media_messages = outbound_media_messages_for_circle(
+            previous_cache,
+            cache,
+            &profile.circle_id,
+            outbound_media_messages,
+        );
+        if profile_outbound_messages.is_empty() && profile_outbound_media_messages.is_empty() {
             return Ok(());
         }
 
-        let request = build_runtime_publish_request(&profile.circle_id, &profile_outbound_messages);
+        let request = build_runtime_publish_request(
+            &profile.circle_id,
+            &profile_outbound_messages,
+            &profile_outbound_media_messages,
+        );
         let event = TransportRuntimeInputEvent::PublishOutboundMessages(request.clone());
         enqueue_local_command_runtime_input(&profile.circle_id, &event)?;
         record_outbound_dispatches(
@@ -151,7 +178,51 @@ impl LocalTransportRuntimeManager {
             previous.map(|entry| entry.generation).unwrap_or_default(),
             request.request_id.as_str(),
             &request.outbound_messages,
+            &request.outbound_media_messages,
         );
+        Ok(())
+    }
+
+    fn enqueue_background_relay_sync_request(
+        previous: Option<&crate::domain::transport::TransportRuntimeRegistryEntry>,
+        cache: &mut TransportCache,
+        profile: &TransportRuntimeProfile,
+        process_probe: &Option<TransportRuntimeProcessProbe>,
+        background_sync_requests: &[TransportRuntimeBackgroundSyncRequest],
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if !profile_supports_background_relay_sync(profile)
+            || !previous
+                .map(|entry| {
+                    matches!(
+                        entry.state,
+                        crate::domain::transport::TransportRuntimeState::Active
+                    )
+                })
+                .unwrap_or(false)
+            || process_probe.is_some()
+        {
+            return Ok(());
+        }
+
+        let Some(background_sync_request) = background_sync_requests
+            .iter()
+            .find(|request| request.circle_id == profile.circle_id)
+        else {
+            return Ok(());
+        };
+        if !should_enqueue_background_relay_sync(cache, &profile.circle_id, now_ms) {
+            return Ok(());
+        }
+
+        let Some(request) =
+            build_background_runtime_sync_request(profile, cache, background_sync_request, now_ms)
+        else {
+            return Ok(());
+        };
+        let event = TransportRuntimeInputEvent::ApplyCircleAction(request);
+        enqueue_local_command_runtime_input(&profile.circle_id, &event)?;
+        record_background_relay_sync_marker(cache, profile.circle_id.as_str(), now_ms);
         Ok(())
     }
 }
@@ -250,7 +321,9 @@ fn apply_runtime_process_action(
     profile: &TransportRuntimeProfile,
     cache: &mut TransportCache,
     action: &TransportCircleActionInput,
+    process_probe: Option<&TransportRuntimeProcessProbe>,
     outbound_messages: &[TransportRuntimeOutboundMessage],
+    outbound_media_messages: &[TransportRuntimeOutboundMedia],
     relay_sync_filters: &[TransportRelaySyncFilter],
 ) -> Result<Option<crate::domain::transport_runtime_registry::TransportRuntimeLaunchAttempt>, String>
 {
@@ -282,12 +355,14 @@ fn apply_runtime_process_action(
         ) && previous
             .map(|entry| runtime_is_live(&entry.state))
             .unwrap_or(false)
+            && process_probe.is_none()
         {
             let request = build_runtime_action_request(
                 profile,
                 cache,
                 action,
                 outbound_messages,
+                outbound_media_messages,
                 relay_sync_filters,
             );
             let event = TransportRuntimeInputEvent::ApplyCircleAction(request.clone());
@@ -298,6 +373,7 @@ fn apply_runtime_process_action(
                 previous.map(|entry| entry.generation).unwrap_or_default(),
                 request.request_id.as_str(),
                 &request.outbound_messages,
+                &request.outbound_media_messages,
             );
         }
         return Ok(None);
@@ -321,7 +397,10 @@ fn apply_runtime_process_action(
         .map(|entry| runtime_is_live(&entry.state))
         .unwrap_or(false)
     {
-        return Ok(None);
+        let runtime_probe = probe_local_command_runtime(&profile.circle_id)?;
+        if runtime_probe.is_none() {
+            return Ok(None);
+        }
     }
 
     Ok(Some(launch_local_command_runtime(profile)))
@@ -332,6 +411,7 @@ fn build_runtime_action_request(
     cache: &TransportCache,
     action: &TransportCircleActionInput,
     outbound_messages: &[TransportRuntimeOutboundMessage],
+    outbound_media_messages: &[TransportRuntimeOutboundMedia],
     relay_sync_filters: &[TransportRelaySyncFilter],
 ) -> TransportRuntimeActionRequest {
     let session_ids = cache
@@ -366,6 +446,7 @@ fn build_runtime_action_request(
         ),
         circle_id: action.circle_id.clone(),
         action: action.action.clone(),
+        background: false,
         primary_session_id,
         session_ids: session_ids.clone(),
         unread_session_ids,
@@ -374,17 +455,20 @@ fn build_runtime_action_request(
         sync_since_created_at: action.sync_since_created_at,
         relay_sync_filters: relay_sync_filters.to_vec(),
         outbound_messages: outbound_messages.to_vec(),
+        outbound_media_messages: outbound_media_messages.to_vec(),
     }
 }
 
 fn build_runtime_publish_request(
     circle_id: &str,
     outbound_messages: &[TransportRuntimeOutboundMessage],
+    outbound_media_messages: &[TransportRuntimeOutboundMedia],
 ) -> TransportRuntimePublishRequest {
     TransportRuntimePublishRequest {
         request_id: format!("publish:{circle_id}:{}", current_time_millis()),
         circle_id: circle_id.to_string(),
         outbound_messages: outbound_messages.to_vec(),
+        outbound_media_messages: outbound_media_messages.to_vec(),
     }
 }
 
@@ -412,17 +496,38 @@ fn outbound_messages_for_circle(
         .collect()
 }
 
+fn outbound_media_messages_for_circle(
+    previous_cache: &TransportCache,
+    cache: &TransportCache,
+    circle_id: &str,
+    outbound_media_messages: &[TransportRuntimeOutboundMedia],
+) -> Vec<TransportRuntimeOutboundMedia> {
+    let session_ids = cache
+        .session_sync
+        .iter()
+        .chain(previous_cache.session_sync.iter())
+        .filter(|item| item.circle_id == circle_id)
+        .map(|item| item.session_id.as_str())
+        .collect::<HashSet<_>>();
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+
+    outbound_media_messages
+        .iter()
+        .filter(|message| session_ids.contains(message.session_id.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn record_outbound_dispatches(
     cache: &mut TransportCache,
     circle_id: &str,
     runtime_generation: u32,
     request_id: &str,
     outbound_messages: &[TransportRuntimeOutboundMessage],
+    outbound_media_messages: &[TransportRuntimeOutboundMedia],
 ) {
-    if outbound_messages.is_empty() {
-        return;
-    }
-
     for outbound in outbound_messages {
         let already_recorded = cache.outbound_dispatches.iter().any(|dispatch| {
             dispatch.circle_id == circle_id
@@ -446,6 +551,125 @@ fn record_outbound_dispatches(
             dispatched_at: "now".into(),
         });
     }
+
+    for outbound in outbound_media_messages {
+        let already_recorded = cache.outbound_media_dispatches.iter().any(|dispatch| {
+            dispatch.circle_id == circle_id
+                && dispatch.session_id == outbound.session_id
+                && dispatch.message_id == outbound.message_id
+                && dispatch.local_path == outbound.local_path
+                && dispatch.runtime_generation == runtime_generation
+        });
+        if already_recorded {
+            continue;
+        }
+
+        cache
+            .outbound_media_dispatches
+            .push(TransportOutboundMediaDispatch {
+                circle_id: circle_id.to_string(),
+                session_id: outbound.session_id.clone(),
+                message_id: outbound.message_id.clone(),
+                remote_id: outbound.remote_id.clone(),
+                local_path: outbound.local_path.clone(),
+                runtime_generation,
+                request_id: request_id.to_string(),
+                dispatched_at: "now".into(),
+            });
+    }
+}
+
+fn build_background_runtime_sync_request(
+    profile: &TransportRuntimeProfile,
+    cache: &TransportCache,
+    background_sync_request: &TransportRuntimeBackgroundSyncRequest,
+    now_ms: u64,
+) -> Option<TransportRuntimeActionRequest> {
+    if background_sync_request.relay_sync_filters.is_empty() {
+        return None;
+    }
+
+    let session_ids = cache
+        .session_sync
+        .iter()
+        .filter(|item| item.circle_id == background_sync_request.circle_id)
+        .map(|item| item.session_id.clone())
+        .collect::<Vec<_>>();
+    let peer_count = cache
+        .peers
+        .iter()
+        .filter(|peer| peer.circle_id == background_sync_request.circle_id && !peer.blocked)
+        .count() as u32;
+    let primary_session_id = session_ids
+        .first()
+        .cloned()
+        .or_else(|| profile_launch_session_id(profile));
+    let primary_session_id = primary_session_id?;
+
+    Some(TransportRuntimeActionRequest {
+        request_id: format!(
+            "background-sync:{}:{now_ms}",
+            background_sync_request.circle_id
+        ),
+        circle_id: background_sync_request.circle_id.clone(),
+        action: TransportCircleAction::Sync,
+        background: true,
+        primary_session_id: Some(primary_session_id),
+        session_ids: session_ids.clone(),
+        unread_session_ids: Vec::new(),
+        peer_count,
+        session_sync_count: session_ids.len() as u32,
+        sync_since_created_at: background_sync_request.sync_since_created_at,
+        relay_sync_filters: background_sync_request.relay_sync_filters.clone(),
+        outbound_messages: Vec::new(),
+        outbound_media_messages: Vec::new(),
+    })
+}
+
+fn profile_supports_background_relay_sync(profile: &TransportRuntimeProfile) -> bool {
+    matches!(
+        profile.adapter_kind,
+        crate::domain::transport::TransportRuntimeAdapterKind::LocalCommand
+    ) && matches!(
+        profile.launch_status,
+        crate::domain::transport::TransportRuntimeLaunchStatus::Ready
+    ) && profile
+        .launch_arguments
+        .first()
+        .is_some_and(|argument| argument == "preview-relay")
+}
+
+fn should_enqueue_background_relay_sync(
+    cache: &TransportCache,
+    circle_id: &str,
+    now_ms: u64,
+) -> bool {
+    cache
+        .relay_background_sync_markers
+        .iter()
+        .find(|marker| marker.circle_id == circle_id)
+        .map(|marker| {
+            now_ms.saturating_sub(marker.last_requested_at_ms) >= BACKGROUND_RELAY_SYNC_INTERVAL_MS
+        })
+        .unwrap_or(true)
+}
+
+fn record_background_relay_sync_marker(cache: &mut TransportCache, circle_id: &str, now_ms: u64) {
+    if let Some(marker) = cache
+        .relay_background_sync_markers
+        .iter_mut()
+        .find(|marker| marker.circle_id == circle_id)
+    {
+        marker.last_requested_at_ms = now_ms;
+        return;
+    }
+
+    cache.relay_background_sync_markers.push(
+        crate::domain::transport_repository::TransportRelayBackgroundSyncMarker {
+            circle_id: circle_id.to_string(),
+            last_requested_at_ms: now_ms,
+        },
+    );
 }
 
 fn profile_launch_session_id(profile: &TransportRuntimeProfile) -> Option<String> {
@@ -522,9 +746,9 @@ mod tests {
         SessionSyncItem, SessionSyncState, TransportActivityItem, TransportActivityKind,
         TransportActivityLevel, TransportCircleAction, TransportCircleActionInput,
         TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchResult,
-        TransportRuntimeLaunchStatus, TransportRuntimeOutboundMessage, TransportRuntimeOutputEvent,
-        TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy, TransportRuntimeSession,
-        TransportRuntimeState,
+        TransportRuntimeLaunchStatus, TransportRuntimeOutboundMedia,
+        TransportRuntimeOutboundMessage, TransportRuntimeOutputEvent, TransportRuntimeQueueState,
+        TransportRuntimeRecoveryPolicy, TransportRuntimeSession, TransportRuntimeState,
     };
     use crate::domain::transport_runtime_registry::TransportRuntimeLabels;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -642,6 +866,160 @@ mod tests {
         }
     }
 
+    fn outbound_runtime_media(
+        session_id: &str,
+        message_id: &str,
+        remote_id: &str,
+        kind: MessageKind,
+        name: &str,
+        label: &str,
+        local_path: &str,
+        remote_url: &str,
+    ) -> TransportRuntimeOutboundMedia {
+        TransportRuntimeOutboundMedia {
+            session_id: session_id.into(),
+            message_id: message_id.into(),
+            remote_id: remote_id.into(),
+            kind,
+            name: name.into(),
+            label: label.into(),
+            local_path: local_path.into(),
+            remote_url: remote_url.into(),
+        }
+    }
+
+    fn background_runtime_sync_request(circle_id: &str) -> TransportRuntimeBackgroundSyncRequest {
+        TransportRuntimeBackgroundSyncRequest {
+            circle_id: circle_id.into(),
+            sync_since_created_at: Some(1_735_689_300),
+            relay_sync_filters: vec![TransportRelaySyncFilter {
+                authors: vec!["pubkey-alice".into()],
+                tagged_pubkeys: vec!["pubkey-me".into()],
+            }],
+        }
+    }
+
+    fn runtime_session_sync_item(circle_id: &str) -> SessionSyncItem {
+        SessionSyncItem {
+            circle_id: circle_id.into(),
+            session_id: "session-1".into(),
+            session_name: "session-1".into(),
+            state: SessionSyncState::Idle,
+            pending_messages: 0,
+            source: "native relay".into(),
+            last_merge: "now".into(),
+        }
+    }
+
+    fn managed_live_local_command_cache(circle_id: &str) -> (TransportCache, String, Vec<String>) {
+        let (command, args) = sleeping_command();
+        let launch_attempt = launch_local_command_runtime(&local_command_profile(
+            circle_id,
+            command.clone(),
+            args.clone(),
+            TransportRuntimeState::Starting,
+        ));
+        assert!(matches!(
+            launch_attempt.result,
+            TransportRuntimeLaunchResult::Spawned | TransportRuntimeLaunchResult::Reused
+        ));
+
+        (
+            TransportCache {
+                runtime_sessions: vec![TransportRuntimeSession {
+                    circle_id: circle_id.into(),
+                    driver: "native-preview-relay-runtime".into(),
+                    adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
+                    launch_status: TransportRuntimeLaunchStatus::Ready,
+                    launch_command: Some(command.clone()),
+                    launch_arguments: args.clone(),
+                    resolved_launch_command: Some(command.clone()),
+                    launch_error: None,
+                    last_launch_result: Some(launch_attempt.result),
+                    last_launch_pid: launch_attempt.pid,
+                    last_launch_at: Some("now".into()),
+                    desired_state: TransportRuntimeDesiredState::Running,
+                    recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
+                    queue_state: TransportRuntimeQueueState::Idle,
+                    restart_attempts: 0,
+                    next_retry_in: None,
+                    next_retry_at_ms: None,
+                    last_failure_reason: None,
+                    last_failure_at: None,
+                    state: TransportRuntimeState::Active,
+                    generation: 1,
+                    state_since: "now".into(),
+                    session_label: format!("native::ws::{circle_id}"),
+                    endpoint: format!("native://relay/{circle_id}"),
+                    last_event: "native runtime active".into(),
+                    last_event_at: "now".into(),
+                }],
+                session_sync: vec![runtime_session_sync_item(circle_id)],
+                ..TransportCache::default()
+            },
+            command,
+            args,
+        )
+    }
+
+    fn managed_live_preview_relay_cache(circle_id: &str) -> (TransportCache, String, Vec<String>) {
+        let (command, process_args) = sleeping_command();
+        let launch_attempt = launch_local_command_runtime(&local_command_profile(
+            circle_id,
+            command.clone(),
+            process_args,
+            TransportRuntimeState::Starting,
+        ));
+        assert!(matches!(
+            launch_attempt.result,
+            TransportRuntimeLaunchResult::Spawned | TransportRuntimeLaunchResult::Reused
+        ));
+        let preview_args = vec![
+            "preview-relay".into(),
+            "--circle".into(),
+            circle_id.into(),
+            "--session".into(),
+            "session-1".into(),
+        ];
+
+        (
+            TransportCache {
+                runtime_sessions: vec![TransportRuntimeSession {
+                    circle_id: circle_id.into(),
+                    driver: "native-preview-relay-runtime".into(),
+                    adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
+                    launch_status: TransportRuntimeLaunchStatus::Ready,
+                    launch_command: Some(command.clone()),
+                    launch_arguments: preview_args.clone(),
+                    resolved_launch_command: Some(command.clone()),
+                    launch_error: None,
+                    last_launch_result: Some(launch_attempt.result),
+                    last_launch_pid: launch_attempt.pid,
+                    last_launch_at: Some("now".into()),
+                    desired_state: TransportRuntimeDesiredState::Running,
+                    recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
+                    queue_state: TransportRuntimeQueueState::Idle,
+                    restart_attempts: 0,
+                    next_retry_in: None,
+                    next_retry_at_ms: None,
+                    last_failure_reason: None,
+                    last_failure_at: None,
+                    state: TransportRuntimeState::Active,
+                    generation: 1,
+                    state_since: "now".into(),
+                    session_label: format!("native::ws::{circle_id}"),
+                    endpoint: format!("native://relay/{circle_id}"),
+                    last_event: "native runtime active".into(),
+                    last_event_at: "now".into(),
+                }],
+                session_sync: vec![runtime_session_sync_item(circle_id)],
+                ..TransportCache::default()
+            },
+            command,
+            preview_args,
+        )
+    }
+
     #[test]
     fn sync_cache_projects_profiles_into_runtime_registry() {
         let manager = LocalTransportRuntimeManager;
@@ -705,6 +1083,8 @@ mod tests {
                     experimental_transport: false,
                     sync_since_created_at: None,
                 }),
+                &[],
+                &[],
                 &[],
                 &[],
             )
@@ -773,6 +1153,8 @@ mod tests {
                 }),
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .expect("runtime manager should record launch attempt");
 
@@ -790,6 +1172,78 @@ mod tests {
             cache.runtime_sessions[0].last_event,
             "native runtime launch spawned"
         );
+    }
+
+    #[test]
+    fn sync_cache_connect_relaunches_when_cached_runtime_has_no_managed_handle() {
+        let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("reconnect-missing-handle");
+        let (command, args) = sleeping_command();
+        let previous_cache = TransportCache {
+            runtime_sessions: vec![TransportRuntimeSession {
+                circle_id: circle_id.clone(),
+                driver: "native-preview-relay-runtime".into(),
+                adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
+                launch_status: TransportRuntimeLaunchStatus::Ready,
+                launch_command: Some(command.clone()),
+                launch_arguments: args.clone(),
+                resolved_launch_command: Some(command.clone()),
+                launch_error: None,
+                last_launch_result: Some(TransportRuntimeLaunchResult::Spawned),
+                last_launch_pid: Some(1234),
+                last_launch_at: Some("now".into()),
+                desired_state: TransportRuntimeDesiredState::Running,
+                recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
+                queue_state: TransportRuntimeQueueState::Idle,
+                restart_attempts: 0,
+                next_retry_in: None,
+                next_retry_at_ms: None,
+                last_failure_reason: None,
+                last_failure_at: None,
+                state: TransportRuntimeState::Active,
+                generation: 1,
+                state_since: "now".into(),
+                session_label: format!("native::ws::{circle_id}"),
+                endpoint: format!("native://relay/{circle_id}"),
+                last_event: "native runtime active".into(),
+                last_event_at: "now".into(),
+            }],
+            ..TransportCache::default()
+        };
+        let mut cache = TransportCache::default();
+
+        manager
+            .sync_cache(
+                &previous_cache,
+                &mut cache,
+                vec![local_command_profile(
+                    &circle_id,
+                    command.clone(),
+                    args.clone(),
+                    TransportRuntimeState::Active,
+                )],
+                Some(&TransportCircleActionInput {
+                    circle_id: circle_id.clone(),
+                    action: TransportCircleAction::Connect,
+                    active_circle_id: Some(circle_id.clone()),
+                    use_tor_network: false,
+                    experimental_transport: true,
+                    sync_since_created_at: None,
+                }),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("connect should relaunch runtime when no managed handle exists");
+
+        assert_eq!(
+            cache.runtime_sessions[0].last_launch_result,
+            Some(TransportRuntimeLaunchResult::Spawned)
+        );
+        assert!(cache.runtime_sessions[0].last_launch_pid.is_some());
+
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
     }
 
     #[test]
@@ -825,6 +1279,8 @@ mod tests {
                     experimental_transport: true,
                     sync_since_created_at: None,
                 }),
+                &[],
+                &[],
                 &[],
                 &[],
             )
@@ -894,6 +1350,8 @@ mod tests {
                 }),
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .expect("connect should spawn runtime");
 
@@ -926,6 +1384,8 @@ mod tests {
                     experimental_transport: true,
                     sync_since_created_at: None,
                 }),
+                &[],
+                &[],
                 &[],
                 &[],
             )
@@ -969,6 +1429,8 @@ mod tests {
                     experimental_transport: true,
                     sync_since_created_at: None,
                 }),
+                &[],
+                &[],
                 &[],
                 &[],
             )
@@ -1019,6 +1481,8 @@ mod tests {
                 }),
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .expect("connect should spawn runtime");
 
@@ -1050,6 +1514,8 @@ mod tests {
                         labels: labels(),
                     }],
                     None,
+                    &[],
+                    &[],
                     &[],
                     &[],
                 )
@@ -1138,6 +1604,8 @@ mod tests {
                 }),
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .expect("connect should launch runtime");
 
@@ -1159,6 +1627,8 @@ mod tests {
                         TransportRuntimeState::Active,
                     )],
                     None,
+                    &[],
+                    &[],
                     &[],
                     &[],
                 )
@@ -1259,6 +1729,8 @@ mod tests {
                 }),
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .expect("connect should launch runtime");
 
@@ -1277,6 +1749,8 @@ mod tests {
                         TransportRuntimeState::Active,
                     )],
                     None,
+                    &[],
+                    &[],
                     &[],
                     &[],
                 )
@@ -1326,45 +1800,7 @@ mod tests {
         let circle_id = unique_circle_id("queued-sync");
         let queue_path = runtime_input_queue_path(&circle_id);
         let _ = std::fs::remove_file(&queue_path);
-        let current_executable =
-            std::env::current_exe().expect("current test executable path should resolve");
-        let previous_cache = TransportCache {
-            runtime_sessions: vec![TransportRuntimeSession {
-                circle_id: circle_id.clone(),
-                driver: "native-preview-relay-runtime".into(),
-                adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
-                launch_status: TransportRuntimeLaunchStatus::Ready,
-                launch_command: Some(current_executable.to_string_lossy().into_owned()),
-                launch_arguments: vec![
-                    "preview-relay".into(),
-                    "--circle".into(),
-                    circle_id.clone(),
-                    "--session".into(),
-                    "session-1".into(),
-                ],
-                resolved_launch_command: Some(current_executable.to_string_lossy().into_owned()),
-                launch_error: None,
-                last_launch_result: Some(TransportRuntimeLaunchResult::Spawned),
-                last_launch_pid: Some(1234),
-                last_launch_at: Some("now".into()),
-                desired_state: TransportRuntimeDesiredState::Running,
-                recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
-                queue_state: TransportRuntimeQueueState::Idle,
-                restart_attempts: 0,
-                next_retry_in: None,
-                next_retry_at_ms: None,
-                last_failure_reason: None,
-                last_failure_at: None,
-                state: TransportRuntimeState::Active,
-                generation: 1,
-                state_since: "now".into(),
-                session_label: format!("native::ws::{circle_id}"),
-                endpoint: format!("native://relay/{circle_id}"),
-                last_event: "native runtime active".into(),
-                last_event_at: "now".into(),
-            }],
-            ..TransportCache::default()
-        };
+        let (previous_cache, command, args) = managed_live_local_command_cache(&circle_id);
 
         let mut cache = TransportCache::default();
         let drained_effects = manager
@@ -1373,14 +1809,8 @@ mod tests {
                 &mut cache,
                 vec![local_command_profile(
                     &circle_id,
-                    current_executable.to_string_lossy().into_owned(),
-                    vec![
-                        "preview-relay".into(),
-                        "--circle".into(),
-                        circle_id.clone(),
-                        "--session".into(),
-                        "session-1".into(),
-                    ],
+                    command,
+                    args,
                     TransportRuntimeState::Active,
                 )],
                 Some(&TransportCircleActionInput {
@@ -1396,6 +1826,8 @@ mod tests {
                     "message-1",
                     "event-1",
                 )],
+                &[],
+                &[],
                 &[],
             )
             .expect("sync sessions should enqueue runtime request");
@@ -1413,62 +1845,19 @@ mod tests {
         assert_eq!(cache.outbound_dispatches[0].runtime_generation, 1);
 
         let _ = std::fs::remove_file(queue_path);
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
     }
 
     #[test]
-    fn sync_cache_hydrate_enqueues_background_publish_for_live_local_command_runtime() {
+    fn sync_cache_hydrate_enqueues_background_publish_for_outbound_media_messages() {
         let manager = LocalTransportRuntimeManager;
-        let circle_id = unique_circle_id("publish");
+        let circle_id = unique_circle_id("publish-media");
         let queue_path = runtime_input_queue_path(&circle_id);
         let _ = std::fs::remove_file(&queue_path);
-        let current_executable =
-            std::env::current_exe().expect("current test executable path should resolve");
-        let previous_cache = TransportCache {
-            runtime_sessions: vec![TransportRuntimeSession {
-                circle_id: circle_id.clone(),
-                driver: "native-preview-relay-runtime".into(),
-                adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
-                launch_status: TransportRuntimeLaunchStatus::Ready,
-                launch_command: Some(current_executable.to_string_lossy().into_owned()),
-                launch_arguments: vec![
-                    "preview-relay".into(),
-                    "--circle".into(),
-                    circle_id.clone(),
-                    "--session".into(),
-                    "session-1".into(),
-                ],
-                resolved_launch_command: Some(current_executable.to_string_lossy().into_owned()),
-                launch_error: None,
-                last_launch_result: Some(TransportRuntimeLaunchResult::Spawned),
-                last_launch_pid: Some(1234),
-                last_launch_at: Some("now".into()),
-                desired_state: TransportRuntimeDesiredState::Running,
-                recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
-                queue_state: TransportRuntimeQueueState::Idle,
-                restart_attempts: 0,
-                next_retry_in: None,
-                next_retry_at_ms: None,
-                last_failure_reason: None,
-                last_failure_at: None,
-                state: TransportRuntimeState::Active,
-                generation: 1,
-                state_since: "now".into(),
-                session_label: format!("native::ws::{circle_id}"),
-                endpoint: format!("native://relay/{circle_id}"),
-                last_event: "native runtime active".into(),
-                last_event_at: "now".into(),
-            }],
-            session_sync: vec![SessionSyncItem {
-                circle_id: circle_id.clone(),
-                session_id: "session-1".into(),
-                session_name: "session-1".into(),
-                state: SessionSyncState::Idle,
-                pending_messages: 0,
-                source: "native relay".into(),
-                last_merge: "now".into(),
-            }],
-            ..TransportCache::default()
-        };
+        let temp_media_path = std::env::temp_dir().join(format!("{circle_id}-preview.png"));
+        std::fs::write(&temp_media_path, b"preview-media")
+            .expect("temp media file should be written");
+        let (previous_cache, command, args) = managed_live_local_command_cache(&circle_id);
 
         let mut cache = TransportCache {
             session_sync: previous_cache.session_sync.clone(),
@@ -1480,14 +1869,142 @@ mod tests {
                 &mut cache,
                 vec![local_command_profile(
                     &circle_id,
-                    current_executable.to_string_lossy().into_owned(),
-                    vec![
-                        "preview-relay".into(),
-                        "--circle".into(),
-                        circle_id.clone(),
-                        "--session".into(),
-                        "session-1".into(),
-                    ],
+                    command,
+                    args,
+                    TransportRuntimeState::Active,
+                )],
+                None,
+                &[],
+                &[outbound_runtime_media(
+                    "session-1",
+                    "message-media-1",
+                    "relay-ack:message-media-1",
+                    MessageKind::Image,
+                    "preview.png",
+                    "PNG · 32 KB",
+                    temp_media_path.to_string_lossy().as_ref(),
+                    "http://127.0.0.1:45115/chat-media/asset/test/preview.png",
+                )],
+                &[],
+                &[],
+            )
+            .expect("hydrate should enqueue background media publish request");
+
+        assert!(drained_effects.is_empty());
+        let contents =
+            std::fs::read_to_string(&queue_path).expect("runtime input queue should be written");
+        assert!(contents.contains("\"kind\":\"publishOutboundMessages\""));
+        assert!(contents.contains("\"outboundMediaMessages\""));
+        assert!(contents.contains("\"messageId\":\"message-media-1\""));
+        assert!(contents.contains("\"localPath\""));
+        assert_eq!(cache.outbound_media_dispatches.len(), 1);
+        assert_eq!(
+            cache.outbound_media_dispatches[0].message_id,
+            "message-media-1"
+        );
+        assert_eq!(
+            cache.outbound_media_dispatches[0].local_path,
+            temp_media_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(cache.outbound_media_dispatches[0].runtime_generation, 1);
+
+        let _ = std::fs::remove_file(queue_path);
+        let _ = std::fs::remove_file(temp_media_path);
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
+    }
+
+    #[test]
+    fn sync_cache_sync_sessions_records_outbound_media_dispatches() {
+        let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("queued-sync-media");
+        let queue_path = runtime_input_queue_path(&circle_id);
+        let _ = std::fs::remove_file(&queue_path);
+        let temp_media_path = std::env::temp_dir().join(format!("{circle_id}-queued.png"));
+        std::fs::write(&temp_media_path, b"queued-media")
+            .expect("temp media file should be written");
+        let (previous_cache, command, args) = managed_live_local_command_cache(&circle_id);
+
+        let mut cache = TransportCache {
+            session_sync: previous_cache.session_sync.clone(),
+            ..TransportCache::default()
+        };
+        let drained_effects = manager
+            .sync_cache(
+                &previous_cache,
+                &mut cache,
+                vec![local_command_profile(
+                    &circle_id,
+                    command,
+                    args,
+                    TransportRuntimeState::Active,
+                )],
+                Some(&TransportCircleActionInput {
+                    circle_id: circle_id.clone(),
+                    action: TransportCircleAction::SyncSessions,
+                    active_circle_id: Some(circle_id.clone()),
+                    use_tor_network: false,
+                    experimental_transport: true,
+                    sync_since_created_at: None,
+                }),
+                &[],
+                &[outbound_runtime_media(
+                    "session-1",
+                    "message-media-1",
+                    "relay-ack:message-media-1",
+                    MessageKind::Image,
+                    "queued.png",
+                    "PNG · 32 KB",
+                    temp_media_path.to_string_lossy().as_ref(),
+                    "http://127.0.0.1:45115/chat-media/asset/test/queued.png",
+                )],
+                &[],
+                &[],
+            )
+            .expect("sync sessions should enqueue runtime media request");
+
+        assert!(drained_effects.is_empty());
+        let contents =
+            std::fs::read_to_string(&queue_path).expect("runtime input queue should be written");
+        assert!(contents.contains("\"kind\":\"applyCircleAction\""));
+        assert!(contents.contains("\"action\":\"syncSessions\""));
+        assert!(contents.contains("\"outboundMediaMessages\""));
+        assert!(contents.contains("\"messageId\":\"message-media-1\""));
+        assert_eq!(cache.outbound_media_dispatches.len(), 1);
+        assert_eq!(
+            cache.outbound_media_dispatches[0].message_id,
+            "message-media-1"
+        );
+        assert_eq!(
+            cache.outbound_media_dispatches[0].local_path,
+            temp_media_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(cache.outbound_media_dispatches[0].runtime_generation, 1);
+
+        let _ = std::fs::remove_file(queue_path);
+        let _ = std::fs::remove_file(temp_media_path);
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
+    }
+
+    #[test]
+    fn sync_cache_hydrate_enqueues_background_publish_for_live_local_command_runtime() {
+        let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("publish");
+        let queue_path = runtime_input_queue_path(&circle_id);
+        let _ = std::fs::remove_file(&queue_path);
+        let (previous_cache, command, args) = managed_live_local_command_cache(&circle_id);
+
+        let mut cache = TransportCache {
+            session_sync: previous_cache.session_sync.clone(),
+            ..TransportCache::default()
+        };
+        let drained_effects = manager
+            .sync_cache(
+                &previous_cache,
+                &mut cache,
+                vec![local_command_profile(
+                    &circle_id,
+                    command,
+                    args,
                     TransportRuntimeState::Active,
                 )],
                 None,
@@ -1496,6 +2013,8 @@ mod tests {
                     "message-1",
                     "event-1",
                 )],
+                &[],
+                &[],
                 &[],
             )
             .expect("hydrate should enqueue background publish request");
@@ -1512,5 +2031,104 @@ mod tests {
         assert_eq!(cache.outbound_dispatches[0].runtime_generation, 1);
 
         let _ = std::fs::remove_file(queue_path);
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
+    }
+
+    #[test]
+    fn sync_cache_hydrate_enqueues_background_relay_sync_for_live_runtime() {
+        let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("background-sync");
+        let queue_path = runtime_input_queue_path(&circle_id);
+        let _ = std::fs::remove_file(&queue_path);
+        let (previous_cache, command, args) = managed_live_preview_relay_cache(&circle_id);
+
+        let mut cache = TransportCache {
+            session_sync: previous_cache.session_sync.clone(),
+            ..TransportCache::default()
+        };
+        let drained_effects = manager
+            .sync_cache(
+                &previous_cache,
+                &mut cache,
+                vec![local_command_profile(
+                    &circle_id,
+                    command,
+                    args,
+                    TransportRuntimeState::Active,
+                )],
+                None,
+                &[],
+                &[],
+                &[],
+                &[background_runtime_sync_request(&circle_id)],
+            )
+            .expect("hydrate should enqueue background relay sync request");
+
+        assert!(drained_effects.is_empty());
+        let contents =
+            std::fs::read_to_string(&queue_path).expect("runtime input queue should be written");
+        assert!(contents.contains("\"kind\":\"applyCircleAction\""));
+        assert!(contents.contains("\"action\":\"sync\""));
+        assert!(contents.contains("\"background\":true"));
+        assert!(contents.contains("\"requestId\":\"background-sync:"));
+        assert!(contents.contains("\"syncSinceCreatedAt\":1735689300"));
+        assert!(contents.contains("\"relaySyncFilters\""));
+        assert_eq!(cache.relay_background_sync_markers.len(), 1);
+        assert_eq!(
+            cache.relay_background_sync_markers[0].circle_id,
+            circle_id.as_str()
+        );
+
+        let _ = std::fs::remove_file(queue_path);
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
+    }
+
+    #[test]
+    fn sync_cache_hydrate_throttles_background_relay_sync_requests() {
+        let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("background-sync-throttle");
+        let queue_path = runtime_input_queue_path(&circle_id);
+        let _ = std::fs::remove_file(&queue_path);
+        let recent_marker_at_ms = current_time_millis();
+        let (mut previous_cache, command, args) = managed_live_preview_relay_cache(&circle_id);
+        previous_cache.relay_background_sync_markers = vec![
+            crate::domain::transport_repository::TransportRelayBackgroundSyncMarker {
+                circle_id: circle_id.clone(),
+                last_requested_at_ms: recent_marker_at_ms,
+            },
+        ];
+
+        let mut cache = TransportCache {
+            session_sync: previous_cache.session_sync.clone(),
+            relay_background_sync_markers: previous_cache.relay_background_sync_markers.clone(),
+            ..TransportCache::default()
+        };
+        let drained_effects = manager
+            .sync_cache(
+                &previous_cache,
+                &mut cache,
+                vec![local_command_profile(
+                    &circle_id,
+                    command,
+                    args,
+                    TransportRuntimeState::Active,
+                )],
+                None,
+                &[],
+                &[],
+                &[],
+                &[background_runtime_sync_request(&circle_id)],
+            )
+            .expect("hydrate should respect background relay sync throttle");
+
+        assert!(drained_effects.is_empty());
+        assert!(!queue_path.exists());
+        assert_eq!(cache.relay_background_sync_markers.len(), 1);
+        assert_eq!(
+            cache.relay_background_sync_markers[0].last_requested_at_ms,
+            recent_marker_at_ms
+        );
+
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
     }
 }

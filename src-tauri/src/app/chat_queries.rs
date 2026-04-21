@@ -10,12 +10,16 @@ use crate::domain::chat_repository::ChatRepository;
 use crate::infra::shell_state_store;
 use crate::infra::sqlite_chat_repository::SqliteChatRepository;
 use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
 pub fn load_chat_shell_snapshot<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<ChatShellSnapshot, String> {
     let repository = SqliteChatRepository::new(app_handle);
-    let shell = load_saved_shell_snapshot(app_handle)?;
+    let mut shell = load_saved_shell_snapshot(app_handle)?;
+    if shell.is_authenticated && !shell.advanced_preferences.experimental_transport {
+        shell.advanced_preferences.experimental_transport = true;
+    }
     let domain = repository.load_domain_seed_preview(
         normalized_non_empty(Some(&shell.selected_session_id)),
         default_message_page_size(),
@@ -204,6 +208,7 @@ fn build_authenticated_shell(
     let auth_session = build_auth_session_summary(input)?;
     shell.auth_session = Some(auth_session.clone());
     shell.auth_runtime = Some(build_auth_runtime_summary(&auth_session));
+    shell.advanced_preferences.experimental_transport = true;
     shell.user_profile = user_profile;
     Ok(shell)
 }
@@ -480,7 +485,20 @@ fn normalized_non_empty(value: Option<&str>) -> Option<&str> {
 
 fn relay_looks_valid(value: &str) -> bool {
     let normalized = value.trim();
-    !normalized.is_empty() && (normalized.contains("://") || normalized.contains('.'))
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let candidate = if normalized.contains("://") {
+        normalized.to_string()
+    } else {
+        format!("wss://{normalized}")
+    };
+    let Ok(parsed) = Url::parse(&candidate) else {
+        return false;
+    };
+
+    matches!(parsed.scheme(), "ws" | "wss") && parsed.host_str().is_some()
 }
 
 fn same_relay(left: &str, right: &str) -> bool {
@@ -989,6 +1007,8 @@ mod tests {
             use_tor_network: true,
             relay_diagnostics: false,
             experimental_transport: true,
+            media_upload_driver: "auto".into(),
+            media_upload_endpoint: String::new(),
         };
         snapshot.shell.active_circle_id = snapshot.domain.circles[0].id.clone();
         snapshot.shell.selected_session_id = snapshot.domain.sessions[0].id.clone();
@@ -1082,6 +1102,8 @@ mod tests {
                     use_tor_network: true,
                     relay_diagnostics: false,
                     experimental_transport: true,
+                    media_upload_driver: "auto".into(),
+                    media_upload_endpoint: String::new(),
                 },
                 active_circle_id: "".into(),
                 selected_session_id: "".into(),
@@ -1562,6 +1584,8 @@ mod tests {
                     use_tor_network: true,
                     relay_diagnostics: false,
                     experimental_transport: true,
+                    media_upload_driver: "auto".into(),
+                    media_upload_endpoint: String::new(),
                 },
                 active_circle_id: "main-circle".into(),
                 selected_session_id: "alice".into(),
@@ -1869,6 +1893,8 @@ mod tests {
                 use_tor_network: true,
                 relay_diagnostics: false,
                 experimental_transport: true,
+                media_upload_driver: "auto".into(),
+                media_upload_endpoint: String::new(),
             },
             active_circle_id: "legacy-circle".into(),
             selected_session_id: "legacy-session".into(),

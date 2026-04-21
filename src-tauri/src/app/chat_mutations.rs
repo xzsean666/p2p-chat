@@ -10,15 +10,16 @@ use crate::domain::chat::{
     SendImageMessageInput, SendMessageInput, SendVideoMessageInput, SessionActionInput,
     SessionItem, SessionKind, ShellStateSnapshot, SignedNostrEvent, StartConversationInput,
     StartConversationResult, StartLookupConversationInput, StartSelfConversationInput,
-    StoreChatMediaAssetInput, StoredChatMediaAsset, UpdateCircleInput, UpdateContactRemarkInput,
-    UpdateGroupMembersInput, UpdateGroupNameInput, UpdateMessageDeliveryStatusInput,
-    UpdateSessionDraftInput,
+    StoreChatMediaAssetInput, StoredChatMediaAsset, UpdateChatMessageMediaRemoteUrlInput,
+    UpdateCircleInput, UpdateContactRemarkInput, UpdateGroupMembersInput, UpdateGroupNameInput,
+    UpdateMessageDeliveryStatusInput, UpdateSessionDraftInput,
+    UpdatedChatMessageMediaRemoteUrlResult,
 };
 use crate::domain::chat_repository::{
     build_message_reply_preview, build_remote_delivery_receipt_change_set,
     build_remote_message_merge_change_set, merge_message_records, message_media_local_path,
-    message_media_meta_with_local_path, message_media_remote_url, ChatDomainChangeSet,
-    ChatRepository, ChatUpsert,
+    message_media_meta_with_local_path, message_media_meta_with_remote_url,
+    message_media_remote_url, ChatDomainChangeSet, ChatRepository, ChatUpsert,
 };
 use crate::domain::transport_repository::TransportRepository;
 use crate::infra::auth_runtime_credential_store::{self, StoredAuthRuntimeCredential};
@@ -29,6 +30,7 @@ use nostr_connect::prelude::PublicKey as NostrPublicKey;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
 pub fn send_message(
     app_handle: &tauri::AppHandle<impl tauri::Runtime>,
@@ -116,7 +118,11 @@ pub fn cache_chat_message_media(
     let message = seed
         .message_store
         .get(&input.session_id)
-        .and_then(|messages| messages.iter().find(|message| message.id == input.message_id))
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message.id == input.message_id)
+        })
         .cloned()
         .ok_or_else(|| format!("message not found: {}", input.message_id))?;
 
@@ -127,8 +133,8 @@ pub fn cache_chat_message_media(
         _ => return Err("message does not support media caching".into()),
     };
 
-    if let Some(local_path) = message_media_local_path(&message)
-        .filter(|local_path| Path::new(local_path).exists())
+    if let Some(local_path) =
+        message_media_local_path(&message).filter(|local_path| Path::new(local_path).exists())
     {
         return Ok(CachedChatMessageMediaResult { seed, local_path });
     }
@@ -158,6 +164,47 @@ pub fn cache_chat_message_media(
         seed,
         local_path: stored_asset.local_path,
     })
+}
+
+pub fn update_chat_message_media_remote_url(
+    app_handle: &tauri::AppHandle<impl tauri::Runtime>,
+    input: UpdateChatMessageMediaRemoteUrlInput,
+) -> Result<UpdatedChatMessageMediaRemoteUrlResult, String> {
+    let session_id = input.session_id.clone();
+    let message_id = input.message_id.clone();
+    let seed = load_domain_seed(app_handle)?;
+    let message = seed
+        .message_store
+        .get(&session_id)
+        .and_then(|messages| messages.iter().find(|message| message.id == message_id))
+        .cloned()
+        .ok_or_else(|| format!("message not found: {message_id}"))?;
+
+    match message.kind {
+        MessageKind::File | MessageKind::Image | MessageKind::Video => {}
+        _ => return Err("message does not support remote media urls".into()),
+    }
+
+    let remote_url = normalize_chat_media_remote_url(&input.remote_url)?;
+    let next_meta = message_media_meta_with_remote_url(&message, remote_url.clone())
+        .ok_or_else(|| "message media metadata is invalid".to_string())?;
+    let updated_message = merge_message_records(
+        message.clone(),
+        MessageItem {
+            meta: Some(next_meta),
+            ..message
+        },
+    );
+    let seed = apply_domain_change_set(
+        app_handle,
+        ChatDomainChangeSet {
+            messages_upsert: vec![(session_id.clone(), updated_message)],
+            ..Default::default()
+        },
+    )?;
+    clear_transport_outbound_dispatch_for_message(app_handle, &session_id, &message_id)?;
+
+    Ok(UpdatedChatMessageMediaRemoteUrlResult { seed, remote_url })
 }
 
 struct SendLocalMessageInput {
@@ -238,6 +285,20 @@ fn send_local_message(
             ..Default::default()
         },
     )
+}
+
+fn normalize_chat_media_remote_url(value: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err("remote media url is empty".into());
+    }
+
+    let parsed = Url::parse(normalized).map_err(|_| "remote media url is invalid".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("remote media url must use http or https".into());
+    }
+
+    Ok(normalized.to_string())
 }
 
 pub fn update_session_draft(
@@ -1598,7 +1659,13 @@ fn clear_transport_outbound_dispatch_for_message(
     cache.outbound_dispatches.retain(|dispatch| {
         !(dispatch.session_id == session_id && dispatch.message_id == message_id)
     });
-    if cache.outbound_dispatches.len() == dispatch_count {
+    let media_dispatch_count = cache.outbound_media_dispatches.len();
+    cache.outbound_media_dispatches.retain(|dispatch| {
+        !(dispatch.session_id == session_id && dispatch.message_id == message_id)
+    });
+    if cache.outbound_dispatches.len() == dispatch_count
+        && cache.outbound_media_dispatches.len() == media_dispatch_count
+    {
         return Ok(());
     }
 
@@ -1624,7 +1691,10 @@ fn normalized_circle_relay(input: &AddCircleInput, normalized_name: &str) -> Str
             "wss://{}.private.circle.local",
             build_circle_slug(normalized_name)
         ),
-        CircleCreateMode::Custom => input.relay.clone().unwrap_or_default().trim().to_string(),
+        CircleCreateMode::Custom => {
+            normalize_custom_circle_relay(input.relay.clone().unwrap_or_default().as_str())
+                .unwrap_or_else(|| input.relay.clone().unwrap_or_default().trim().to_string())
+        }
         CircleCreateMode::Invite => {
             let invite_code = input.invite_code.clone().unwrap_or_default();
             if invite_code.trim().contains("://") {
@@ -1634,6 +1704,23 @@ fn normalized_circle_relay(input: &AddCircleInput, normalized_name: &str) -> Str
             }
         }
     }
+}
+
+fn normalize_custom_circle_relay(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("wss://{trimmed}")
+    };
+    let parsed = Url::parse(&candidate).ok()?;
+    matches!(parsed.scheme(), "ws" | "wss")
+        .then_some(candidate)
+        .filter(|_| parsed.host_str().is_some())
 }
 
 fn default_circle_description(circle_type: &CircleType) -> &'static str {
@@ -1825,7 +1912,7 @@ mod tests {
         LoginAccessSummary, LoginCircleSelectionMode, LoginMethod, ShellStateSnapshot,
     };
     use crate::domain::chat_repository::ChatRepository;
-    use crate::domain::transport::TransportOutboundDispatch;
+    use crate::domain::transport::{TransportOutboundDispatch, TransportOutboundMediaDispatch};
     use crate::domain::transport_repository::{TransportCache, TransportRepository};
     use crate::infra::sqlite_chat_repository::SqliteChatRepository;
     use crate::infra::sqlite_transport_repository::SqliteTransportRepository;
@@ -2861,11 +2948,17 @@ mod tests {
             })
             .expect("cached message should remain in session");
         let meta = serde_json::from_str::<serde_json::Value>(
-            cached_message.meta.as_deref().expect("cached message should keep meta"),
+            cached_message
+                .meta
+                .as_deref()
+                .expect("cached message should keep meta"),
         )
         .expect("cached meta should be valid json");
 
-        assert_eq!(meta.get("version").and_then(|value| value.as_u64()), Some(3));
+        assert_eq!(
+            meta.get("version").and_then(|value| value.as_u64()),
+            Some(3)
+        );
         assert_eq!(
             meta.get("remoteUrl").and_then(|value| value.as_str()),
             Some(remote_url.as_str())
@@ -2873,6 +2966,193 @@ mod tests {
         assert_eq!(
             meta.get("localPath").and_then(|value| value.as_str()),
             Some(result.local_path.as_str())
+        );
+    }
+
+    #[test]
+    fn update_chat_message_media_remote_url_preserves_local_image_path() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let sent = send_image_message(
+            app_handle,
+            SendImageMessageInput {
+                session_id: "mika".into(),
+                name: "harbor-sunrise.png".into(),
+                meta: json!({
+                    "version": 2,
+                    "label": "PNG · 1280 x 720 · 84 KB",
+                    "localPath": "/tmp/chat-media/images/harbor-sunrise.png"
+                })
+                .to_string(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to seed image message");
+        let message = sent
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .expect("missing seeded image message");
+
+        let result = update_chat_message_media_remote_url(
+            app_handle,
+            UpdateChatMessageMediaRemoteUrlInput {
+                session_id: "mika".into(),
+                message_id: message.id.clone(),
+                remote_url: " https://cdn.example.test/chat-media/harbor-sunrise.png ".into(),
+            },
+        )
+        .expect("remote url update should succeed");
+
+        assert_eq!(
+            result.remote_url,
+            "https://cdn.example.test/chat-media/harbor-sunrise.png"
+        );
+        let updated_message = result
+            .seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.iter().find(|candidate| candidate.id == message.id))
+            .expect("updated image message should remain in session");
+        let meta = serde_json::from_str::<serde_json::Value>(
+            updated_message
+                .meta
+                .as_deref()
+                .expect("updated image message should keep meta"),
+        )
+        .expect("updated image meta should be valid json");
+
+        assert_eq!(
+            meta.get("version").and_then(|value| value.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            meta.get("localPath").and_then(|value| value.as_str()),
+            Some("/tmp/chat-media/images/harbor-sunrise.png")
+        );
+        assert_eq!(
+            meta.get("remoteUrl").and_then(|value| value.as_str()),
+            Some("https://cdn.example.test/chat-media/harbor-sunrise.png")
+        );
+    }
+
+    #[test]
+    fn update_chat_message_media_remote_url_clears_transport_outbound_media_dispatch_record() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let sent = send_image_message(
+            app_handle,
+            SendImageMessageInput {
+                session_id: "mika".into(),
+                name: "harbor-sunrise.png".into(),
+                meta: json!({
+                    "version": 2,
+                    "label": "PNG · 1280 x 720 · 84 KB",
+                    "localPath": "/tmp/chat-media/images/harbor-sunrise.png"
+                })
+                .to_string(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to seed image message");
+        let message = sent
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .expect("missing seeded image message");
+
+        SqliteTransportRepository::new(app_handle)
+            .save_transport_cache(TransportCache {
+                outbound_media_dispatches: vec![TransportOutboundMediaDispatch {
+                    circle_id: "bitchat-circle".into(),
+                    session_id: "mika".into(),
+                    message_id: message.id.clone(),
+                    remote_id: message
+                        .remote_id
+                        .clone()
+                        .expect("media message should have remote id"),
+                    local_path: "/tmp/chat-media/images/harbor-sunrise.png".into(),
+                    runtime_generation: 1,
+                    request_id: "publish:bitchat-circle:1".into(),
+                    dispatched_at: "now".into(),
+                }],
+                ..TransportCache::default()
+            })
+            .expect("failed to seed transport outbound media dispatch");
+
+        update_chat_message_media_remote_url(
+            app_handle,
+            UpdateChatMessageMediaRemoteUrlInput {
+                session_id: "mika".into(),
+                message_id: message.id.clone(),
+                remote_url: "https://cdn.example.test/chat-media/harbor-sunrise.png".into(),
+            },
+        )
+        .expect("remote url update should succeed");
+
+        let cache = transport_cache(app_handle);
+        assert!(cache.outbound_media_dispatches.is_empty());
+    }
+
+    #[test]
+    fn update_chat_message_media_remote_url_promotes_plain_file_meta() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let sent = send_file_message(
+            app_handle,
+            SendFileMessageInput {
+                session_id: "mika".into(),
+                name: "roadmap.pdf".into(),
+                meta: Some("PDF · 2.4 MB".into()),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to seed file message");
+        let message = sent
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .expect("missing seeded file message");
+
+        let result = update_chat_message_media_remote_url(
+            app_handle,
+            UpdateChatMessageMediaRemoteUrlInput {
+                session_id: "mika".into(),
+                message_id: message.id.clone(),
+                remote_url: "https://cdn.example.test/chat-media/roadmap.pdf".into(),
+            },
+        )
+        .expect("plain file meta should promote to remote-capable shape");
+
+        let updated_message = result
+            .seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.iter().find(|candidate| candidate.id == message.id))
+            .expect("updated file message should remain in session");
+
+        let meta = serde_json::from_str::<serde_json::Value>(
+            updated_message
+                .meta
+                .as_deref()
+                .expect("updated file message should keep meta"),
+        )
+        .expect("updated file meta should be valid json");
+
+        assert_eq!(
+            meta.get("version").and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            meta.get("label").and_then(|value| value.as_str()),
+            Some("PDF · 2.4 MB")
+        );
+        assert_eq!(
+            meta.get("remoteUrl").and_then(|value| value.as_str()),
+            Some("https://cdn.example.test/chat-media/roadmap.pdf")
         );
     }
 

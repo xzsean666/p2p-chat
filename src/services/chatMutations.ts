@@ -22,12 +22,14 @@ import type {
   StartConversationResult,
   StartLookupConversationInput,
   StartSelfConversationInput,
+  UpdateChatMessageMediaRemoteUrlInput,
   UpdateMessageDeliveryStatusInput,
   UpdateContactRemarkInput,
   UpdateGroupMembersInput,
   UpdateGroupNameInput,
   UpdateSessionDraftInput,
   UpdateCircleInput,
+  UpdatedChatMessageMediaRemoteUrlResult,
 } from "../types/chat";
 
 function cloneState<T>(value: T): T {
@@ -103,6 +105,17 @@ export async function cacheChatMessageMedia(
   return invokeDesktopMutation<CachedChatMessageMediaResult>("cache_chat_message_media", {
     input: cloneState(input),
   });
+}
+
+export async function updateChatMessageMediaRemoteUrl(
+  input: UpdateChatMessageMediaRemoteUrlInput,
+): Promise<UpdatedChatMessageMediaRemoteUrlResult | null> {
+  return invokeDesktopMutation<UpdatedChatMessageMediaRemoteUrlResult>(
+    "update_chat_message_media_remote_url",
+    {
+      input: cloneState(input),
+    },
+  );
 }
 
 export async function updateChatSessionDraft(
