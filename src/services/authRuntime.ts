@@ -60,16 +60,16 @@ export function deriveAuthRuntimeFromAuthSession(
       };
     }
 
-    if (authSession.access.kind === "bunker") {
+    if (authSession.access.kind === "bunker" || authSession.access.kind === "nostrConnect") {
       return {
         state: "pending",
         loginMethod: authSession.loginMethod,
         accessKind: authSession.access.kind,
         label: authSession.access.label,
         pubkey: authSession.access.pubkey,
-        error: "Remote bunker handoff is stored, but signer handshake is not implemented yet.",
+        error: "Remote signer handoff is stored and waiting for a signer handshake.",
         canSendMessages: false,
-        sendBlockedReason: "Remote bunker handoff is stored, but signer handshake is not implemented yet.",
+        sendBlockedReason: "Remote signer handoff is stored and waiting for a signer handshake.",
         persistedInNativeStore: false,
         credentialPersistedInNativeStore: false,
         updatedAt: authSession.loggedInAt,
@@ -98,9 +98,9 @@ export function deriveAuthRuntimeFromAuthSession(
       accessKind: authSession.access.kind,
       label: authSession.access.label,
       pubkey: authSession.access.pubkey,
-      error: "Remote signer handshake is not implemented yet.",
+      error: "Remote signer handshake is pending.",
       canSendMessages: false,
-      sendBlockedReason: "Remote signer handshake is not implemented yet.",
+      sendBlockedReason: "Remote signer handshake is pending.",
       persistedInNativeStore: false,
       credentialPersistedInNativeStore: false,
       updatedAt: authSession.loggedInAt,
@@ -194,7 +194,7 @@ function defaultAuthRuntimeError(
 ) {
   if (state === "pending") {
     if (authSession.access.kind === "bunker" || authSession.access.kind === "nostrConnect") {
-      return "Remote signer handshake is not implemented yet.";
+      return "Remote signer handshake is pending.";
     }
 
     return "Account runtime is still waiting for a signer handshake.";
@@ -212,7 +212,7 @@ function defaultAuthRuntimeError(
 }
 
 function resolveSendBlockedReason(
-  accessKind: AuthSessionSummary["access"]["kind"],
+  _accessKind: AuthSessionSummary["access"]["kind"],
   state: AuthRuntimeState,
   error: string | undefined,
 ) {
@@ -221,9 +221,7 @@ function resolveSendBlockedReason(
   }
 
   if (state === "connected") {
-    return accessKind === "nostrConnect"
-      ? remoteSignerSendSupportMissingReason()
-      : undefined;
+    return undefined;
   }
 
   if (error?.trim()) {
@@ -249,10 +247,6 @@ export function resolveAuthRuntimeCanSendMessages(
   error: string | undefined,
 ) {
   return !resolveSendBlockedReason(accessKind, state, error);
-}
-
-function remoteSignerSendSupportMissingReason() {
-  return "Remote signer is connected, but message send still requires remote event-signing support.";
 }
 
 export function buildAuthRuntimeBindingSummary(

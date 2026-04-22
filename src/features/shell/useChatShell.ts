@@ -79,6 +79,11 @@ import {
   videoMessageRemoteUrl,
 } from "../chat/videoMessageMeta";
 import {
+  normalizeNostrPubkey,
+  resolveMessageAuthorLabel,
+  resolveReplyPreviewAuthorLabel,
+} from "../chat/messageAuthor";
+import {
   cloneOverlayPages,
   createOverlayHistoryState,
   overlayRouteHash,
@@ -156,9 +161,11 @@ type DomainSeedMessageMode = "full" | "preview";
 
 const SESSION_MESSAGE_PAGE_SIZE = 30;
 const AUTH_RUNTIME_SYNC_INTERVAL_MS = 2500;
-const TRANSPORT_RELAY_HEARTBEAT_INTERVAL_MS = 8_000;
-const TRANSPORT_RELAY_DIAGNOSTIC_HEARTBEAT_INTERVAL_MS = 12_000;
-const TRANSPORT_RUNTIME_RECOVERY_HEARTBEAT_INTERVAL_MS = 3_000;
+const TRANSPORT_RELAY_HEARTBEAT_INTERVAL_MS = 2_500;
+const TRANSPORT_RELAY_BACKGROUND_HEARTBEAT_INTERVAL_MS = 8_000;
+const TRANSPORT_RELAY_DIAGNOSTIC_HEARTBEAT_INTERVAL_MS = 6_000;
+const TRANSPORT_RELAY_DIAGNOSTIC_BACKGROUND_HEARTBEAT_INTERVAL_MS = 12_000;
+const TRANSPORT_RUNTIME_RECOVERY_HEARTBEAT_INTERVAL_MS = 2_000;
 const TRANSPORT_PUBLISH_WARN_TITLES = new Set([
   "Relay rejected event",
   "Relay closed publish connection",
@@ -179,15 +186,19 @@ function hasTauriRuntime() {
   return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in globalWindow || "__TAURI__" in globalWindow);
 }
 
+function documentHidden() {
+  return typeof document !== "undefined" && document.hidden;
+}
+
 export function useChatShell() {
   const initialShellState = createEmptyShellState();
   const isShellStateReady = ref(false);
-  let persistTimer: ReturnType<typeof window.setTimeout> | null = null;
-  let draftPersistTimer: ReturnType<typeof window.setTimeout> | null = null;
-  let transportTimer: ReturnType<typeof window.setTimeout> | null = null;
-  let transportHeartbeatTimer: ReturnType<typeof window.setInterval> | null = null;
-  let transportNoticeTimer: ReturnType<typeof window.setTimeout> | null = null;
-  let authRuntimeSyncTimer: ReturnType<typeof window.setTimeout> | null = null;
+  let persistTimer: number | null = null;
+  let draftPersistTimer: number | null = null;
+  let transportTimer: number | null = null;
+  let transportHeartbeatTimer: number | null = null;
+  let transportNoticeTimer: number | null = null;
+  let authRuntimeSyncTimer: number | null = null;
   let authRuntimeNativeSyncSupported = true;
   let authRuntimeBackgroundSyncFailed = false;
   let transportSnapshotBackgroundRefreshFailed = false;
@@ -204,6 +215,8 @@ export function useChatShell() {
   const searchText = ref("");
   const composerText = ref("");
   const replyToMessageId = ref<string | null>(null);
+  const findPeopleSubmitting = ref(false);
+  const findPeopleErrorMessage = ref("");
   const isAuthenticated = ref(initialShellState.isAuthenticated);
   const authSession = ref(initialShellState.authSession);
   const authRuntime = ref(initialShellState.authRuntime);
@@ -299,29 +312,11 @@ export function useChatShell() {
   });
 
   const sendBlockedReason = computed(() => {
-    if (!isAuthenticated.value) {
-      return "Log in before sending messages.";
-    }
-
-    const runtime = effectiveAuthRuntime.value;
-    if (!runtime) {
-      return "";
-    }
-
-    return runtime.sendBlockedReason ?? "";
+    return selectedSessionSendState.value.reason;
   });
 
   const canSendMessages = computed(() => {
-    if (!isAuthenticated.value) {
-      return false;
-    }
-
-    const runtime = effectiveAuthRuntime.value;
-    if (!runtime) {
-      return true;
-    }
-
-    return runtime.canSendMessages;
+    return selectedSessionSendState.value.canSend;
   });
 
   const runtimeDiagnosticError = computed(() => {
@@ -467,6 +462,51 @@ export function useChatShell() {
     return selectedGroup.value.members
       .map((member) => contacts.value.find((item) => item.id === member.contactId))
       .filter((item): item is ContactItem => !!item);
+  });
+
+  const selectedSessionSendState = computed(() => {
+    if (!isAuthenticated.value) {
+      return {
+        canSend: false,
+        reason: "Log in before sending messages.",
+      };
+    }
+
+    const runtime = effectiveAuthRuntime.value;
+    if (runtime && !runtime.canSendMessages) {
+      return {
+        canSend: false,
+        reason: runtime.sendBlockedReason ?? "",
+      };
+    }
+
+    if (selectedSession.value?.kind === "direct" && selectedContact.value?.blocked) {
+      return {
+        canSend: false,
+        reason: "This user is blocked. Unblock them to send messages.",
+      };
+    }
+
+    if (selectedSession.value?.kind === "group") {
+      if (selectedGroup.value?.needsJoin) {
+        return {
+          canSend: false,
+          reason: "Join this group before sending messages.",
+        };
+      }
+
+      if (selectedGroup.value?.canSend === false) {
+        return {
+          canSend: false,
+          reason: "Sending is unavailable in this group right now.",
+        };
+      }
+    }
+
+    return {
+      canSend: true,
+      reason: "",
+    };
   });
 
   const activeOverlayPage = computed(() => {
@@ -878,6 +918,7 @@ export function useChatShell() {
           !!messageStore.value[page.sessionId]?.some((message) => message.id === page.messageId)
         );
       case "new-message":
+      case "circle-invite":
       case "self-chat-confirm":
       case "group-select-members":
       case "archived":
@@ -1270,7 +1311,12 @@ export function useChatShell() {
     visibilitychangeHandler = () => {
       if (document.hidden) {
         flushPendingPersistence("full");
+        restartTransportHeartbeat();
+        return;
       }
+
+      restartTransportHeartbeat();
+      void refreshTransportSnapshot({ suppressNotice: true });
     };
     window.addEventListener("pagehide", pagehideHandler);
     document.addEventListener("visibilitychange", visibilitychangeHandler);
@@ -1737,9 +1783,15 @@ export function useChatShell() {
       return TRANSPORT_RUNTIME_RECOVERY_HEARTBEAT_INTERVAL_MS;
     }
 
+    const background = documentHidden();
+
     return advancedPreferences.value.relayDiagnostics
-      ? TRANSPORT_RELAY_DIAGNOSTIC_HEARTBEAT_INTERVAL_MS
-      : TRANSPORT_RELAY_HEARTBEAT_INTERVAL_MS;
+      ? background
+        ? TRANSPORT_RELAY_DIAGNOSTIC_BACKGROUND_HEARTBEAT_INTERVAL_MS
+        : TRANSPORT_RELAY_DIAGNOSTIC_HEARTBEAT_INTERVAL_MS
+      : background
+        ? TRANSPORT_RELAY_BACKGROUND_HEARTBEAT_INTERVAL_MS
+        : TRANSPORT_RELAY_HEARTBEAT_INTERVAL_MS;
   }
 
   function restartTransportHeartbeat() {
@@ -1823,7 +1875,13 @@ export function useChatShell() {
     return merged;
   }
 
-  function sessionSubtitleFromMessage(message: MessageItem) {
+  function sessionSubtitleFromMessage(sessionId: string, message: MessageItem) {
+    const session = sessions.value.find((item) => item.id === sessionId) ?? null;
+    if (session?.kind === "group" && message.author === "peer") {
+      const authorLabel = resolveMessageAuthorLabel(session, message);
+      return `${authorLabel}: ${message.body}`;
+    }
+
     return message.body;
   }
 
@@ -1839,9 +1897,10 @@ export function useChatShell() {
     messages: MessageItem[],
     page: SessionMessagePageState,
   ) {
+    const hydratedMessages = hydrateSessionMessages(sessionId, messages);
     messageStore.value = {
       ...messageStore.value,
-      [sessionId]: messages,
+      [sessionId]: hydratedMessages,
     };
     setSessionMessagePageState(sessionId, page);
   }
@@ -1970,7 +2029,7 @@ export function useChatShell() {
     const lastMessage = mergedMessages[mergedMessages.length - 1];
     if (lastMessage) {
       updateSession(sessionId, {
-        subtitle: sessionSubtitleFromMessage(lastMessage),
+        subtitle: sessionSubtitleFromMessage(sessionId, lastMessage),
         time: lastMessage.time,
         unreadCount: undefined,
       });
@@ -2123,14 +2182,15 @@ export function useChatShell() {
     const nextSessionMessagePages = { ...sessionMessagePages.value };
 
     for (const [sessionId, messages] of Object.entries(seed.messageStore)) {
+      const hydratedMessages = hydrateSessionMessages(sessionId, messages);
       if (messageStoreMode === "preview") {
-        const normalized = buildSessionMessagePageState(messages);
+        const normalized = buildSessionMessagePageState(hydratedMessages);
         nextMessageStore[sessionId] = normalized.messages;
         nextSessionMessagePages[sessionId] = normalized.page;
         continue;
       }
 
-      nextMessageStore[sessionId] = messages;
+      nextMessageStore[sessionId] = hydratedMessages;
       nextSessionMessagePages[sessionId] = buildLoadedSessionMessageState();
     }
 
@@ -2346,8 +2406,18 @@ export function useChatShell() {
     });
   }
 
-  function chooseCircle(circleId: string) {
-    focusCircle(circleId);
+  function resetFindPeopleRequestState() {
+    findPeopleSubmitting.value = false;
+    findPeopleErrorMessage.value = "";
+  }
+
+  function setFindPeopleErrorMessage(message: string) {
+    findPeopleErrorMessage.value = message.trim();
+  }
+
+  async function chooseCircle(circleId: string) {
+    showCircleSwitcher.value = false;
+    await landOnCircle(circleId);
   }
 
   function focusCircle(
@@ -2385,6 +2455,15 @@ export function useChatShell() {
     pushOverlayPage({ kind: "new-message" });
   }
 
+  function openCircleInvitePage() {
+    if (!activeCircle.value) {
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
+    pushOverlayPage({ kind: "circle-invite" });
+  }
+
   function openSelfChatConfirmPage() {
     if (!activeCircle.value) {
       openFindPeoplePage("join-circle");
@@ -2395,6 +2474,7 @@ export function useChatShell() {
   }
 
   function openFindPeoplePage(mode: "chat" | "join-circle" = "chat") {
+    resetFindPeopleRequestState();
     pushOverlayPage({
       kind: "find-people",
       mode: !activeCircle.value && mode === "chat" ? "join-circle" : mode,
@@ -2530,6 +2610,10 @@ export function useChatShell() {
 
   function openProfilePage() {
     if (!selectedSession.value) {
+      return;
+    }
+
+    if (selectedSession.value.kind === "self") {
       return;
     }
 
@@ -2730,34 +2814,58 @@ export function useChatShell() {
   async function restoreCircleAccess(entry: RestorableCircleEntry) {
     const circleId = await restoreRestorableCircle(entry);
     if (circleId) {
-      chooseCircle(circleId);
+      await landOnCircle(circleId);
     }
   }
 
   async function resolveLoginCircle(selection: LoginCircleSelectionInput): Promise<{
     circleId: string;
     canFallbackToExistingCircle: boolean;
+    openJoinCirclePicker: boolean;
   }> {
     if (selection.mode === "restore") {
-      const catalogEntry =
-        restorableCircles.value.find((entry) => {
-          if (!selection.relay?.trim()) {
-            return false;
-          }
+      const selectedCatalogEntries =
+        selection.relays?.length
+          ? selection.relays
+              .map((relay) => {
+                return restorableCircles.value.find((entry) => sameRelay(entry.relay, relay)) ?? null;
+              })
+              .filter((entry): entry is RestorableCircleEntry => !!entry)
+              .filter((entry, index, entries) => {
+                return entries.findIndex((candidate) => sameRelay(candidate.relay, entry.relay)) === index;
+              })
+          : [
+              restorableCircles.value.find((entry) => {
+                if (!selection.relay?.trim()) {
+                  return false;
+                }
 
-          return sameRelay(entry.relay, selection.relay);
-        }) ?? restorableCircles.value[0];
-      if (catalogEntry) {
-        const circleId = await restoreRestorableCircle(catalogEntry);
+                return sameRelay(entry.relay, selection.relay);
+              }) ?? restorableCircles.value[0],
+            ].filter((entry): entry is RestorableCircleEntry => !!entry);
+      if (selectedCatalogEntries.length) {
+        let primaryCircleId = "";
+        let restoredAnyCircle = false;
+
+        for (const entry of selectedCatalogEntries) {
+          const circleId = await restoreRestorableCircle(entry);
+          if (circleId && !primaryCircleId) {
+            primaryCircleId = circleId;
+          }
+          restoredAnyCircle = restoredAnyCircle || !!circleId;
+        }
+
         return {
-          circleId: circleId ?? "",
-          canFallbackToExistingCircle: !!circleId,
+          circleId: primaryCircleId,
+          canFallbackToExistingCircle: restoredAnyCircle,
+          openJoinCirclePicker: false,
         };
       }
 
       return {
         circleId: circles.value[0]?.id ?? activeCircleId.value,
         canFallbackToExistingCircle: true,
+        openJoinCirclePicker: false,
       };
     }
 
@@ -2769,6 +2877,15 @@ export function useChatShell() {
           circles.value[0]?.id ??
           activeCircleId.value,
         canFallbackToExistingCircle: true,
+        openJoinCirclePicker: false,
+      };
+    }
+
+    if (selection.mode === "invite" && !selection.inviteCode?.trim()) {
+      return {
+        circleId: "",
+        canFallbackToExistingCircle: false,
+        openJoinCirclePicker: true,
       };
     }
 
@@ -2798,6 +2915,7 @@ export function useChatShell() {
       return {
         circleId: mutation.result.circleId,
         canFallbackToExistingCircle: true,
+        openJoinCirclePicker: false,
       };
     }
 
@@ -2805,6 +2923,7 @@ export function useChatShell() {
       return {
         circleId: "",
         canFallbackToExistingCircle: false,
+        openJoinCirclePicker: false,
       };
     }
 
@@ -2813,6 +2932,7 @@ export function useChatShell() {
     return {
       circleId,
       canFallbackToExistingCircle: true,
+      openJoinCirclePicker: false,
     };
   }
 
@@ -2821,21 +2941,26 @@ export function useChatShell() {
       ...input,
       loggedInAt: input.loggedInAt ?? new Date().toISOString(),
     }) as LoginCompletionInput;
+    const wantsPostLoginJoinCirclePicker =
+      nextInput.circleSelection.mode === "invite" &&
+      !nextInput.circleSelection.inviteCode?.trim();
     let completedSnapshot: ChatShellSnapshot | null = null;
 
-    try {
-      completedSnapshot = await completeLoginViaRuntime(nextInput);
-    } catch (error) {
-      showTransportNotice({
-        id: `complete-login-failed-${Date.now()}`,
-        tone: "warn",
-        title: "Login failed",
-        detail: describeCommandError(
-          error,
-          "Desktop login could not finish the native shell bootstrap.",
-        ),
-      });
-      return;
+    if (!wantsPostLoginJoinCirclePicker) {
+      try {
+        completedSnapshot = await completeLoginViaRuntime(nextInput);
+      } catch (error) {
+        showTransportNotice({
+          id: `complete-login-failed-${Date.now()}`,
+          tone: "warn",
+          title: "Login failed",
+          detail: describeCommandError(
+            error,
+            "Desktop login could not finish the native shell bootstrap.",
+          ),
+        });
+        return;
+      }
     }
 
     if (completedSnapshot) {
@@ -2843,6 +2968,9 @@ export function useChatShell() {
       closeTransientChrome();
       closeAllOverlayPages();
       applyChatShellSnapshot(completedSnapshot);
+      if (activeCircleId.value) {
+        await ensureCircleHasSendableSession(activeCircleId.value);
+      }
       searchText.value = "";
       composerText.value = "";
       return;
@@ -2883,15 +3011,30 @@ export function useChatShell() {
     closeTransientChrome();
     closeAllOverlayPages();
     await refreshDomainOverview({ showFailureNotice: true });
+
+    if (wantsPostLoginJoinCirclePicker) {
+      activeCircleId.value = "";
+      selectedSessionId.value = "";
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
     const circleResolution = await resolveLoginCircle(nextInput.circleSelection);
 
+    if (circleResolution.openJoinCirclePicker) {
+      activeCircleId.value = "";
+      selectedSessionId.value = "";
+      openFindPeoplePage("join-circle");
+      return;
+    }
+
     if (circleResolution.circleId) {
-      chooseCircle(circleResolution.circleId);
+      await landOnCircle(circleResolution.circleId);
       return;
     }
 
     if (circleResolution.canFallbackToExistingCircle && circles.value[0]?.id) {
-      chooseCircle(circles.value[0].id);
+      await landOnCircle(circles.value[0].id);
       return;
     }
 
@@ -3032,6 +3175,155 @@ export function useChatShell() {
       .toUpperCase();
   }
 
+  function contactById(contactId?: string | null) {
+    const normalizedContactId = contactId?.trim() ?? "";
+    if (!normalizedContactId) {
+      return null;
+    }
+
+    return contacts.value.find((contact) => contact.id === normalizedContactId) ?? null;
+  }
+
+  function resolveMessageAuthorContact(session: SessionItem | null, message: MessageItem) {
+    if (!session || message.author !== "peer") {
+      return null;
+    }
+
+    const existingAuthorContact = contactById(message.authorContactId);
+    if (existingAuthorContact) {
+      return existingAuthorContact;
+    }
+
+    if (session.kind === "direct") {
+      return contactById(session.contactId);
+    }
+
+    if (session.kind !== "group") {
+      return null;
+    }
+
+    const group = groups.value.find((candidate) => candidate.sessionId === session.id) ?? null;
+    const groupMemberIds = new Set(group?.members.map((member) => member.contactId) ?? []);
+    if (!groupMemberIds.size) {
+      return null;
+    }
+
+    const senderPubkey = normalizeNostrPubkey(message.signedNostrEvent?.pubkey);
+    if (!senderPubkey) {
+      return null;
+    }
+
+    return (
+      contacts.value.find((contact) => {
+        return groupMemberIds.has(contact.id) && normalizeNostrPubkey(contact.pubkey) === senderPubkey;
+      }) ?? null
+    );
+  }
+
+  function hydrateMessageAuthor(sessionId: string, message: MessageItem) {
+    const session = sessions.value.find((candidate) => candidate.id === sessionId) ?? null;
+    if (!session || message.author === "system") {
+      return message;
+    }
+
+    if (message.author === "me") {
+      const nextAuthorName = userProfile.value.name.trim() || undefined;
+      const nextAuthorInitials =
+        userProfile.value.initials.trim() || buildInitials(nextAuthorName ?? message.authorName ?? "You");
+      if (message.authorName === nextAuthorName && message.authorInitials === nextAuthorInitials) {
+        return message;
+      }
+
+      return {
+        ...message,
+        authorName: nextAuthorName,
+        authorInitials: nextAuthorInitials,
+      };
+    }
+
+    const authorContact = resolveMessageAuthorContact(session, message);
+    const nextAuthorName =
+      authorContact?.name ??
+      message.authorName?.trim() ??
+      (session.kind === "direct" ? session.name : undefined);
+    const nextAuthorInitials =
+      authorContact?.initials ??
+      message.authorInitials?.trim() ??
+      (session.kind === "direct" ? session.initials : undefined);
+    const nextAuthorContactId =
+      authorContact?.id ??
+      message.authorContactId?.trim() ??
+      (session.kind === "direct" ? session.contactId : undefined);
+
+    if (
+      message.authorName === nextAuthorName &&
+      message.authorInitials === nextAuthorInitials &&
+      message.authorContactId === nextAuthorContactId
+    ) {
+      return message;
+    }
+
+    return {
+      ...message,
+      authorName: nextAuthorName,
+      authorInitials: nextAuthorInitials,
+      authorContactId: nextAuthorContactId,
+    };
+  }
+
+  function registerMessageReference(index: Map<string, MessageItem>, message: MessageItem) {
+    index.set(message.id, message);
+    if (message.remoteId) {
+      index.set(message.remoteId, message);
+    }
+
+    const signedEventId = message.signedNostrEvent?.eventId;
+    if (signedEventId) {
+      index.set(signedEventId, message);
+    }
+  }
+
+  function hydrateSessionMessages(sessionId: string, messages: MessageItem[]) {
+    const session = sessions.value.find((candidate) => candidate.id === sessionId) ?? null;
+    if (!session) {
+      return messages;
+    }
+
+    const hydratedMessages = messages.map((message) => hydrateMessageAuthor(sessionId, message));
+    const messageIndex = new Map<string, MessageItem>();
+
+    for (const message of messageStore.value[sessionId] ?? []) {
+      registerMessageReference(messageIndex, hydrateMessageAuthor(sessionId, message));
+    }
+    for (const message of hydratedMessages) {
+      registerMessageReference(messageIndex, message);
+    }
+
+    return hydratedMessages.map((message) => {
+      if (!message.replyTo) {
+        return message;
+      }
+
+      const replyTarget =
+        messageIndex.get(message.replyTo.messageId) ??
+        (message.replyTo.remoteId ? messageIndex.get(message.replyTo.remoteId) : undefined);
+      const nextAuthorLabel = replyTarget
+        ? resolveMessageAuthorLabel(session, replyTarget)
+        : resolveReplyPreviewAuthorLabel(session, message.replyTo);
+      if (message.replyTo.authorLabel === nextAuthorLabel) {
+        return message;
+      }
+
+      return {
+        ...message,
+        replyTo: {
+          ...message.replyTo,
+          authorLabel: nextAuthorLabel,
+        },
+      };
+    });
+  }
+
   function dedupeContactIds(contactIds: string[]) {
     return Array.from(
       new Set(contactIds.map((contactId) => contactId.trim()).filter(Boolean)),
@@ -3105,14 +3397,7 @@ export function useChatShell() {
   }
 
   function messageReplyAuthorLabel(message: MessageItem) {
-    switch (message.author) {
-      case "me":
-        return "You";
-      case "peer":
-        return selectedSession.value?.kind === "direct" ? selectedSession.value.name : "Peer";
-      default:
-        return "System";
-    }
+    return resolveMessageAuthorLabel(selectedSession.value, message);
   }
 
   function buildLocalReplyPreview(message: MessageItem) {
@@ -3648,8 +3933,9 @@ export function useChatShell() {
       syncSource: "local",
       replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
     };
+    const hydratedMessage = hydrateMessageAuthor(sessionId, message);
 
-    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), hydratedMessage];
 
     const targetIndex = sessions.value.findIndex((session) => session.id === sessionId);
     if (targetIndex < 0) {
@@ -3688,8 +3974,9 @@ export function useChatShell() {
       syncSource: "local",
       replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
     };
+    const hydratedMessage = hydrateMessageAuthor(sessionId, message);
 
-    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), hydratedMessage];
 
     const targetIndex = sessions.value.findIndex((currentSession) => currentSession.id === sessionId);
     if (targetIndex < 0) {
@@ -3726,8 +4013,9 @@ export function useChatShell() {
       syncSource: "local",
       replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
     };
+    const hydratedMessage = hydrateMessageAuthor(sessionId, message);
 
-    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), hydratedMessage];
 
     const targetIndex = sessions.value.findIndex((currentSession) => currentSession.id === sessionId);
     if (targetIndex < 0) {
@@ -3764,8 +4052,9 @@ export function useChatShell() {
       syncSource: "local",
       replyTo: replyToMessage ? buildLocalReplyPreview(replyToMessage) : undefined,
     };
+    const hydratedMessage = hydrateMessageAuthor(sessionId, message);
 
-    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), message];
+    messageStore.value[sessionId] = [...(messageStore.value[sessionId] ?? []), hydratedMessage];
 
     const targetIndex = sessions.value.findIndex((currentSession) => currentSession.id === sessionId);
     if (targetIndex < 0) {
@@ -4142,23 +4431,19 @@ export function useChatShell() {
     };
 
     sessions.value = [newSession, ...sessions.value];
-    messageStore.value[sessionId] = [
-      {
-        id: `${sessionId}-system`,
-        kind: "system",
-        author: "system",
-        body: `New conversation with ${contact.name}`,
-        time: "",
-      },
-    ];
+    messageStore.value[sessionId] = [];
     selectedSessionId.value = sessionId;
 
     return sessionId;
   }
 
-  function applyLocalStartSelfConversation() {
+  function applyLocalStartSelfConversation(circleId = activeCircleId.value) {
+    if (!circleId) {
+      return null;
+    }
+
     const existing = sessions.value.find((session) => {
-      return session.circleId === activeCircleId.value && session.kind === "self";
+      return session.circleId === circleId && session.kind === "self";
     });
 
     if (existing) {
@@ -4170,31 +4455,108 @@ export function useChatShell() {
       return existing.id;
     }
 
-    const sessionId = buildUniqueSessionId(`self-${activeCircleId.value}`);
+    const sessionId = buildUniqueSessionId(`self-${circleId}`);
     const newSession: SessionItem = {
       id: sessionId,
-      circleId: activeCircleId.value,
-      name: "Note to Self",
+      circleId,
+      name: "File Transfer Assistant",
       initials: "ME",
-      subtitle: "Private note space",
+      subtitle: "Add notes to yourself here.",
       time: "now",
       kind: "self",
       category: "system",
     };
 
     sessions.value = [newSession, ...sessions.value];
-    messageStore.value[sessionId] = [
-      {
-        id: `${sessionId}-system`,
-        kind: "system",
-        author: "system",
-        body: "Private note space opened",
-        time: "",
-      },
-    ];
+    messageStore.value[sessionId] = [];
     selectedSessionId.value = sessionId;
 
     return sessionId;
+  }
+
+  function firstVisibleSessionForCircle(circleId: string) {
+    return (
+      sessions.value.find((session) => {
+        return session.circleId === circleId && !session.archived;
+      }) ?? null
+    );
+  }
+
+  async function openSelfConversationForCircle(
+    circleId: string,
+    options: {
+      closeOverlays?: boolean;
+    } = {},
+  ) {
+    if (!circleId || !circles.value.some((circle) => circle.id === circleId)) {
+      return null;
+    }
+
+    const mutation = await runFallbackEligibleMutation(() => startSelfConversation({
+      circleId,
+    }), {
+      title: "Open self chat failed",
+      fallbackDetail: "Desktop chat state could not open the self-note session.",
+    });
+
+    if (mutation.result) {
+      applyDomainSeed(mutation.result.seed, {
+        preferredCircleId: circleId,
+        preferredSessionId: mutation.result.sessionId,
+      });
+      if (options.closeOverlays) {
+        closeAllOverlayPages();
+      }
+      return mutation.result.sessionId;
+    }
+
+    if (!mutation.canFallbackLocally) {
+      return null;
+    }
+
+    const sessionId = applyLocalStartSelfConversation(circleId);
+    if (sessionId && options.closeOverlays) {
+      closeAllOverlayPages();
+    }
+
+    return sessionId;
+  }
+
+  async function ensureCircleHasSendableSession(circleId: string) {
+    if (!circleId || !circles.value.some((circle) => circle.id === circleId)) {
+      return null;
+    }
+
+    const existingSession = firstVisibleSessionForCircle(circleId);
+    if (existingSession) {
+      const selectedSessionStillVisible = sessions.value.some((session) => {
+        return session.id === selectedSessionId.value && session.circleId === circleId && !session.archived;
+      });
+      if (!selectedSessionStillVisible) {
+        selectSession(existingSession.id);
+      }
+      return existingSession.id;
+    }
+
+    return openSelfConversationForCircle(circleId);
+  }
+
+  async function landOnCircle(
+    circleId: string,
+    options: {
+      nextOverlay?: "new-message";
+    } = {},
+  ) {
+    if (!circleId) {
+      return null;
+    }
+
+    focusCircle(circleId, options);
+    if (options.nextOverlay === "new-message") {
+      return null;
+    }
+
+    return ensureCircleHasSendableSession(circleId);
   }
 
   function applyLocalCreateLookupContact(query: string) {
@@ -4433,30 +4795,7 @@ export function useChatShell() {
       return;
     }
 
-    const mutation = await runFallbackEligibleMutation(() => startSelfConversation({
-      circleId: activeCircleId.value,
-    }), {
-      title: "Open self chat failed",
-      fallbackDetail: "Desktop chat state could not open the self-note session.",
-    });
-
-    if (mutation.result) {
-      applyDomainSeed(mutation.result.seed, {
-        preferredCircleId: activeCircleId.value,
-        preferredSessionId: mutation.result.sessionId,
-      });
-      closeAllOverlayPages();
-      return;
-    }
-
-    if (!mutation.canFallbackLocally) {
-      return;
-    }
-
-    const sessionId = applyLocalStartSelfConversation();
-    if (sessionId) {
-      closeAllOverlayPages();
-    }
+    await openSelfConversationForCircle(activeCircleId.value, { closeOverlays: true });
   }
 
   async function createGroupChat(input: Omit<CreateGroupConversationInput, "circleId">) {
@@ -4505,7 +4844,7 @@ export function useChatShell() {
   ) {
     const normalizedQuery = query.trim();
     if (!normalizedQuery) {
-      return;
+      return false;
     }
 
     const input = inferCircleInputFromQuery(normalizedQuery);
@@ -4519,19 +4858,22 @@ export function useChatShell() {
         preferredSessionId: selectedSessionId.value,
       });
       forgetRestorableCircleByCircleId(mutation.result.circleId);
-      focusCircle(mutation.result.circleId, options);
-      return;
+      await landOnCircle(mutation.result.circleId, options);
+      return true;
     }
 
     if (!mutation.canFallbackLocally) {
-      return;
+      return false;
     }
 
     const circleId = applyLocalAddCircleFromDirectory(input);
     if (circleId) {
       forgetRestorableCircleByCircleId(circleId);
-      focusCircle(circleId, options);
+      await landOnCircle(circleId, options);
+      return true;
     }
+
+    return false;
   }
 
   async function updateGroupName(payload: UpdateGroupNameInput) {
@@ -4606,19 +4948,26 @@ export function useChatShell() {
 
   async function startLookupChat(query: string) {
     const normalizedQuery = query.trim();
+    resetFindPeopleRequestState();
     if (!normalizedQuery) {
       return;
     }
 
+    findPeopleSubmitting.value = true;
     if (isCircleQuery(normalizedQuery)) {
-      await joinCircleFromLookup(
+      const joined = await joinCircleFromLookup(
         normalizedQuery,
         shouldReturnToNewMessageAfterCircleJoin() ? { nextOverlay: "new-message" } : {},
       );
+      if (!joined) {
+        setFindPeopleErrorMessage("Failed to process invite link.");
+      }
+      findPeopleSubmitting.value = false;
       return;
     }
 
     if (!activeCircleId.value) {
+      findPeopleSubmitting.value = false;
       redirectToCircleSetup();
       return;
     }
@@ -4636,19 +4985,27 @@ export function useChatShell() {
         preferredCircleId: activeCircleId.value,
         preferredSessionId: mutation.result.sessionId,
       });
+      findPeopleSubmitting.value = false;
       closeAllOverlayPages();
       return;
     }
 
     if (!mutation.canFallbackLocally) {
+      findPeopleSubmitting.value = false;
+      setFindPeopleErrorMessage("User not found.");
       return;
     }
 
     const contact = applyLocalCreateLookupContact(normalizedQuery);
     const sessionId = applyLocalStartConversation(contact.id);
     if (sessionId) {
+      findPeopleSubmitting.value = false;
       closeAllOverlayPages();
+      return;
     }
+
+    findPeopleSubmitting.value = false;
+    setFindPeopleErrorMessage("User not found.");
   }
 
   function applyLocalSessionAction(payload: { sessionId: string; action: SessionAction }) {
@@ -4824,13 +5181,37 @@ export function useChatShell() {
       .replace(/^-+|-+$/g, "") || "circle";
   }
 
+  function resolvePublicRelayShortcut(value: string) {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+
+    switch (normalized) {
+      case "0xchat":
+        return "wss://relay.0xchat.com";
+      case "damus":
+        return "wss://relay.damus.io";
+      case "nos":
+        return "wss://nos.lol";
+      case "primal":
+        return "wss://relay.primal.net";
+      case "yabu":
+        return "wss://yabu.me";
+      case "nostrband":
+        return "wss://relay.nostr.band";
+      default:
+        return null;
+    }
+  }
+
   function normalizeCustomRelayInput(value: string) {
     const trimmed = value.trim();
     if (!trimmed) {
       return "";
     }
 
-    const candidate = trimmed.includes("://") ? trimmed : `wss://${trimmed}`;
+    const candidate = resolvePublicRelayShortcut(trimmed) ?? (trimmed.includes("://") ? trimmed : `wss://${trimmed}`);
     try {
       const parsed = new URL(candidate);
       if ((parsed.protocol === "ws:" || parsed.protocol === "wss:") && parsed.hostname) {
@@ -4913,7 +5294,7 @@ export function useChatShell() {
         preferredSessionId: selectedSessionId.value,
       });
       forgetRestorableCircleByCircleId(mutation.result.circleId);
-      chooseCircle(mutation.result.circleId);
+      await landOnCircle(mutation.result.circleId);
       return;
     }
 
@@ -4924,7 +5305,7 @@ export function useChatShell() {
     const circleId = applyLocalAddCircleFromDirectory(payload);
     if (circleId) {
       forgetRestorableCircleByCircleId(circleId);
-      chooseCircle(circleId);
+      await landOnCircle(circleId);
     }
   }
 
@@ -5047,8 +5428,7 @@ export function useChatShell() {
       });
 
       if (removedActiveCircle) {
-        closeTransientChrome();
-        closeAllOverlayPages();
+        await landOnCircle(mutation.result.circles[0]?.id ?? "");
         return;
       }
 
@@ -5073,6 +5453,9 @@ export function useChatShell() {
 
     upsertRestorableCircle(buildRestorableCircleEntry(removedCircle));
     applyLocalRemoveCircle(circleId);
+    if (removedActiveCircle && activeCircleId.value) {
+      await landOnCircle(activeCircleId.value);
+    }
   }
 
   function buildLocalTransportLatency(relay: string, type: string) {
@@ -5367,6 +5750,8 @@ export function useChatShell() {
   return {
     searchText,
     composerText,
+    findPeopleSubmitting,
+    findPeopleErrorMessage,
     isAuthenticated,
     authSession,
     authRuntime,
@@ -5433,6 +5818,7 @@ export function useChatShell() {
     chooseCircle,
     toggleCircleSwitcher,
     openNewMessage,
+    openCircleInvitePage,
     openSelfChatConfirmPage,
     openFindPeoplePage,
     openCircleManagement,

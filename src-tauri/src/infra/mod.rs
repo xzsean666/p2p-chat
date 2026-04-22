@@ -12,6 +12,7 @@ pub mod media_upload;
 pub mod mock_transport_adapters;
 pub mod mock_transport_engine;
 pub mod mock_transport_runtime;
+pub mod pending_auth_runtime_client_store;
 pub mod preview_transport_engine;
 pub mod preview_transport_runtime;
 pub mod seed_chat_repository;

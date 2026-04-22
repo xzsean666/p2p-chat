@@ -1,6 +1,6 @@
 use crate::app::{chat_mutations, chat_queries};
 use crate::domain::chat::{
-    AddCircleInput, AddCircleResult, CacheChatMessageMediaInput, CachedChatMessageMediaResult,
+    AddCircleInput, AddCircleResult, AuthRuntimeClientUriSummary, CacheChatMessageMediaInput, CachedChatMessageMediaResult,
     ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage,
     ChatShellSnapshot, CleanupChatMediaAssetsResult, CreateGroupConversationInput,
     LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCompletionInput,
@@ -59,6 +59,27 @@ pub fn update_auth_runtime(
     input: UpdateAuthRuntimeInput,
 ) -> Result<ShellStateSnapshot, String> {
     chat_queries::update_auth_runtime(&app_handle, input)
+}
+
+#[tauri::command]
+pub fn load_auth_runtime_client_uri(
+    app_handle: tauri::AppHandle,
+) -> Result<Option<AuthRuntimeClientUriSummary>, String> {
+    chat_queries::load_auth_runtime_client_uri(&app_handle)
+}
+
+#[tauri::command]
+pub fn load_pending_auth_runtime_client_uri(
+    app_handle: tauri::AppHandle,
+) -> Result<AuthRuntimeClientUriSummary, String> {
+    chat_queries::load_pending_auth_runtime_client_uri(&app_handle)
+}
+
+#[tauri::command]
+pub fn await_pending_auth_runtime_client_pairing(
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    chat_queries::await_pending_auth_runtime_client_pairing(&app_handle)
 }
 
 #[tauri::command]

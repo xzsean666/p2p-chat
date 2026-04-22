@@ -1,6 +1,82 @@
 # Next Session
 
-更新时间: 2026-04-21
+更新时间: 2026-04-22
+
+## 本轮新增收口
+
+- 本轮并行起了 explorer / worker agents，对 `LoginScreen / NewMessage / FindPeople / ChatPane / useChatShell` 做了 source parity 审核和分片实现。
+- 最新静态验证已通过：
+  - `pnpm exec tsc --noEmit`
+  - `pnpm build`
+  - `git diff --check`
+- 登录引导页又收了一轮 MVP 安全路径：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 里的 `invite` 不再伪造 placeholder invite code；step-3 CTA 现在改成 `Continue to Join Circle`，登录后会走现有 join-circle handoff。
+  - `Restore private circle` 现在只在有 `restorableCircles` 时可点；无 restore 数据时不会再主动打开空 restore 页。
+  - `Get Private Circle` 不再继续进入那条长静态 prototype 作为 MVP 主链；当前它跟 invite 一样走安全的 post-login circle flow handoff，避免把用户带进 source 不等价的 dead-end。
+- 新消息/找人页继续往 source 靠：
+  - [NewMessagePage.vue](/home/sean/git/p2p-chat/src/components/NewMessagePage.vue) 现在切成更接近 source 的两态：
+    - 默认态: actions + A-Z 分组联系人列表
+    - 搜索态: 聚焦搜索后进入搜索页模型，空搜索只显示简提示，输入关键词后显示扁平 search results
+  - self entry 已并入统一列表模型，不再单独做一个 `Self` section。
+  - `Invite / Add Friends` 现在接上可用性开关；无可用 circle/invite link 时会短路。
+  - [FindPeoplePage.vue](/home/sean/git/p2p-chat/src/components/FindPeoplePage.vue) 现在接受 `submitting / submitError`，顶部 `Next`、输入框、inline loading/error 状态都能和 shell 状态联动。
+- shell/chat MVP 主链也补了几处真实断点：
+  - [useChatShell.ts](/home/sean/git/p2p-chat/src/features/shell/useChatShell.ts) 的 `chooseCircle(...)` 不再只是 `focusCircle(...)`；切圈现在会走 `landOnCircle(...)`，自动确保落到一个可发送 session。
+  - remove circle 后如果当前 active circle 被删，也会自动落到剩余 circle 并保证有 sendable session。
+  - `FindPeople` 的提交态和错误态已经接入 shell：
+    - `findPeopleSubmitting`
+    - `findPeopleErrorMessage`
+  - session 级发送 gating 已收进 shell，而不再只看全局 runtime：
+    - direct chat 若联系人已 block，会立即禁用 composer
+    - group 预留了 `canSend / needsJoin` 前端 capability 位
+  - fallback 新建 direct/self 会话不再注入假 `system` message，空会话会像 source 一样干净打开。
+  - fallback self session 本地标题/副文案已统一到 `File Transfer Assistant / Add notes to yourself here.`，且 self chat header 点击不再落到 details drawer。
+- 群聊显示又收了一轮 source-like 细节：
+  - [ChatPane.vue](/home/sean/git/p2p-chat/src/components/ChatPane.vue) 现在只在 group incoming cluster 的首条消息显示 sender name / avatar，不再每条 peer message 都重复显示。
+  - group session preview 更新时，会把 sender label 前缀进 subtitle，避免群会话预览丢作者信息。
+- 用户明确要求“多起几个 agent 并行做”，本轮后半段又继续起了多名 worker 并行收尾：
+  - `FindPeoplePage.vue` 权限/恢复态
+  - `SelfChatConfirmPage.vue` / `ConversationDetailsDrawer.vue` / `chatSeedFallback`
+  - `LoginScreen.vue` 文案收口
+  - 新增独立 invite 页组件
+- invite flow 这轮终于从 `NewMessage` 的即时 share/copy 提升成独立页：
+  - 新增 [CircleInvitePage.vue](/home/sean/git/p2p-chat/src/components/CircleInvitePage.vue)
+  - [overlayRoutes.ts](/home/sean/git/p2p-chat/src/features/shell/overlayRoutes.ts)、[useChatShell.ts](/home/sean/git/p2p-chat/src/features/shell/useChatShell.ts)、[App.vue](/home/sean/git/p2p-chat/src/App.vue)、[NewMessagePage.vue](/home/sean/git/p2p-chat/src/components/NewMessagePage.vue) 已接上 `circle-invite` overlay
+  - `Invite` 现在会打开独立 invite 页，而不是直接在 `NewMessage` 里做 fallback share/copy
+  - invite 页当前提供：
+    - circle name
+    - real invite link
+    - real scannable QR code
+    - share button
+    - copy button + 本地 copy feedback
+- 为了让 invite 页提供真实可扫码 QR，这轮新增了前端依赖：
+  - [package.json](/home/sean/git/p2p-chat/package.json) 加入 `qrcode`
+  - [package.json](/home/sean/git/p2p-chat/package.json) 加入 `@types/qrcode`
+- `FindPeople` 的扫码权限恢复链又补了一轮：
+  - [FindPeoplePage.vue](/home/sean/git/p2p-chat/src/components/FindPeoplePage.vue) 现在会区分：
+    - `permission-denied`
+    - `camera-unavailable`
+    - generic scanner error
+  - scanner error 不再只剩一句 inline 文本，而是 source-like 的恢复 panel，带更明确的说明、步骤和 `Open QR Image / Retry Camera` 操作
+- self chat 相关可见文案也继续统一到了 `File Transfer Assistant` 语义：
+  - [SelfChatConfirmPage.vue](/home/sean/git/p2p-chat/src/components/SelfChatConfirmPage.vue)
+  - [ConversationDetailsDrawer.vue](/home/sean/git/p2p-chat/src/components/ConversationDetailsDrawer.vue)
+  - [chatSeedFallback.ts](/home/sean/git/p2p-chat/src/mock/chatSeedFallback.ts)
+- 登录页最后又做了一轮 copy-only source 收口：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 现在把 account key / add-circle / restore / private preview 的可见文案更精确地对回当前实际行为
+
+## 当前最新判断
+
+- 现在 `MVP = 登录 -> 进圈/加圈 -> 打开可发送会话 -> 发送最简单文本消息` 这条链已经比上一轮稳很多，且切圈/新圈空会话的问题已经被补掉。
+- UI 已明显更接近 `tmp/xchat-app-main`，尤其登录页、找人页、新消息页和群聊 sender 呈现。
+- 但“完全一样”仍未 100% 完成；当前残留更像是 source fidelity 细节，而不是主链功能断点。
+
+## 仍未完全收口
+
+- `FindPeople` 现在已有权限恢复 panel，但还不是 source 那种真正拉起系统 settings 的完整权限恢复链；当前仍是 in-page 指引 + retry。
+- `CircleInvitePage.vue` 现在已经有真实 QR，但整体视觉和 source 的完整 invite / profile / QR page 仍不是 1:1 复刻，只能算 MVP 可用且更接近 source。
+- `Get Private Circle` 现在为了 MVP 被收成安全 handoff；source 那条完整 private cloud 购买/开通链仍然没有真实 backend，因此这里只能保证不误导用户进入假流程。
+- `Settings / shell-first layout / overlay shell` 仍和 Flutter source 的原生页面容器有差异；目前优先级低于聊天主链。
 
 ## 当前硬约束
 
@@ -28,6 +104,135 @@
 
 ## 本轮刚完成
 
+- 未登录态的标准 signer 配对链路这轮已经补通，且不再只是“已登录后导出 client URI”：
+  - [shell_auth.rs](/home/sean/git/p2p-chat/src-tauri/src/app/shell_auth.rs) 新增了 pending client 配对层：
+    - 生成并持久化未登录 `nostrconnect://...?metadata=...` client URI
+    - 等待 signer 侧 connect ack + `get_public_key`
+    - 在握手完成后导出可登录的 `bunker://...`
+    - 登录时若使用这条已配对 `bunker://...`，会把预先生成的 client key 直接 claim 到 authenticated session，不会再被重新生成
+  - Rust 新增 store 与命令接线：
+    - [pending_auth_runtime_client_store.rs](/home/sean/git/p2p-chat/src-tauri/src/infra/pending_auth_runtime_client_store.rs)
+    - [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs)
+    - [commands/chat.rs](/home/sean/git/p2p-chat/src-tauri/src/commands/chat.rs)
+    - [commands/mod.rs](/home/sean/git/p2p-chat/src-tauri/src/commands/mod.rs)
+    - [lib.rs](/home/sean/git/p2p-chat/src-tauri/src/lib.rs)
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 现在在 source-like 的 account key 页做了最小增补：
+    - `Learn more` 旁边新增 `Pair with signer`
+    - 打开后是全屏配对页，展示标准 client URI，并提供 `Copy URI`
+    - 点击 `I approved in signer app` 会等待配对完成，然后把解析出的 `bunker://...` 自动回填到原登录输入框
+    - 用户仍然走原来的 `LOGIN` 主按钮提交流程，没有改掉 source 的主页面骨架
+  - 前端命令包装也已接上：
+    - [chatShell.ts](/home/sean/git/p2p-chat/src/services/chatShell.ts)
+- 这轮新增 Rust 回归覆盖：
+  - [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs)
+    - `load_pending_auth_runtime_client_uri_returns_standard_nostrconnect_client_uri`
+    - `await_pending_auth_runtime_client_pairing_resolves_and_persists_bunker_uri`
+    - `bootstrap_auth_session_claims_paired_pending_auth_runtime_client`
+- 本轮最新验证已通过：
+  - `cargo test --manifest-path src-tauri/Cargo.toml load_pending_auth_runtime_client_uri_returns_standard_nostrconnect_client_uri -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml await_pending_auth_runtime_client_pairing_resolves_and_persists_bunker_uri -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml bootstrap_auth_session_claims_paired_pending_auth_runtime_client -- --nocapture`
+  - `cargo test --manifest-path src-tauri/Cargo.toml auth_runtime -- --nocapture`
+  - `pnpm exec tsc --noEmit`
+  - `pnpm build`
+  - `git diff --check`
+- restore 页又按 `tmp/xchat-app-main/packages/business_modules/ox_login/lib/page/circle_restore_page.dart` 收了一轮真实交互，而不只是文案接近：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 现在默认全选所有可恢复圈子
+  - restore 列表改成 source-like 的多选 toggle，点击卡片即可选中/取消
+  - 底部主按钮会按当前选中数动态显示 `Restore Circle` / `Restore {count} Circles`
+  - restore 卡片选中态判断和切换逻辑已抽成明确的 `sameRelay / isRestoreCircleSelected / toggleRestoreCircle`，不再在模板里内联拼状态
+  - `Restore private circle` 链接在没有可恢复圈子时现在会真实禁用，不再只是样式变灰但仍可点击
+- [FindPeoplePage.vue](/home/sean/git/p2p-chat/src/components/FindPeoplePage.vue) 的 `Scan QR Code` 已不再只是占位：
+  - 已接入真实相机扫码，成功识别后会直接回填输入并继续当前 `chat / join-circle` 提交流程
+  - 同时补了 `Open QR Image` 回退路径，桌面环境下即使无法打开相机，也可以从本地图片解码 QR
+  - 扫码流不再是自定义 modal 弹层，现已收成更接近 source 的独立全屏扫描页；顶部返回会先退回 `Find People` 页，再退出 overlay
+  - 本轮最新静态验证再次通过：`pnpm exec tsc --noEmit`、`pnpm build`
+- 前台 relay heartbeat 这轮也收紧了一次，先压 MVP 的“收消息体感延迟”，但还没扩成常驻 subscription：
+  - [useChatShell.ts](/home/sean/git/p2p-chat/src/features/shell/useChatShell.ts) 现在把前台 relay heartbeat 从 `8s` 收到 `2.5s`
+  - 页面切到后台后会自动降回较慢轮询，避免一直高频刷新
+  - 页面重新回到前台时会立即补打一轮 `refreshTransportSnapshot(...)`，不再等下一次 interval
+  - runtime recovery 期间的 heartbeat 也从 `3s` 收到 `2s`
+  - 本轮最新静态验证再次通过：`pnpm exec tsc --noEmit`、`pnpm build`、`git diff --check`
+- remote signer 的 `nostrconnect://...&secret=...` 手动粘贴链路这轮也补通了，不再继续停在 “connected 但不可发送”：
+  - [shell_auth.rs](/home/sean/git/p2p-chat/src-tauri/src/app/shell_auth.rs) 现在会把当前桌面端接受的 legacy `nostrconnect` handoff 绑定桥接到现有 NIP-46 bunker 握手/签名链
+  - 这意味着 `sync_auth_runtime`、文本消息 `sign_event`、NIP-98/Blossom HTTP auth 现在都能复用同一条远端 signer 能力
+  - [chat_mutations.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_mutations.rs) 的文本消息 signer 也已不再只认 `bunker`，`nostrConnect` connected runtime 现在同样会生成 `signed_nostr_event` 并进入正常发送状态
+  - 本轮新增/更新验证已通过：
+    - `cargo test --manifest-path src-tauri/Cargo.toml nostrconnect -- --nocapture`
+    - `cargo test --manifest-path src-tauri/Cargo.toml auth_runtime -- --nocapture`
+- 标准 `metadata=` 版 nostrConnect client URI 的已登录态导出也已经补通：
+  - [shell_auth.rs](/home/sean/git/p2p-chat/src-tauri/src/app/shell_auth.rs) 现在会基于当前 authenticated remote-signer session 生成标准 `nostrconnect://<client-pubkey>?metadata=...&relay=...` client URI
+  - [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs)、[commands/chat.rs](/home/sean/git/p2p-chat/src-tauri/src/commands/chat.rs)、[chatShell.ts](/home/sean/git/p2p-chat/src/services/chatShell.ts) 已把这条能力接成可调用命令
+  - [SettingsDetailPage.vue](/home/sean/git/p2p-chat/src/components/SettingsDetailPage.vue) 现在会在 `about` 页的 auth runtime 区域展示标准 client URI，并支持复制 `Client URI / Client Pubkey`
+  - Rust 回归已补：
+    - [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs) 新增 `load_auth_runtime_client_uri_returns_standard_nostrconnect_client_uri_for_remote_signer`
+  - 本轮最新验证已通过：
+    - `cargo test --manifest-path src-tauri/Cargo.toml load_auth_runtime_client_uri_returns_standard_nostrconnect_client_uri_for_remote_signer -- --nocapture`
+    - `cargo test --manifest-path src-tauri/Cargo.toml auth_runtime -- --nocapture`
+    - `pnpm exec tsc --noEmit`
+    - `pnpm build`
+- 登录页 source 对齐又补了一轮收口：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 的 account key placeholder 已从偏离 source 的 `Enter nsec or remote signer URI` 收回到源项目实际文案 `Enter nsec or bunker:// URI`
+  - `Understanding Nostr` 页里的 remote signer 使用说明也收回到 source 当前文案：只展示 `bunker:// URI`，不再在登录 UI 里额外暴露 `nostrconnect://`
+  - 这次收口只改了可见 UI 文案；底层对 legacy `nostrconnect://...&secret=...` 的兼容仍保留
+- 前端 auth runtime fallback 状态也继续和 Rust 对齐：
+  - [authRuntime.ts](/home/sean/git/p2p-chat/src/services/authRuntime.ts) 不再残留 `Remote bunker handoff is stored, but signer handshake is not implemented yet.`
+  - existing-account/signer 的远端 signer fallback 现在统一收敛成 `pending / waiting for a signer handshake` 语义，不再把 `nostrConnect` connected runtime 错误地继续视为“功能未实现”
+- 登录完成时的 restore payload 现在真正支持多圈恢复，不再只是 UI 假多选：
+  - [src/types/chat.ts](/home/sean/git/p2p-chat/src/types/chat.ts) 和 [chat.rs](/home/sean/git/p2p-chat/src-tauri/src/domain/chat.rs) 的 `LoginCircleSelectionInput` 已新增 `relays`
+  - 前端 restore 提交现在会同时发送首个 `relay` 和完整 `relays[]`
+  - [useChatShell.ts](/home/sean/git/p2p-chat/src/features/shell/useChatShell.ts) 与 [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs) 都已按多选 restore 处理，当前行为是：
+    - 按提交列表恢复多个 circle
+    - 第一个恢复成功的 circle 成为 active circle
+    - 已恢复的 restore catalog 项会一并从本地列表移除
+- Rust 侧把这次改动补成了回归覆盖：
+  - [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs) 新增 `complete_login_restores_multiple_circles_and_keeps_first_restored_active`
+  - 现有 restore / custom relay shortcut 相关 `LoginCircleSelectionInput` 测试 fixture 也都补齐了 `relays: None`
+- 登录说明页和 private learn-more 页又继续往 source 靠了一轮：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 的 `What is a Circle?` 说明页现在不再保留那套自写 FAQ，而是改回 `nostr_relay_introduction_page.dart` 对应的 source 分段：
+    - `Your private communication hub`
+    - `Think of it like a mailroom`
+    - `How does it work?`
+  - private `Learn More` 页去掉了 source 不存在的自定义概述段，pricing 区也改回更像 `private_circle_learn_more_page.dart` 的定价行结构：
+    - `2 Members / 6 Members / 20 Members`
+    - `Yearly plan`
+    - `monthly / yearly` 价格同行展示
+  - private `duration` 页的 `Save up to {percent}% with yearly billing.` 和 `SAVE {percent}%` 现在按当前套餐价格动态计算，不再写死 `17%`
+  - private activated 页的 `Share Invite Link` 也更接近 source 行为：
+    - 优先尝试 `navigator.share(...)`
+    - fallback 才静默复制链接
+    - 去掉了 source 不存在的 `Preview invite link copied / Clipboard is unavailable` inline 提示
+- 登录页与 checkout/private footer 又补了一轮 source-like 交互细节：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 里的 `Privacy Policy / Terms of Use` 现在不再是空按钮，而是会像 source 那样打开 0xchat 协议页面
+  - private `overview / capacity / duration / activated` 底部主按钮补回了 source 风格的右箭头布局，不再只是纯文字按钮
+- 本轮验证已通过：
+  - `pnpm exec tsc --noEmit`
+  - `pnpm build`
+  - `cargo test --manifest-path src-tauri/Cargo.toml complete_login_restores_`
+
+- 登录/加圈 UI 又按用户最新要求做了一轮“严格对照 source”回收，这一条优先级高于之前那轮 `Community Circle` MVP 主入口实验：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 的 circle selection 主结构现在重新严格对齐 `tmp/xchat-app-main/packages/business_modules/ox_login/lib/page/circle_selection_page.dart`
+  - 可见主卡片重新收敛为且只保留：
+    - `I have an invite`
+    - `Get Private Circle`
+    - `Custom Relay`
+  - 之前为了当前 MVP 额外露出的顶层 `Community Circle` 卡片已经移除，不再作为 source 不存在的主入口
+  - public relay shortcut 仍保留，但只藏在 `Custom Relay` sheet / relay 归一化逻辑里，不再破坏 source 页结构
+  - circle step 底部主按钮文案也从之前误写的 `Connect` 改回 source locale 实际值 `Continue`
+  - restore/private preview 页的关键文案也继续校回 source：
+    - `Welcome Back`
+    - `We found {count} circles linked to your account. Select the ones you want to restore to this device.`
+    - `No Private Circle to restore`
+    - `CONFIGURE PLAN`
+    - `Enter My Private Circle`
+  - 又补了一轮细节 source 对齐：
+    - `profile setup` 页底部主按钮已从误写的 `Continue` 改回 source 的 `Next`
+    - `account key` 页去掉了几条 source 不存在的附加状态提示，只保留 source 本身的说明文案和 `NSEC invalid` 提示
+    - `custom relay` sheet 现在对回 source 文案：`Add Custom Relay`、`Enter relay URL or name`、`Join`
+    - `custom relay` sheet 打开时若用户还没填任何内容，会像 source dialog 一样预填 `damus`
+    - `custom relay` sheet 里之前那排 source 没有的 shortcut chips 和 `Relay will be saved as ...` 预览提示已经去掉，收成更接近 source 的 inline `0xchat / damus` shortcut 文本
+    - `restore` 页卡片也去掉了 source 没有的 `type pill / archived time`，现在更接近原始 restore list 的简洁结构
+    - [FindPeoplePage.vue](/home/sean/git/p2p-chat/src/components/FindPeoplePage.vue) 的 `join-circle` 模式 notice / placeholder 又继续校回 source：`Enter a circle invite link or scan the invite QR code to join a circle.`、`Enter circle invite link`
 - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 已做第一轮源项目回拢：
   - 去掉了之前那套“双栏大白卡 + 4 步 marketing flow”的自定义入口
   - 改成更接近原 Flutter 登录页的“全屏渐变 + 单列 onboarding 轮播 + 底部两个主入口按钮”
@@ -83,6 +288,42 @@
   - account key 页的 `Learn more` 现在会弹出 `Understanding Nostr` info sheet
   - custom relay sheet 的 `What is a Relay?` 现在会弹出 `What is a Circle?` info sheet
   - 自定义 relay sheet 也补回了更接近原项目的 URL/shortcut hint，不再只剩 placeholder
+- 登录引导页又继续往原项目结构收了一轮：
+  - `invite` 选项不再要求先在 login 页填本地 sheet；登录完成后会直接打开 join-circle overlay，更接近源项目的后续 join flow
+  - profile 页补了本地 avatar 选择预览，不再是纯静态头像占位
+  - 入口页 footer 去掉了自定义 checkbox 式 terms 表达，account key placeholder / restore 文案 / private card badge 也继续向源项目文案收紧
+- `circle selection` 页又继续做了页级拆分，不再只在主页面内联堆内容：
+  - `restore private relay` 现在会打开独立全屏 restore page，不再把 restore 列表直接塞在 circle 主页底部
+  - `Get Private Circle` 现在不再是死的 disabled 卡，而是会进入 source-like 的 `overview / learn more` 全屏页
+  - 但 `Configure Plan` 仍然只是静态占位，capacity / duration / checkout 链还没接出来
+- `invite` 桌面流又修了一处实际逻辑坑：
+  - 现在遇到“只选 invite、尚未输入邀请码”的情况，会先做 auth bootstrap，再打开 join-circle overlay
+  - 不再先把空 invite payload 打到 Rust `complete_login`，避免被 `inviteCode >= 6` 校验直接拒掉
+- [FindPeoplePage.vue](/home/sean/git/p2p-chat/src/components/FindPeoplePage.vue) 也开始按 `tmp/xchat-app-main/packages/business_modules/ox_chat/lib/page/session/find_people_page.dart` 收 UI：
+  - 现有那套 lookup/tag/联系人分组工具页已经删掉
+  - `chat / join-circle` 两种模式都改成 source-like 的极简输入页：右上角 `Next`、单输入框、notice、底部 `Scan QR Code` 按钮
+  - `Scan QR Code` 现在已经接上真实扫码能力；主页面骨架仍保持 source-like 极简结构，扫码能力收在独立扫描层里
+- `private circle` 那条 source 页链这轮也补出来了，仍集中在 [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue)：
+  - `overview -> learn more -> capacity -> duration -> checkout -> activated` 现在都已有独立全屏页，不再停在一个 disabled 的 `Configure Plan`
+  - `learn more` 页也补回了 source 里的 `Features / Privacy / Pricing` 三段结构
+  - `capacity / duration / checkout / activated` 目前是静态 UI preview：
+    - 价格是前端占位数据，不是商店实时价格
+    - `Subscribe` 只会进入本地 activated preview，不会触发真实支付或开通私有圈
+- 范围后来又进一步收紧到 `MVP = 公共 wss relay 上的 Nostr 聊天`：
+  - [Agent.md](/home/sean/git/p2p-chat/Agent.md) 已明确写入：当前先做简单 P2P 聊天 MVP，不把 `subscription / checkout / private cloud` 当主线
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 入口卡现在把主推荐项改成了 `Community Circle`，作为当前 MVP 的主推荐路径，而不是 `Get Private Circle`
+  - `damus / nos / primal / 0xchat` 这类 shortcut 现在会映射到真实 public relay URL，不再只是错误地补成 `wss://damus`
+  - 对应映射同时补到了前端 [useChatShell.ts](/home/sean/git/p2p-chat/src/features/shell/useChatShell.ts)、查询意图 [chatQueryIntents.ts](/home/sean/git/p2p-chat/src/services/chatQueryIntents.ts) 和 Rust `chat_mutations / chat_queries`
+- 又补了一轮收口：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 现在重新补回了可点击的 `Get Private Circle` 入口卡，private preview 页链不再是“页面存在但入口丢失”
+  - Rust 侧补了 relay shortcut 回归测试：
+    - [chat_queries.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_queries.rs) 现在覆盖 `complete_login + custom circle + damus shortcut`
+    - [chat_mutations.rs](/home/sean/git/p2p-chat/src-tauri/src/app/chat_mutations.rs) 现在覆盖 `damus / nos / primal / 0xchat` 的归一化
+- 登录/加圈 UI 又继续往 source-like 收了一轮：
+  - [LoginScreen.vue](/home/sean/git/p2p-chat/src/components/LoginScreen.vue) 的 circle selection 现在不再默认预选 `Community Circle`；用户需要像源项目一样先点选卡片，再点底部 `Connect`
+  - `Get Private Circle` 现在也回到 source-like 节奏：先选中 private card，再由底部 `Connect` 打开 private preview 页链
+  - circle 页副标题、`Get Private Circle` 描述、`Restore private circle` 链接文案都已精确对回源项目英文文案
+  - [FindPeoplePage.vue](/home/sean/git/p2p-chat/src/components/FindPeoplePage.vue) 的聊天模式标题/notice/placeholder 也重新对回 `i18n_en.json`：`Add Friends`、`For privacy, users are hidden...`、`Enter Invite Link or User ID (npub...)`
 - 这轮没有做 Android 真机或模拟器实测：
   - 当前对 Android/Flutter 版本的判断，来自 `tmp/xchat-app-main` 源码、资源、文案和页面结构比对
   - 不是 Android runtime 的端到端验收
@@ -178,13 +419,13 @@
 1. 公开 relay 的 runtime 级、Rust service 显式 `Connect` live smoke，以及 Rust service 无手动 `Connect` auto-start live smoke 现在都已实证通过，但“桌面 UI 登录态 -> 自动拉起 runtime -> 建圈/选圈 -> 发消息 -> heartbeat/hydrate 自动回流到正确 session”这条完整前台链路还没做人工端到端验收，所以暂时还不能把“已经完全可聊”当成最终验收完成。
    - 不过当前代码已经进一步收紧到“首次 bootstrap connect 不再额外等待一轮 backoff”，并且“无手动 Connect 的 auto-start publish”也已经做过 live smoke，所以离真实前台可聊只剩桌面 UI 验收，不再是 transport 主链明显断链。
    - 同时，登录 UI 虽已按源项目做了第一轮回拢，但还没有经过用户主导的视觉验收，也没有 Android 端对照实跑。
-2. inbound sync 仍不是常驻 relay subscription；真实收消息延迟仍取决于 snapshot refresh 周期。
+2. inbound sync 仍不是常驻 relay subscription；不过前台 heartbeat 已收紧到 `2.5s` 且切回前台会立即补刷新，所以当前剩余延迟主要受 snapshot heartbeat，而不再是之前的 `8s` 级等待。
 3. `publish -> relay OK/failed -> timeline` 这条状态已补上 runtime warn 分类，但还可以继续收紧到更前台/更贴消息的用户可见错误表面。
 4. direct/group/self-chat 的 self-authored reroute 已有基础实现，但还需要继续用真实 relay 数据验证:
    - 同 relay 多圈
    - 缺 tag 或弱 tag
    - 旧 event replay / duplicate echo
-5. pasted `nostrconnect://` 仍未支持本地生成 client URI 的完整授权流，当前继续视为不可发送。
+5. 标准 `metadata=` 版 nostrConnect client URI 的“已登录态 settings/about 导出与展示”现在已经补通；仍未补的是“未登录态/登录页直接生成并展示标准 client URI”的 onboarding 配对流。
 
 ## 下个 Session 直接做
 
@@ -218,6 +459,7 @@
    - 是否需要把 explicit reject/timeout/close 进一步贴到消息级状态
    - 是否需要把 sync read fail 之类非 publish warn 也收进更克制的 notice 策略
 6. 若 heartbeat 实测仍不够，再决定是否上更短周期或更明确的前台/后台 refresh 策略；暂时不要扩成后端或新服务。
+7. 如果后面继续补标准 signer onboarding，就基于当前已完成的 settings/about client URI 导出能力，把它前移到未登录态配对页；不要再另起一套不同的 signer 流。
 
 ## 关键文件
 

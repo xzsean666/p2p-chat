@@ -89,8 +89,10 @@ pub fn collect_local_transport_recovery_actions(
 }
 
 fn needs_bootstrap_connect(runtime: &TransportRuntimeRegistryEntry) -> bool {
-    matches!(runtime.adapter_kind, TransportRuntimeAdapterKind::LocalCommand)
-        && matches!(runtime.launch_status, TransportRuntimeLaunchStatus::Ready)
+    matches!(
+        runtime.adapter_kind,
+        TransportRuntimeAdapterKind::LocalCommand
+    ) && matches!(runtime.launch_status, TransportRuntimeLaunchStatus::Ready)
         && runtime.last_launch_result.is_none()
         && runtime.last_launch_pid.is_none()
         && runtime.last_launch_at.is_none()
@@ -124,9 +126,8 @@ mod tests {
     use crate::domain::chat::{ChatDomainSeed, CircleItem, CircleStatus, CircleType};
     use crate::domain::transport::{
         TransportRuntimeAdapterKind, TransportRuntimeDesiredState, TransportRuntimeLaunchResult,
-        TransportRuntimeLaunchStatus, TransportRuntimeQueueState,
-        TransportRuntimeRecoveryPolicy, TransportRuntimeRegistryEntry, TransportRuntimeSession,
-        TransportRuntimeState,
+        TransportRuntimeLaunchStatus, TransportRuntimeQueueState, TransportRuntimeRecoveryPolicy,
+        TransportRuntimeRegistryEntry, TransportRuntimeSession, TransportRuntimeState,
     };
     use crate::domain::transport_repository::TransportCache;
     use crate::domain::transport_runtime_registry::TransportRuntimeLabels;

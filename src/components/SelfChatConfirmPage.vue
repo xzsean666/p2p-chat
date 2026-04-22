@@ -17,8 +17,8 @@ const emit = defineEmits<{
 
 <template>
   <OverlayPageShell
-    title="Note to Self"
-    subtitle="Open the private memo thread for the current circle."
+    title="File Transfer Assistant"
+    subtitle="Open the private assistant chat for the current circle."
     @close="emit('close')"
   >
     <div class="confirm-body">
@@ -29,8 +29,8 @@ const emit = defineEmits<{
           <p>
             {{
               circle
-                ? "Your self chat stays scoped to this circle, so drafts, files and quick notes remain separated from other relay contexts."
-                : "Choose a circle first, then open a private memo thread for that circle."
+                ? "This chat stays scoped to this circle, so notes, links and files stay separate from other circles."
+                : "Choose a circle first, then open File Transfer Assistant for that circle."
             }}
           </p>
         </div>
@@ -43,19 +43,19 @@ const emit = defineEmits<{
       </section>
 
       <section class="section-card">
-        <div class="section-title">What Happens Next</div>
+        <div class="section-title">What Opens</div>
         <div class="info-list">
           <div class="info-row">
-            <strong>Private Thread</strong>
-            <p>Create or reopen the `Note to Self` session for this circle.</p>
+            <strong>Assistant Chat</strong>
+            <p>Create or reopen the `File Transfer Assistant` chat for this circle.</p>
           </div>
           <div class="info-row">
             <strong>Circle Scoped</strong>
-            <p>Notes stay inside the current circle instead of becoming a global inbox.</p>
+            <p>Messages and saved items stay attached to the current circle.</p>
           </div>
           <div class="info-row">
-            <strong>Quick Capture</strong>
-            <p>Use it for temporary files, transfer notes and relay-specific reminders.</p>
+            <strong>Quick Saves</strong>
+            <p>Use it for notes, links and files you want close at hand.</p>
           </div>
         </div>
       </section>
@@ -66,7 +66,7 @@ const emit = defineEmits<{
         <Button label="Cancel" text severity="secondary" @click="emit('close')" />
         <Button
           icon="pi pi-arrow-right"
-          label="Open Note to Self"
+          label="Open File Transfer Assistant"
           severity="contrast"
           :disabled="!circle"
           @click="emit('confirm')"

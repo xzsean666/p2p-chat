@@ -20,6 +20,7 @@ import {
   videoMessagePreviewUrl,
   videoMessageRemoteUrl,
 } from "../features/chat/videoMessageMeta";
+import { resolveMessageAuthorLabel } from "../features/chat/messageAuthor";
 import type { MessageItem, SessionItem } from "../types/chat";
 
 const props = defineProps<{
@@ -38,7 +39,7 @@ const emit = defineEmits<{
 }>();
 
 const copyFeedback = ref("");
-let copyFeedbackTimer: ReturnType<typeof window.setTimeout> | null = null;
+let copyFeedbackTimer: number | null = null;
 
 const messageTypeLabel = computed(() => {
   switch (props.message?.kind) {
@@ -62,14 +63,7 @@ const authorLabel = computed(() => {
     return "Unknown";
   }
 
-  switch (props.message.author) {
-    case "me":
-      return "You";
-    case "peer":
-      return props.session?.kind === "direct" ? props.session.name : "Peer";
-    default:
-      return "System";
-  }
+  return resolveMessageAuthorLabel(props.session, props.message);
 });
 
 const deliveryLabel = computed(() => {

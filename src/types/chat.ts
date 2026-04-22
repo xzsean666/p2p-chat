@@ -69,6 +69,7 @@ export interface LoginCircleSelectionInput {
   inviteCode?: string;
   name?: string;
   relay?: string;
+  relays?: string[];
 }
 
 export interface LoginAccessInput {
@@ -113,6 +114,15 @@ export interface AuthRuntimeBindingSummary {
   clientName?: string;
   persistedInNativeStore: boolean;
   updatedAt: string;
+}
+
+export interface AuthRuntimeClientUriSummary {
+  uri: string;
+  publicKey: string;
+  relayCount: number;
+  relays: string[];
+  clientName: string;
+  storedAt: string;
 }
 
 export interface UpdateAuthRuntimeInput {
@@ -185,6 +195,9 @@ export interface MessageItem {
   id: string;
   kind: MessageKind;
   author: MessageAuthor;
+  authorName?: string;
+  authorContactId?: string;
+  authorInitials?: string;
   body: string;
   time: string;
   meta?: string;
@@ -237,6 +250,8 @@ export interface GroupProfile {
   description: string;
   members: GroupMember[];
   muted?: boolean;
+  canSend?: boolean;
+  needsJoin?: boolean;
 }
 
 export interface AppPreferences {

@@ -1,19 +1,24 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import Avatar from "primevue/avatar";
-import Button from "primevue/button";
+import jsQR from "jsqr";
+import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import InputText from "primevue/inputtext";
-import Tag from "primevue/tag";
 import OverlayPageShell from "./OverlayPageShell.vue";
-import { classifyChatQuery, isCircleQuery } from "../services/chatQueryIntents";
 import type { CircleItem, ContactItem } from "../types/chat";
 
-const props = defineProps<{
-  contacts: ContactItem[];
-  currentCircleContactIds: string[];
-  circle: CircleItem | null;
-  mode: "chat" | "join-circle";
-}>();
+const props = withDefaults(
+  defineProps<{
+    contacts: ContactItem[];
+    currentCircleContactIds: string[];
+    circle: CircleItem | null;
+    mode: "chat" | "join-circle";
+    submitting?: boolean;
+    submitError?: string | null;
+  }>(),
+  {
+    submitting: false,
+    submitError: null,
+  },
+);
 
 const emit = defineEmits<{
   (event: "close"): void;
@@ -24,299 +29,475 @@ const emit = defineEmits<{
 }>();
 
 const keyword = ref("");
-const pasteFeedback = ref<"" | "pasted" | "failed">("");
+const activePage = ref<"form" | "scanner">("form");
+const scannerBusy = ref(false);
+const scannerError = ref("");
+const scannerIssue = ref<"permission-denied" | "camera-unavailable" | "generic-error" | null>(null);
+const scannerVideo = ref<HTMLVideoElement | null>(null);
+const scannerImageInput = ref<HTMLInputElement | null>(null);
 
-const currentCircleContactSet = computed(() => new Set(props.currentCircleContactIds));
+let scannerStream: MediaStream | null = null;
+let scannerFrameHandle = 0;
+const scannerCanvas = typeof document !== "undefined" ? document.createElement("canvas") : null;
+const scannerContext = scannerCanvas?.getContext("2d", { willReadFrequently: true }) ?? null;
 
 const title = computed(() => {
-  return props.mode === "join-circle" ? "Join Circle" : "Add Friends to Chat";
+  if (activePage.value === "scanner") {
+    return "Scan QR Code";
+  }
+
+  return props.mode === "join-circle" ? "Join Circle" : "Add Friends";
 });
 
-const subtitle = computed(() => {
+const privacyNotice = computed(() => {
   return props.mode === "join-circle"
-    ? "Paste an invite link or relay endpoint to connect a new circle on desktop."
-    : props.circle
-      ? `Browse people around ${props.circle.name}`
-      : "Browse the available contact list.";
+    ? "Enter a circle invite link or scan the invite QR code to join a circle."
+    : "For privacy, users are hidden. You need an invite link or user ID to connect.";
 });
 
 const placeholder = computed(() => {
   return props.mode === "join-circle"
-    ? "Paste an invite link or relay endpoint"
-    : "Search by name, handle, pubkey or invite text";
+    ? "Enter circle invite link"
+    : "Enter Invite Link or User ID (npub...)";
 });
 
-const exactLocalMatch = computed(() => {
-  if (props.mode !== "chat") {
-    return null;
+const canSubmit = computed(() => !props.submitting && keyword.value.trim().length > 0);
+const showHeaderAction = computed(() => activePage.value === "form");
+const submitButtonLabel = computed(() => {
+  if (!props.submitting) {
+    return "Next";
   }
 
-  const normalized = keyword.value.trim().toLowerCase();
-  if (!normalized) {
-    return null;
+  return props.mode === "join-circle" ? "Joining..." : "Finding...";
+});
+const submitStatusMessage = computed(() => {
+  return props.mode === "join-circle" ? "Joining circle..." : "Looking up account...";
+});
+const submitErrorText = computed(() => props.submitError?.trim() ?? "");
+const scannerRecovery = computed(() => {
+  if (scannerIssue.value === "permission-denied") {
+    return {
+      title: "Camera access is turned off",
+      description:
+        "This app cannot start the scanner until camera access is allowed for this site or app.",
+      note: "Open your browser or device privacy settings, allow camera access here, then return and retry.",
+      steps: [
+        "Open the site or app permissions for camera access.",
+        "Switch camera access to Allow.",
+        "Come back here and choose Retry Camera.",
+      ],
+    };
   }
 
-  return (
-    props.contacts.find((contact) => {
-      return [contact.id, contact.name, contact.handle, contact.pubkey]
-        .map((value) => value.trim().toLowerCase())
-        .includes(normalized);
-    }) ?? null
-  );
+  if (scannerIssue.value === "camera-unavailable") {
+    return {
+      title: "Camera is unavailable",
+      description: "No usable camera is available in this browser or device context right now.",
+      note: "If another app is using the camera, close it first. Otherwise switch to a context that exposes camera access, or continue from a QR image.",
+      steps: [
+        "Make sure no other app is using the camera.",
+        "If this browser or device blocks camera access, switch to one that supports it.",
+        "Use Open QR Image if you already have the code saved.",
+      ],
+    };
+  }
+
+  return null;
 });
 
-const filteredContacts = computed(() => {
-  if (props.mode !== "chat") {
-    return [];
+const scannerMessage = computed(() => {
+  if (scannerBusy.value) {
+    return "Opening camera...";
   }
 
-  const value = keyword.value.trim().toLowerCase();
-  return props.contacts
-    .filter((contact) => {
-      if (!value) {
-        return true;
-      }
+  if (scannerError.value) {
+    return scannerError.value;
+  }
 
-      return [contact.name, contact.handle, contact.subtitle, contact.bio, contact.pubkey]
-        .join(" ")
-        .toLowerCase()
-        .includes(value);
-    })
-    .sort((left, right) => left.name.localeCompare(right.name));
+  return props.mode === "join-circle"
+    ? "Align the invite QR code inside the frame to join the circle."
+    : "Align the QR code inside the frame to add a friend.";
 });
 
-const groupedContacts = computed(() => {
-  const groups = new Map<string, ContactItem[]>();
-
-  filteredContacts.value.forEach((contact) => {
-    const key = contact.name.charAt(0).toUpperCase() || "#";
-    if (!groups.has(key)) {
-      groups.set(key, []);
-    }
-
-    groups.get(key)?.push(contact);
-  });
-
-  return Array.from(groups.entries()).map(([letter, items]) => ({ letter, items }));
-});
-
-const queryType = computed(() => {
-  const kind = classifyChatQuery(keyword.value);
-  if (!kind) {
-    return null;
+function submit() {
+  if (props.submitting) {
+    return;
   }
 
-  switch (kind) {
-    case "relay":
-      return "Relay";
-    case "invite":
-      return "Invite";
-    case "handle":
-      return "Handle";
-    case "pubkey":
-      return "Pubkey";
-    default:
-      return props.mode === "join-circle" ? "Join Link" : "Lookup";
-  }
-});
-
-const showLookupCard = computed(() => {
-  const value = keyword.value.trim();
-  if (!value) {
-    return false;
-  }
-
-  if (props.mode === "join-circle") {
-    return true;
-  }
-
-  return !exactLocalMatch.value;
-});
-
-const circleInputDetected = computed(() => {
-  if (props.mode === "join-circle") {
-    return true;
-  }
-
-  return isCircleQuery(keyword.value);
-});
-
-function contactMetaLine(contact: ContactItem) {
-  return contact.subtitle ? `${contact.handle} · ${contact.subtitle}` : contact.handle;
-}
-
-function submitJoinCircle() {
   const value = keyword.value.trim();
   if (!value) {
     return;
   }
 
-  emit("join-circle", value);
-}
-
-function submitContactLookup() {
-  const value = keyword.value.trim();
-  if (!value) {
+  if (props.mode === "join-circle") {
+    emit("join-circle", value);
     return;
   }
 
   emit("lookup-contact", value);
 }
 
-function submitLookup() {
-  if (props.mode === "join-circle" || circleInputDetected.value) {
-    submitJoinCircle();
+function resetScannerFrameLoop() {
+  if (scannerFrameHandle) {
+    window.cancelAnimationFrame(scannerFrameHandle);
+    scannerFrameHandle = 0;
+  }
+}
+
+function stopScannerStream() {
+  resetScannerFrameLoop();
+
+  if (scannerStream) {
+    scannerStream.getTracks().forEach((track) => track.stop());
+    scannerStream = null;
+  }
+
+  const video = scannerVideo.value;
+  if (video) {
+    video.pause();
+    video.srcObject = null;
+  }
+}
+
+function resetScannerStatus() {
+  scannerError.value = "";
+  scannerIssue.value = null;
+}
+
+function setScannerStatus(
+  message: string,
+  issue: "permission-denied" | "camera-unavailable" | "generic-error" | null = "generic-error",
+) {
+  scannerBusy.value = false;
+  scannerError.value = message;
+  scannerIssue.value = issue;
+}
+
+function closeScannerPage() {
+  stopScannerStream();
+  activePage.value = "form";
+  scannerBusy.value = false;
+  resetScannerStatus();
+}
+
+function applyScannedValue(value: string) {
+  const resolved = value.trim();
+  if (!resolved) {
+    setScannerStatus("The QR code did not contain a usable value.");
     return;
   }
 
-  submitContactLookup();
+  keyword.value = resolved;
+  closeScannerPage();
+  submit();
 }
 
-async function pasteFromClipboard() {
-  try {
-    const value = await navigator.clipboard.readText();
-    if (!value.trim()) {
-      pasteFeedback.value = "failed";
-    } else {
-      keyword.value = value.trim();
-      pasteFeedback.value = "pasted";
-    }
-  } catch {
-    pasteFeedback.value = "failed";
+function handleClose() {
+  if (activePage.value === "scanner") {
+    closeScannerPage();
+    return;
   }
 
-  window.setTimeout(() => {
-    pasteFeedback.value = "";
-  }, 1800);
+  emit("close");
 }
+
+function scheduleScannerFrame() {
+  resetScannerFrameLoop();
+  scannerFrameHandle = window.requestAnimationFrame(scanCameraFrame);
+}
+
+function scanCameraFrame() {
+  const video = scannerVideo.value;
+  if (activePage.value !== "scanner" || !video || !scannerCanvas || !scannerContext) {
+    return;
+  }
+
+  if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA || !video.videoWidth || !video.videoHeight) {
+    scheduleScannerFrame();
+    return;
+  }
+
+  if (scannerCanvas.width !== video.videoWidth || scannerCanvas.height !== video.videoHeight) {
+    scannerCanvas.width = video.videoWidth;
+    scannerCanvas.height = video.videoHeight;
+  }
+
+  scannerContext.drawImage(video, 0, 0, scannerCanvas.width, scannerCanvas.height);
+  const frame = scannerContext.getImageData(0, 0, scannerCanvas.width, scannerCanvas.height);
+  const result = jsQR(frame.data, frame.width, frame.height, {
+    inversionAttempts: "attemptBoth",
+  });
+
+  if (result?.data) {
+    applyScannedValue(result.data);
+    return;
+  }
+
+  scheduleScannerFrame();
+}
+
+async function startScannerCamera() {
+  stopScannerStream();
+  scannerBusy.value = true;
+  resetScannerStatus();
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setScannerStatus("Camera scanning is unavailable in this environment.", "camera-unavailable");
+    return;
+  }
+
+  try {
+    scannerStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "environment",
+      },
+      audio: false,
+    });
+  } catch (error) {
+    if (error instanceof DOMException) {
+      if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+        setScannerStatus("Camera access was denied.", "permission-denied");
+        return;
+      }
+
+      if (
+        error.name === "NotFoundError" ||
+        error.name === "NotReadableError" ||
+        error.name === "AbortError" ||
+        error.name === "OverconstrainedError"
+      ) {
+        setScannerStatus("Unable to access a usable camera right now.", "camera-unavailable");
+        return;
+      }
+    }
+
+    setScannerStatus("Unable to open the camera. Open a QR image instead.");
+    return;
+  }
+
+  await nextTick();
+
+  const video = scannerVideo.value;
+  if (!video) {
+    setScannerStatus("Camera preview could not be created.");
+    stopScannerStream();
+    return;
+  }
+
+  video.srcObject = scannerStream;
+
+  try {
+    await video.play();
+  } catch {
+    setScannerStatus("Camera preview could not start.", "camera-unavailable");
+    stopScannerStream();
+    return;
+  }
+
+  scannerBusy.value = false;
+  scheduleScannerFrame();
+}
+
+async function openScannerPage() {
+  if (props.submitting) {
+    return;
+  }
+
+  activePage.value = "scanner";
+  await nextTick();
+  await startScannerCamera();
+}
+
+function openScannerImagePicker() {
+  if (props.submitting) {
+    return;
+  }
+
+  scannerImageInput.value?.click();
+}
+
+function loadImage(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Image failed to load"));
+    image.src = url;
+  });
+}
+
+async function decodeQrImage(file: File) {
+  if (!scannerCanvas || !scannerContext) {
+    setScannerStatus("QR image decoding is unavailable in this environment.");
+    return;
+  }
+
+  scannerBusy.value = true;
+  resetScannerStatus();
+
+  try {
+    const imageUrl = URL.createObjectURL(file);
+    try {
+      const image = await loadImage(imageUrl);
+      scannerCanvas.width = image.naturalWidth || image.width;
+      scannerCanvas.height = image.naturalHeight || image.height;
+      scannerContext.drawImage(image, 0, 0, scannerCanvas.width, scannerCanvas.height);
+      const frame = scannerContext.getImageData(0, 0, scannerCanvas.width, scannerCanvas.height);
+      const result = jsQR(frame.data, frame.width, frame.height, {
+        inversionAttempts: "attemptBoth",
+      });
+
+      if (!result?.data) {
+        setScannerStatus("No QR code was found in that image.");
+        return;
+      }
+
+      applyScannedValue(result.data);
+    } finally {
+      URL.revokeObjectURL(imageUrl);
+    }
+  } catch {
+    setScannerStatus("That image could not be scanned. Try another QR image.");
+  } finally {
+    scannerBusy.value = false;
+  }
+}
+
+async function handleScannerImageSelected(event: Event) {
+  const input = event.target as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) {
+    return;
+  }
+
+  await decodeQrImage(file);
+  input.value = "";
+}
+
+onBeforeUnmount(() => {
+  stopScannerStream();
+});
 </script>
 
 <template>
-  <OverlayPageShell :title="title" :subtitle="subtitle" @close="emit('close')">
+  <OverlayPageShell :title="title" @close="handleClose">
+    <template v-if="showHeaderAction" #actions>
+      <button
+        type="button"
+        class="header-next-button"
+        :disabled="!canSubmit"
+        @click="submit"
+      >
+        <span class="header-next-content">
+          <i v-if="props.submitting" class="pi pi-spin pi-spinner"></i>
+          <span>{{ submitButtonLabel }}</span>
+        </span>
+      </button>
+    </template>
+
     <div class="find-page">
-      <section class="search-card">
-        <div class="search-field">
-          <i class="pi pi-search"></i>
+      <section v-if="activePage === 'form'" class="find-card">
+        <div class="find-input-wrap">
           <InputText
             v-model="keyword"
             :placeholder="placeholder"
-            @keydown.enter.prevent="submitLookup"
-          />
-          <Button
-            icon="pi pi-arrow-right"
-            rounded
-            text
-            severity="secondary"
-            :aria-label="mode === 'join-circle' || circleInputDetected ? 'Connect circle' : 'Run lookup'"
-            @click="submitLookup"
+            autocomplete="off"
+            :disabled="props.submitting"
+            @keydown.enter.prevent="submit"
           />
         </div>
 
-        <div class="tool-row">
-          <Button
-            icon="pi pi-copy"
-            label="Paste from Clipboard"
-            text
-            severity="secondary"
-            @click="pasteFromClipboard"
-          />
-          <Tag :value="mode === 'join-circle' || circleInputDetected ? 'Circle Import' : 'Lookup'" severity="contrast" rounded />
-        </div>
-        <p v-if="pasteFeedback === 'pasted'" class="feedback success">Clipboard value pasted into the field.</p>
-        <p v-else-if="pasteFeedback === 'failed'" class="feedback">Clipboard is unavailable or empty in this environment.</p>
+        <p class="find-notice">{{ privacyNotice }}</p>
+
+        <p v-if="props.submitting" class="find-feedback find-feedback-state find-feedback-info">
+          <i class="pi pi-spin pi-spinner"></i>
+          <span>{{ submitStatusMessage }}</span>
+        </p>
+        <p v-else-if="submitErrorText" class="find-feedback find-feedback-state find-feedback-error" role="alert">
+          <i class="pi pi-exclamation-circle"></i>
+          <span>{{ submitErrorText }}</span>
+        </p>
+
+        <button
+          type="button"
+          class="scan-qr-button"
+          :disabled="props.submitting"
+          @click="openScannerPage"
+        >
+          <i class="pi pi-qrcode"></i>
+          <span>Scan QR Code</span>
+        </button>
       </section>
 
-      <section v-if="showLookupCard" class="lookup-card">
-        <div class="lookup-copy">
-          <div class="lookup-head">
-            <strong>{{ queryType }} {{ mode === "join-circle" ? "Connect" : "Lookup" }}</strong>
-            <Tag :value="queryType || 'Input'" severity="contrast" rounded />
-          </div>
-          <p>{{ keyword.trim() }}</p>
-          <span>
-            {{
-              mode === "join-circle" || circleInputDetected
-                ? "This looks like a circle invite or relay address. The desktop flow will resolve it as a circle import by default."
-                : "This will create a local contact shell when no matching person already exists."
-            }}
-          </span>
-        </div>
-
-        <div class="lookup-actions">
-          <Button
-            :icon="mode === 'join-circle' || circleInputDetected ? 'pi pi-compass' : 'pi pi-send'"
-            :label="mode === 'join-circle' || circleInputDetected ? 'Join Circle' : 'Start from Lookup'"
-            severity="contrast"
-            @click="submitLookup"
-          />
-          <Button
-            v-if="mode === 'chat' && circleInputDetected"
-            icon="pi pi-user-plus"
-            label="Treat as Person Lookup"
-            text
-            severity="secondary"
-            @click="submitContactLookup"
-          />
-        </div>
-      </section>
-
-      <section v-if="mode === 'chat' && groupedContacts.length" class="grouped-list">
-        <div v-for="group in groupedContacts" :key="group.letter" class="letter-group">
-          <div class="group-letter">{{ group.letter }}</div>
-
-          <div class="group-list">
-            <div v-for="contact in group.items" :key="contact.id" class="contact-row">
-              <button type="button" class="contact-main" @click="emit('open-contact', contact.id)">
-                <Avatar :label="contact.initials" shape="circle" class="contact-avatar" />
-                <div class="contact-copy">
-                  <div class="contact-head">
-                    <strong>{{ contact.name }}</strong>
-                    <span v-if="contact.online" class="online-dot"></span>
-                  </div>
-                  <p>{{ contactMetaLine(contact) }}</p>
-                </div>
-              </button>
-
-              <div class="contact-actions">
-                <Tag
-                  :value="currentCircleContactSet.has(contact.id) ? 'In Circle' : 'Available'"
-                  :severity="currentCircleContactSet.has(contact.id) ? 'secondary' : 'contrast'"
-                  rounded
-                />
-                <Button
-                  icon="pi pi-send"
-                  rounded
-                  severity="contrast"
-                  aria-label="Start conversation"
-                  @click="emit('select-contact', contact.id)"
-                />
-              </div>
+      <section v-else class="scanner-page">
+        <div class="scanner-page-body">
+          <div class="scanner-preview">
+            <video ref="scannerVideo" class="scanner-video" autoplay muted playsinline></video>
+            <div class="scanner-frame" aria-hidden="true"></div>
+            <div v-if="scannerBusy || scannerError" class="scanner-overlay">
+              <i class="pi pi-camera scanner-overlay-icon" />
             </div>
           </div>
-        </div>
-      </section>
 
-      <section v-else-if="mode === 'chat'" class="empty-state">
-        <i class="pi pi-users"></i>
-        <h3>No Results</h3>
-        <p>Nothing matched your search. Try a shorter keyword or start directly from a handle, pubkey or invite-like text.</p>
-      </section>
+          <div v-if="scannerRecovery" class="scanner-recovery-card" role="alert">
+            <div class="scanner-recovery-header">
+              <div class="scanner-recovery-badge">
+                <i class="pi pi-cog scanner-recovery-badge-icon"></i>
+              </div>
+              <div class="scanner-recovery-copy">
+                <h3>{{ scannerRecovery.title }}</h3>
+                <p>{{ scannerRecovery.description }}</p>
+              </div>
+            </div>
 
-      <section v-else class="join-mode-card">
-        <div class="join-copy">
-          <h3>Join with invite or relay URL</h3>
-          <p>Use invite links for imported circles, or paste a `wss://` endpoint for a manual relay entry.</p>
-        </div>
+            <p class="scanner-recovery-note">
+              <i class="pi pi-sliders-h"></i>
+              <span>{{ scannerRecovery.note }}</span>
+            </p>
 
-        <div class="join-grid">
-          <div class="join-item">
-            <strong>Invite Links</strong>
-            <p>`p2pchat://...`, `invite://...` and other invite-like text will be treated as join flow input.</p>
+            <ol class="scanner-recovery-steps">
+              <li v-for="step in scannerRecovery.steps" :key="step">
+                {{ step }}
+              </li>
+            </ol>
+
+            <div class="scanner-page-actions scanner-page-actions-recovery">
+              <button type="button" class="scanner-link-button" @click="openScannerImagePicker">
+                Open QR Image
+              </button>
+              <button
+                type="button"
+                class="scanner-link-button"
+                :disabled="scannerBusy"
+                @click="startScannerCamera"
+              >
+                Retry Camera
+              </button>
+            </div>
           </div>
-          <div class="join-item">
-            <strong>Relay Endpoints</strong>
-            <p>`wss://relay.example.com` and compatible runtime URLs will be added as custom relay entries.</p>
+          <p v-else class="find-feedback scanner-feedback">{{ scannerMessage }}</p>
+
+          <div v-if="!scannerRecovery" class="scanner-page-actions">
+            <button type="button" class="scanner-link-button" @click="openScannerImagePicker">
+              Open QR Image
+            </button>
+            <button
+              v-if="scannerError"
+              type="button"
+              class="scanner-link-button"
+              :disabled="scannerBusy"
+              @click="startScannerCamera"
+            >
+              Retry Camera
+            </button>
           </div>
+
+          <input
+            ref="scannerImageInput"
+            type="file"
+            accept="image/*"
+            class="scanner-file-input"
+            @change="handleScannerImageSelected"
+          />
         </div>
       </section>
     </div>
@@ -324,211 +505,310 @@ async function pasteFromClipboard() {
 </template>
 
 <style scoped>
-.find-page,
-.search-card,
-.grouped-list,
-.letter-group,
-.group-list,
-.lookup-card,
-.lookup-copy,
-.join-mode-card,
-.join-grid,
-.join-item {
-  display: grid;
-}
-
 .find-page {
-  gap: 18px;
+  min-height: 100%;
+  display: grid;
+  align-content: start;
 }
 
-.search-card,
-.lookup-card,
-.join-mode-card {
-  padding: 18px;
-  border-radius: 24px;
-}
-
-.search-card,
-.join-mode-card {
-  background: #f8fbfd;
-}
-
-.lookup-card {
+.find-card {
+  width: min(560px, 100%);
+  margin: 0 auto;
+  display: grid;
   gap: 14px;
-  align-items: center;
-  background:
-    radial-gradient(circle at top left, rgba(106, 168, 255, 0.14), transparent 24%),
-    linear-gradient(180deg, #f7fbfe 0%, #f2f7fb 100%);
+  padding-top: 8px;
 }
 
-.search-field,
-.contact-row,
-.contact-main,
-.contact-head,
-.contact-actions,
-.lookup-head,
-.tool-row,
-.lookup-actions {
-  display: flex;
-  align-items: center;
+.scanner-page {
+  width: min(560px, 100%);
+  margin: 0 auto;
+  min-height: 100%;
 }
 
-.search-field {
-  gap: 10px;
-  padding: 0 14px;
-  border: 1px solid #d8e2ef;
-  border-radius: 16px;
-  background: #ffffff;
+.scanner-page-body {
+  display: grid;
+  gap: 16px;
+  padding-top: 8px;
 }
 
-.search-field i {
-  color: #7b8ca5;
-}
-
-.search-field :deep(.p-inputtext) {
-  width: 100%;
+.header-next-button,
+.scan-qr-button {
+  appearance: none;
   border: 0;
-  box-shadow: none;
   background: transparent;
-  padding-left: 0;
+  font: inherit;
 }
 
-.tool-row {
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 10px;
-}
-
-.lookup-actions {
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.feedback,
-.lookup-copy p,
-.lookup-copy span,
-.contact-copy p,
-.empty-state p,
-.join-copy p,
-.join-item p {
-  margin: 0;
-  color: #6d809a;
-}
-
-.feedback.success {
-  color: #2d7a53;
-}
-
-.lookup-copy {
+.header-next-content,
+.find-feedback-state {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
 }
 
-.lookup-head {
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.lookup-copy strong,
-.lookup-copy p,
-.lookup-copy span,
-.contact-copy strong,
-.contact-copy p,
-.empty-state h3,
-.empty-state p,
-.join-copy h3,
-.join-copy p,
-.join-item strong,
-.join-item p {
-  margin: 0;
-}
-
-.grouped-list,
-.letter-group,
-.group-list,
-.join-grid {
-  gap: 10px;
-}
-
-.group-letter {
-  color: #6a7d98;
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
-  font-size: 0.72rem;
-}
-
-.contact-row {
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px;
-  border-radius: 20px;
-  background: #f7fafc;
-}
-
-.contact-main {
-  flex: 1;
-  gap: 12px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  text-align: left;
+.header-next-button {
+  padding: 6px 8px;
+  color: #2d74dd;
+  font-size: 0.96rem;
+  font-weight: 600;
   cursor: pointer;
 }
 
-.contact-avatar {
-  width: 42px;
-  height: 42px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
-  font-weight: 700;
+.header-next-button:disabled {
+  color: #a9b4c2;
+  cursor: default;
 }
 
-.contact-copy strong,
-.contact-copy p {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.contact-head {
-  gap: 8px;
-}
-
-.online-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: #35c98d;
-}
-
-.contact-actions {
-  gap: 8px;
-}
-
-.empty-state,
-.join-item {
-  padding: 18px;
-  border-radius: 20px;
+.find-input-wrap :deep(.p-inputtext) {
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: 15px;
+  border: 1px solid #d9e1eb;
   background: #ffffff;
+  box-shadow: none;
+  color: #132032;
+  font-size: 0.97rem;
 }
 
-.empty-state {
-  display: grid;
-  justify-items: center;
-  gap: 12px;
+.find-input-wrap :deep(.p-inputtext:enabled:focus) {
+  border-color: #88afe8;
+  box-shadow: 0 0 0 3px rgba(64, 118, 214, 0.12);
+}
+
+.find-notice,
+.find-feedback {
+  margin: 0;
+  color: #6f7d90;
+  line-height: 1.55;
+}
+
+.find-notice {
+  font-size: 0.93rem;
+}
+
+.find-feedback {
+  font-size: 0.88rem;
+}
+
+.find-feedback-state {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #f6f9fc;
+}
+
+.find-feedback-info {
+  color: #54708d;
+}
+
+.find-feedback-error {
+  color: #b3464b;
+  background: #fff3f3;
+}
+
+.scanner-feedback {
   text-align: center;
 }
 
-.empty-state i {
-  font-size: 2rem;
-  color: #7d8ea6;
-}
-
-.join-mode-card {
+.scanner-recovery-card {
+  display: grid;
   gap: 14px;
+  padding: 18px;
+  border: 1px solid #d7e0eb;
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(241, 246, 252, 0.98) 100%);
+  box-shadow: 0 12px 28px rgba(16, 29, 48, 0.08);
 }
 
-.join-copy,
-.join-item {
+.scanner-recovery-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.scanner-recovery-badge {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: #ffffff;
+  box-shadow: inset 0 0 0 1px #d7e1ee;
+}
+
+.scanner-recovery-badge-icon {
+  color: #2d74dd;
+  font-size: 1rem;
+}
+
+.scanner-recovery-copy {
+  display: grid;
   gap: 6px;
+}
+
+.scanner-recovery-copy h3,
+.scanner-recovery-copy p,
+.scanner-recovery-note,
+.scanner-recovery-steps {
+  margin: 0;
+}
+
+.scanner-recovery-copy h3 {
+  color: #172334;
+  font-size: 1rem;
+}
+
+.scanner-recovery-copy p {
+  color: #5d6f86;
+  line-height: 1.55;
+}
+
+.scanner-recovery-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #50637c;
+  line-height: 1.5;
+}
+
+.scanner-recovery-steps {
+  padding-left: 20px;
+  color: #4c5d74;
+  line-height: 1.5;
+}
+
+.scanner-recovery-steps li + li {
+  margin-top: 8px;
+}
+
+.scan-qr-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 15px 18px;
+  border: 1px solid #d8e0ea;
+  border-radius: 16px;
+  background: #f8fafc;
+  color: #172334;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    transform 140ms ease;
+}
+
+.scan-qr-button:hover {
+  border-color: #c4cfdd;
+  background: #f2f6fb;
+}
+
+.scan-qr-button:active {
+  transform: translateY(1px);
+}
+
+.scan-qr-button i {
+  font-size: 1.2rem;
+  color: #2d74dd;
+}
+
+.scan-qr-button:disabled {
+  border-color: #e2e8f0;
+  background: #f8fafc;
+  color: #9aa8bb;
+  cursor: default;
+  transform: none;
+}
+
+.scan-qr-button:disabled i {
+  color: #9aa8bb;
+}
+
+.scanner-preview {
+  position: relative;
+  overflow: hidden;
+  aspect-ratio: 1 / 1;
+  border-radius: 22px;
+  background: linear-gradient(180deg, #132033 0%, #223752 100%);
+  box-shadow: inset 0 0 0 1px rgba(168, 185, 210, 0.26);
+}
+
+.scanner-video,
+.scanner-overlay {
+  position: absolute;
+  inset: 0;
+}
+
+.scanner-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.scanner-overlay {
+  display: grid;
+  place-items: center;
+  background: rgba(10, 19, 33, 0.45);
+}
+
+.scanner-overlay-icon {
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 1.8rem;
+}
+
+.scanner-frame {
+  position: absolute;
+  inset: 14%;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  border-radius: 22px;
+  box-shadow: 0 0 0 999px rgba(8, 15, 26, 0.18);
+}
+
+.scanner-page-actions {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.scanner-page-actions-recovery {
+  justify-content: flex-start;
+}
+
+.scanner-link-button {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2d74dd;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.scanner-link-button:disabled {
+  color: #a9b4c2;
+  cursor: default;
+}
+
+.scanner-file-input {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .find-card {
+    width: 100%;
+    padding-top: 0;
+  }
+
+  .scanner-page {
+    width: 100%;
+  }
 }
 </style>

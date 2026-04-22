@@ -1,6 +1,6 @@
 use crate::app::auth_access;
 use crate::domain::chat::{
-    AuthRuntimeBindingSummary, AuthRuntimeState, AuthRuntimeSummary, AuthSessionSummary,
+    AuthRuntimeBindingSummary, AuthRuntimeClientUriSummary, AuthRuntimeState, AuthRuntimeSummary, AuthSessionSummary,
     ChatDomainSeed, LoginAccessInput, LoginAccessKind, LoginMethod, PersistedShellState,
     ShellStateSnapshot, SignedNostrEvent, UpdateAuthRuntimeInput,
 };
@@ -8,21 +8,30 @@ use crate::infra::auth_runtime_binding_store::{self, StoredAuthRuntimeBinding};
 use crate::infra::auth_runtime_client_store::{self, StoredAuthRuntimeClient};
 use crate::infra::auth_runtime_credential_store::{self, StoredAuthRuntimeCredential};
 use crate::infra::auth_runtime_state_store::{self, StoredAuthRuntimeState};
+use crate::infra::pending_auth_runtime_client_store::{self, StoredPendingAuthRuntimeClient};
 use crate::infra::shell_state_store;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use nostr_connect::prelude::{
     Event as NostrEvent, EventBuilder as NostrEventBuilder, JsonUtil, Keys as NostrKeys,
     Kind as NostrKind, NostrConnect, NostrConnectURI, NostrSigner, PublicKey as NostrPublicKey,
-    Tag as NostrTag, Timestamp as NostrTimestamp, ToBech32,
+    RelayUrl, Tag as NostrTag, Timestamp as NostrTimestamp, ToBech32,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::time::Duration;
+use url::Url;
 
 const REMOTE_SIGNER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+const PENDING_REMOTE_SIGNER_PAIRING_TIMEOUT: Duration = Duration::from_secs(20);
 const BLOSSOM_UPLOAD_AUTH_EXPIRATION_WINDOW: Duration = Duration::from_secs(10 * 60);
+const STANDARD_NOSTRCONNECT_CLIENT_NAME: &str = "XChat Desktop";
+const DEFAULT_PENDING_NOSTRCONNECT_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+];
 
 pub fn deserialize_shell_state_snapshot(value: Value) -> Option<ShellStateSnapshot> {
     serde_json::from_value::<ShellStateSnapshot>(value.clone())
@@ -116,6 +125,107 @@ pub fn clear_auth_runtime_client<R: tauri::Runtime>(
     auth_runtime_client_store::clear(app_handle)
 }
 
+pub fn load_pending_standard_nostrconnect_client_uri<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<AuthRuntimeClientUriSummary, String> {
+    let client = load_or_create_pending_auth_runtime_client(app_handle)?;
+    build_standard_nostrconnect_client_uri_summary(
+        &client.public_key,
+        &client.secret_key_hex,
+        &client.relays,
+        &client.client_name,
+        &client.stored_at,
+        "pending remote signer client",
+    )
+}
+
+pub fn await_pending_standard_nostrconnect_client_pairing<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<String, String> {
+    let stored_client = load_or_create_pending_auth_runtime_client(app_handle)?;
+
+    if let Some(existing_bunker_uri) = normalized_non_empty(stored_client.paired_bunker_uri.as_deref()) {
+        let existing_uri = NostrConnectURI::parse(existing_bunker_uri)
+            .map_err(|error| format!("Stored paired bunker URI is invalid: {error}"))?;
+        if existing_uri.is_bunker() {
+            return Ok(existing_uri.to_string());
+        }
+    }
+
+    let client_keys = pending_auth_runtime_client_keys(&stored_client)?;
+    let client_uri = build_standard_nostrconnect_client_uri_summary(
+        &stored_client.public_key,
+        &stored_client.secret_key_hex,
+        &stored_client.relays,
+        &stored_client.client_name,
+        &stored_client.stored_at,
+        "pending remote signer client",
+    )?
+    .uri;
+    let client_uri = NostrConnectURI::parse(&client_uri)
+        .map_err(|error| format!("Generated pending client URI is invalid: {error}"))?;
+
+    let paired_bunker_uri = block_on_remote_auth_runtime(async move {
+        let connect = NostrConnect::new(
+            client_uri,
+            client_keys,
+            PENDING_REMOTE_SIGNER_PAIRING_TIMEOUT,
+            None,
+        )
+        .map_err(|error| format!("failed to initialize pending signer pairing client: {error}"))?;
+        let user_pubkey = connect
+            .get_public_key()
+            .await
+            .map_err(|error| format!("Remote signer pairing failed: {error}"));
+
+        let bunker_uri = if user_pubkey.is_ok() {
+            connect
+                .bunker_uri()
+                .await
+                .map_err(|error| format!("failed to derive bunker URI after signer pairing: {error}"))
+        } else {
+            Err("Remote signer pairing did not complete.".into())
+        };
+        connect.shutdown().await;
+
+        let _ = user_pubkey?;
+        Ok(bunker_uri?.to_string())
+    })?;
+
+    pending_auth_runtime_client_store::save(
+        app_handle,
+        &StoredPendingAuthRuntimeClient {
+            paired_bunker_uri: Some(paired_bunker_uri.clone()),
+            ..stored_client
+        },
+    )?;
+
+    Ok(paired_bunker_uri)
+}
+
+pub fn build_standard_nostrconnect_client_uri<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+) -> Result<AuthRuntimeClientUriSummary, String> {
+    let binding = auth_runtime_binding_store::load(app_handle)?
+        .filter(|binding| stored_auth_runtime_binding_matches_session(binding, auth_session))
+        .ok_or_else(missing_remote_auth_runtime_binding_error)?;
+    let client = load_or_create_auth_runtime_client(app_handle, auth_session)?;
+    let relays = remote_signer_binding_relays(&binding)?
+        .into_iter()
+        .map(|relay| relay.to_string())
+        .collect::<Vec<_>>();
+
+    build_standard_nostrconnect_client_uri_summary(
+        &client.public_key,
+        &client.secret_key_hex,
+        &relays,
+        STANDARD_NOSTRCONNECT_CLIENT_NAME,
+        &client.stored_at,
+        "stored auth runtime client",
+    )
+}
+
 pub fn sign_remote_auth_runtime_text_note<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     auth_session: &AuthSessionSummary,
@@ -136,7 +246,14 @@ pub fn sign_remote_auth_runtime_text_note<R: tauri::Runtime>(
             created_at,
             tags,
         ),
-        LoginAccessKind::NostrConnect => Err(unsupported_nostrconnect_client_uri_error()),
+        LoginAccessKind::NostrConnect => sign_remote_nostrconnect_auth_runtime_text_note(
+            app_handle,
+            auth_session,
+            &binding,
+            content,
+            created_at,
+            tags,
+        ),
         _ => Err("Stored remote signer binding is not supported.".into()),
     };
 
@@ -251,10 +368,7 @@ pub fn derive_auth_runtime_from_session(auth_session: &AuthSessionSummary) -> Au
             ),
             LoginAccessKind::Bunker => (
                 AuthRuntimeState::Pending,
-                Some(
-                    "Remote bunker handoff is stored, but signer handshake is not implemented yet."
-                        .into(),
-                ),
+                Some("Remote signer handoff is stored and waiting for a signer handshake.".into()),
             ),
             LoginAccessKind::LocalProfile | LoginAccessKind::NostrConnect => (
                 AuthRuntimeState::Failed,
@@ -264,7 +378,7 @@ pub fn derive_auth_runtime_from_session(auth_session: &AuthSessionSummary) -> Au
         LoginMethod::Signer => match auth_session.access.kind {
             LoginAccessKind::Bunker | LoginAccessKind::NostrConnect => (
                 AuthRuntimeState::Pending,
-                Some("Remote signer handshake is not implemented yet.".into()),
+                Some("Remote signer handshake is pending.".into()),
             ),
             LoginAccessKind::LocalProfile
             | LoginAccessKind::Nsec
@@ -415,7 +529,11 @@ pub fn persist_auth_runtime_binding<R: tauri::Runtime>(
         auth_runtime_binding_store::clear(app_handle)?;
         return Ok(None);
     };
-    auth_runtime_client_store::clear(app_handle)?;
+    let claimed_pending_client =
+        claim_pending_auth_runtime_client(app_handle, auth_session, access)?;
+    if !claimed_pending_client {
+        auth_runtime_client_store::clear(app_handle)?;
+    }
     let raw_value = normalized_non_empty(access.value.as_deref())
         .expect("resolved auth runtime binding should keep its raw input");
 
@@ -608,7 +726,7 @@ fn default_auth_runtime_error(
         AuthRuntimeState::LocalProfile | AuthRuntimeState::Connected => None,
         AuthRuntimeState::Pending => Some(match auth_session.access.kind {
             LoginAccessKind::Bunker | LoginAccessKind::NostrConnect => {
-                "Remote signer handshake is not implemented yet.".into()
+                "Remote signer handshake is pending.".into()
             }
             _ => "Account runtime is still waiting for a signer handshake.".into(),
         }),
@@ -858,19 +976,13 @@ fn missing_remote_auth_runtime_binding_error() -> String {
 }
 
 fn default_send_blocked_reason_for_state(
-    access_kind: &LoginAccessKind,
+    _access_kind: &LoginAccessKind,
     state: AuthRuntimeState,
     error: Option<&str>,
 ) -> Option<String> {
     match state {
         AuthRuntimeState::LocalProfile => None,
-        AuthRuntimeState::Connected => {
-            if remote_signer_send_support_is_missing(access_kind) {
-                Some(remote_signer_send_support_missing_error())
-            } else {
-                None
-            }
-        }
+        AuthRuntimeState::Connected => None,
         AuthRuntimeState::Pending => Some(
             normalized_non_empty(error)
                 .map(ToOwned::to_owned)
@@ -884,15 +996,6 @@ fn default_send_blocked_reason_for_state(
                 .unwrap_or_else(|| "This account runtime cannot send messages yet.".into()),
         ),
     }
-}
-
-fn remote_signer_send_support_is_missing(access_kind: &LoginAccessKind) -> bool {
-    matches!(access_kind, LoginAccessKind::NostrConnect)
-}
-
-fn remote_signer_send_support_missing_error() -> String {
-    "Remote signer is connected, but message send still requires remote event-signing support."
-        .into()
 }
 
 fn normalized_non_empty(value: Option<&str>) -> Option<&str> {
@@ -1040,7 +1143,9 @@ fn handshake_remote_auth_runtime_binding<R: tauri::Runtime>(
         LoginAccessKind::Bunker => {
             handshake_remote_bunker_auth_runtime_binding(app_handle, auth_session, binding)
         }
-        LoginAccessKind::NostrConnect => Err(unsupported_nostrconnect_client_uri_error()),
+        LoginAccessKind::NostrConnect => {
+            handshake_remote_nostrconnect_auth_runtime_binding(app_handle, auth_session, binding)
+        }
         _ => Err("Stored remote signer binding is not supported.".into()),
     }
 }
@@ -1072,6 +1177,35 @@ fn handshake_remote_bunker_auth_runtime_binding<R: tauri::Runtime>(
         user_pubkey
             .to_bech32()
             .map_err(|error| format!("failed to encode remote bunker pubkey: {error}"))
+    })?;
+
+    Ok(RemoteAuthRuntimeHandshake {
+        user_pubkey: Some(user_pubkey),
+    })
+}
+
+fn handshake_remote_nostrconnect_auth_runtime_binding<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+    binding: &StoredAuthRuntimeBinding,
+) -> Result<RemoteAuthRuntimeHandshake, String> {
+    let client = load_or_create_auth_runtime_client(app_handle, auth_session)?;
+    let client_keys = auth_runtime_client_keys(&client)?;
+    let uri = legacy_nostrconnect_binding_as_bunker_uri(binding)?;
+
+    let user_pubkey = block_on_remote_auth_runtime(async move {
+        let connect = NostrConnect::new(uri, client_keys, REMOTE_SIGNER_HANDSHAKE_TIMEOUT, None)
+            .map_err(|error| format!("failed to initialize nostrConnect handshake: {error}"))?;
+        let user_pubkey = connect
+            .get_public_key()
+            .await
+            .map_err(|error| format!("Remote nostrConnect handshake failed: {error}"));
+        connect.shutdown().await;
+
+        let user_pubkey = user_pubkey?;
+        user_pubkey
+            .to_bech32()
+            .map_err(|error| format!("failed to encode remote nostrConnect pubkey: {error}"))
     })?;
 
     Ok(RemoteAuthRuntimeHandshake {
@@ -1139,7 +1273,13 @@ fn build_remote_auth_runtime_authorization_header<R: tauri::Runtime>(
             builder,
             auth_label,
         ),
-        LoginAccessKind::NostrConnect => Err(unsupported_nostrconnect_client_uri_error()),
+        LoginAccessKind::NostrConnect => build_remote_nostrconnect_auth_runtime_authorization_header(
+            app_handle,
+            auth_session,
+            binding,
+            builder,
+            auth_label,
+        ),
         _ => Err("Stored remote signer binding is not supported.".into()),
     };
 
@@ -1201,6 +1341,35 @@ fn sign_remote_bunker_auth_runtime_text_note<R: tauri::Runtime>(
     })
 }
 
+fn sign_remote_nostrconnect_auth_runtime_text_note<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+    binding: &StoredAuthRuntimeBinding,
+    content: &str,
+    created_at: u64,
+    tags: &[Vec<String>],
+) -> Result<SignedNostrEvent, String> {
+    let client = load_or_create_auth_runtime_client(app_handle, auth_session)?;
+    let client_keys = auth_runtime_client_keys(&client)?;
+    let uri = legacy_nostrconnect_binding_as_bunker_uri(binding)?;
+
+    let content = content.to_string();
+    let tags = nostr_text_note_public_key_tags(tags);
+    block_on_remote_auth_runtime(async move {
+        let connect = NostrConnect::new(uri, client_keys, REMOTE_SIGNER_HANDSHAKE_TIMEOUT, None)
+            .map_err(|error| format!("failed to initialize nostrConnect signer client: {error}"))?;
+        let signed_event = NostrEventBuilder::text_note(content)
+            .tags(tags)
+            .custom_created_at(NostrTimestamp::from_secs(created_at))
+            .sign(&connect)
+            .await
+            .map_err(|error| format!("Remote nostrConnect sign_event failed: {error}"));
+        connect.shutdown().await;
+
+        Ok(build_signed_nostr_event_from_remote_event(signed_event?))
+    })
+}
+
 fn build_remote_bunker_auth_runtime_authorization_header<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     auth_session: &AuthSessionSummary,
@@ -1232,11 +1401,67 @@ fn build_remote_bunker_auth_runtime_authorization_header<R: tauri::Runtime>(
     })
 }
 
+fn build_remote_nostrconnect_auth_runtime_authorization_header<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+    binding: &StoredAuthRuntimeBinding,
+    builder: NostrEventBuilder,
+    auth_label: &str,
+) -> Result<String, String> {
+    let client = load_or_create_auth_runtime_client(app_handle, auth_session)?;
+    let client_keys = auth_runtime_client_keys(&client)?;
+    let uri = legacy_nostrconnect_binding_as_bunker_uri(binding)?;
+
+    block_on_remote_auth_runtime(async move {
+        let connect = NostrConnect::new(uri, client_keys, REMOTE_SIGNER_HANDSHAKE_TIMEOUT, None)
+            .map_err(|error| {
+                format!("failed to initialize nostrConnect {auth_label} auth client: {error}")
+            })?;
+        let signed_event = builder
+            .sign(&connect)
+            .await
+            .map_err(|error| format!("Remote nostrConnect {auth_label} auth failed: {error}"));
+        connect.shutdown().await;
+
+        Ok(encode_nip98_http_authorization(&signed_event?))
+    })
+}
+
 fn block_on_remote_auth_runtime<F, T>(future: F) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
 {
     tauri::async_runtime::block_on(future)
+}
+
+fn build_standard_nostrconnect_client_uri_summary(
+    public_key: &str,
+    secret_key_hex: &str,
+    relays: &[String],
+    client_name: &str,
+    stored_at: &str,
+    client_label: &str,
+) -> Result<AuthRuntimeClientUriSummary, String> {
+    let client_keys = nostr_client_keys_from_keypair(public_key, secret_key_hex, client_label)?;
+    let relay_urls = parse_nostrconnect_client_relays(relays, client_label)?;
+    let uri = NostrConnectURI::client(
+        client_keys.public_key(),
+        relay_urls.iter().cloned(),
+        client_name,
+    )
+    .to_string();
+
+    Ok(AuthRuntimeClientUriSummary {
+        uri,
+        public_key: public_key.to_string(),
+        relay_count: relay_urls.len() as u32,
+        relays: relay_urls
+            .into_iter()
+            .map(|relay| relay.to_string())
+            .collect(),
+        client_name: client_name.to_string(),
+        stored_at: stored_at.to_string(),
+    })
 }
 
 fn load_or_create_auth_runtime_client<R: tauri::Runtime>(
@@ -1263,15 +1488,199 @@ fn load_or_create_auth_runtime_client<R: tauri::Runtime>(
 }
 
 fn auth_runtime_client_keys(client: &StoredAuthRuntimeClient) -> Result<NostrKeys, String> {
-    let client_keys = NostrKeys::parse(&client.secret_key_hex)
-        .map_err(|error| format!("Stored remote signer client secret is invalid: {error}"))?;
-    if client_keys.public_key().to_hex() != client.public_key {
-        return Err(
-            "Stored remote signer client keypair does not match its persisted public key.".into(),
-        );
+    nostr_client_keys_from_keypair(
+        &client.public_key,
+        &client.secret_key_hex,
+        "stored remote signer client",
+    )
+}
+
+fn load_or_create_pending_auth_runtime_client<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<StoredPendingAuthRuntimeClient, String> {
+    if let Some(stored_client) = pending_auth_runtime_client_store::load(app_handle)? {
+        if pending_auth_runtime_client_keys(&stored_client).is_ok()
+            && parse_nostrconnect_client_relays(&stored_client.relays, "pending remote signer client").is_ok()
+            && normalized_non_empty(Some(stored_client.client_name.as_str())).is_some()
+        {
+            return Ok(stored_client);
+        }
+
+        pending_auth_runtime_client_store::clear(app_handle)?;
+    }
+
+    let client_keys = NostrKeys::generate();
+    let stored_client = StoredPendingAuthRuntimeClient {
+        public_key: client_keys.public_key().to_hex(),
+        secret_key_hex: client_keys.secret_key().to_secret_hex(),
+        relays: DEFAULT_PENDING_NOSTRCONNECT_RELAYS
+            .iter()
+            .map(|relay| (*relay).to_string())
+            .collect(),
+        client_name: STANDARD_NOSTRCONNECT_CLIENT_NAME.into(),
+        stored_at: current_auth_runtime_timestamp(),
+        paired_bunker_uri: None,
+    };
+    pending_auth_runtime_client_store::save(app_handle, &stored_client)?;
+    Ok(stored_client)
+}
+
+fn pending_auth_runtime_client_keys(
+    client: &StoredPendingAuthRuntimeClient,
+) -> Result<NostrKeys, String> {
+    nostr_client_keys_from_keypair(
+        &client.public_key,
+        &client.secret_key_hex,
+        "pending remote signer client",
+    )
+}
+
+fn nostr_client_keys_from_keypair(
+    public_key: &str,
+    secret_key_hex: &str,
+    client_label: &str,
+) -> Result<NostrKeys, String> {
+    let client_keys = NostrKeys::parse(secret_key_hex)
+        .map_err(|error| format!("{client_label} secret key is invalid: {error}"))?;
+    if client_keys.public_key().to_hex() != public_key {
+        return Err(format!(
+            "{client_label} keypair does not match its persisted public key."
+        ));
     }
 
     Ok(client_keys)
+}
+
+fn parse_nostrconnect_client_relays(
+    relays: &[String],
+    client_label: &str,
+) -> Result<Vec<RelayUrl>, String> {
+    let relay_urls = relays
+        .iter()
+        .map(String::as_str)
+        .filter_map(|relay| normalized_non_empty(Some(relay)))
+        .map(|relay| {
+            RelayUrl::parse(relay)
+                .map_err(|error| format!("{client_label} relay `{relay}` is invalid: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if relay_urls.is_empty() {
+        return Err(format!("{client_label} is missing relay parameters."));
+    }
+
+    Ok(relay_urls)
+}
+
+fn claim_pending_auth_runtime_client<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+    access: &LoginAccessInput,
+) -> Result<bool, String> {
+    if !matches!(access.kind, LoginAccessKind::Bunker) {
+        return Ok(false);
+    }
+
+    let Some(stored_client) = pending_auth_runtime_client_store::load(app_handle)? else {
+        return Ok(false);
+    };
+    let Some(expected_bunker_uri) = normalized_non_empty(stored_client.paired_bunker_uri.as_deref()) else {
+        return Ok(false);
+    };
+    let Some(provided_bunker_uri) = normalized_non_empty(access.value.as_deref()) else {
+        return Ok(false);
+    };
+    if expected_bunker_uri != provided_bunker_uri {
+        return Ok(false);
+    }
+
+    let client_keys = match pending_auth_runtime_client_keys(&stored_client) {
+        Ok(client_keys) => client_keys,
+        Err(_) => {
+            pending_auth_runtime_client_store::clear(app_handle)?;
+            return Ok(false);
+        }
+    };
+
+    let claimed_client = StoredAuthRuntimeClient {
+        login_method: auth_session.login_method.clone(),
+        access_kind: auth_session.access.kind.clone(),
+        public_key: client_keys.public_key().to_hex(),
+        secret_key_hex: client_keys.secret_key().to_secret_hex(),
+        stored_at: auth_session.logged_in_at.clone(),
+    };
+    auth_runtime_client_store::save(app_handle, &claimed_client)?;
+    pending_auth_runtime_client_store::clear(app_handle)?;
+
+    Ok(true)
+}
+
+fn legacy_nostrconnect_binding_as_bunker_uri(
+    binding: &StoredAuthRuntimeBinding,
+) -> Result<NostrConnectURI, String> {
+    let source = Url::parse(&binding.value)
+        .map_err(|error| format!("Stored nostrConnect URI is invalid: {error}"))?;
+    if !source.scheme().eq_ignore_ascii_case("nostrconnect") {
+        return Err("Stored remote signer binding is not a nostrConnect URI.".into());
+    }
+
+    let remote_signer_public_key = source
+        .host_str()
+        .ok_or_else(|| "Stored nostrConnect URI is missing a remote signer pubkey.".to_string())?;
+    let mut bunker_url = Url::parse(&format!("bunker://{remote_signer_public_key}"))
+        .map_err(|error| format!("failed to derive bunker URI from nostrConnect binding: {error}"))?;
+    let mut relay_count = 0usize;
+    let mut secret = None::<String>;
+
+    for (name, value) in source.query_pairs() {
+        let key = name.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        if key.eq_ignore_ascii_case("relay") {
+            bunker_url.query_pairs_mut().append_pair("relay", value);
+            relay_count += 1;
+        } else if key.eq_ignore_ascii_case("secret") && secret.is_none() {
+            secret = Some(value.to_string());
+        }
+    }
+
+    if relay_count == 0 {
+        return Err("Stored nostrConnect URI is missing relay parameters.".into());
+    }
+
+    let secret =
+        secret.ok_or_else(|| "Stored nostrConnect URI is missing the shared secret.".to_string())?;
+    bunker_url.query_pairs_mut().append_pair("secret", &secret);
+
+    NostrConnectURI::parse(bunker_url.as_str()).map_err(|error| {
+        format!("Derived bunker URI from nostrConnect binding is invalid: {error}")
+    })
+}
+
+fn remote_signer_binding_relays(
+    binding: &StoredAuthRuntimeBinding,
+) -> Result<Vec<RelayUrl>, String> {
+    let uri = match binding.access_kind {
+        LoginAccessKind::Bunker => {
+            let uri = NostrConnectURI::parse(&binding.value)
+                .map_err(|error| format!("Stored bunker URI is invalid: {error}"))?;
+            if !uri.is_bunker() {
+                return Err("Stored remote signer binding is not a bunker URI.".into());
+            }
+            uri
+        }
+        LoginAccessKind::NostrConnect => legacy_nostrconnect_binding_as_bunker_uri(binding)?,
+        _ => return Err("Stored remote signer binding is not supported.".into()),
+    };
+
+    let relays = uri.relays().to_vec();
+    if relays.is_empty() {
+        return Err("Stored remote signer binding is missing relay parameters.".into());
+    }
+
+    Ok(relays)
 }
 
 fn build_signed_nostr_event_from_remote_event(event: NostrEvent) -> SignedNostrEvent {
@@ -1336,10 +1745,6 @@ fn nostr_text_note_public_key_tags(tags: &[Vec<String>]) -> Vec<NostrTag> {
                 .map(NostrTag::public_key)
         })
         .collect()
-}
-
-fn unsupported_nostrconnect_client_uri_error() -> String {
-    "Pasted nostrConnect client URIs are not supported yet; use a bunker:// handoff until desktop-generated client URIs are implemented.".into()
 }
 
 fn same_auth_runtime_state(left: &AuthRuntimeState, right: &AuthRuntimeState) -> bool {

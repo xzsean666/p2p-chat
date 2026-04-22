@@ -5,6 +5,7 @@ import {
 } from "../data/shellDefaults";
 import { loadLocalShellState, persistShellStateLocally } from "./shellState";
 import type {
+  AuthRuntimeClientUriSummary,
   ChatDomainOverview,
   ChatSessionMessageUpdates,
   ChatSessionMessagesPage,
@@ -109,6 +110,20 @@ export async function updateAuthRuntime(
   return invokeDesktopShellCommand<ShellStateSnapshot>("update_auth_runtime", {
     input: cloneState(input),
   });
+}
+
+export async function loadAuthRuntimeClientUri(): Promise<AuthRuntimeClientUriSummary | null> {
+  return invokeDesktopShellCommand<AuthRuntimeClientUriSummary>("load_auth_runtime_client_uri");
+}
+
+export async function loadPendingAuthRuntimeClientUri(): Promise<AuthRuntimeClientUriSummary | null> {
+  return invokeDesktopShellCommand<AuthRuntimeClientUriSummary>(
+    "load_pending_auth_runtime_client_uri",
+  );
+}
+
+export async function awaitPendingAuthRuntimeClientPairing(): Promise<string | null> {
+  return invokeDesktopShellCommand<string>("await_pending_auth_runtime_client_pairing");
 }
 
 function loadSessionMessagesFallback(

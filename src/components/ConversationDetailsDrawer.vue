@@ -40,6 +40,10 @@ const titleText = computed(() => {
     return "Group Info";
   }
 
+  if (isSelf.value) {
+    return "Chat Info";
+  }
+
   return "User Detail";
 });
 </script>
@@ -74,7 +78,7 @@ const titleText = computed(() => {
             <span class="pubkey">{{ contact.pubkey }}</span>
           </template>
           <template v-else>
-            <span>Private note space</span>
+            <span>Notes, links and files for this circle.</span>
           </template>
         </div>
       </section>
@@ -101,11 +105,15 @@ const titleText = computed(() => {
       </section>
 
       <section v-if="isSelf" class="drawer-section">
-        <p class="section-title">Memo</p>
+        <p class="section-title">Assistant</p>
         <div class="info-card">
           <div class="info-row block">
             <span class="label">Usage</span>
-            <p>Use this session as your file transfer assistant and private note space.</p>
+            <p>Use this chat to keep notes, links and files for the current circle.</p>
+          </div>
+          <div class="info-row block">
+            <span class="label">Scope</span>
+            <p>Anything saved here stays tied to this circle.</p>
           </div>
         </div>
       </section>

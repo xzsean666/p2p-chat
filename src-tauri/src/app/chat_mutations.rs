@@ -1706,17 +1706,33 @@ fn normalized_circle_relay(input: &AddCircleInput, normalized_name: &str) -> Str
     }
 }
 
+fn resolve_public_relay_shortcut(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0xchat" => Some("wss://relay.0xchat.com"),
+        "damus" => Some("wss://relay.damus.io"),
+        "nos" => Some("wss://nos.lol"),
+        "primal" => Some("wss://relay.primal.net"),
+        "yabu" => Some("wss://yabu.me"),
+        "nostrband" => Some("wss://relay.nostr.band"),
+        _ => None,
+    }
+}
+
 fn normalize_custom_circle_relay(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let candidate = if trimmed.contains("://") {
-        trimmed.to_string()
-    } else {
-        format!("wss://{trimmed}")
-    };
+    let candidate = resolve_public_relay_shortcut(trimmed)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if trimmed.contains("://") {
+                trimmed.to_string()
+            } else {
+                format!("wss://{trimmed}")
+            }
+        });
     let parsed = Url::parse(&candidate).ok()?;
     matches!(parsed.scheme(), "ws" | "wss")
         .then_some(candidate)
@@ -1799,7 +1815,7 @@ struct MessageSendContext {
 #[derive(Clone)]
 enum TextNoteSigner {
     LocalSecret(StoredAuthRuntimeCredential),
-    RemoteBunker(AuthSessionSummary),
+    RemoteAuthRuntime(AuthSessionSummary),
 }
 
 impl TextNoteSigner {
@@ -1817,7 +1833,7 @@ impl TextNoteSigner {
                 created_at,
                 tags.to_vec(),
             ),
-            Self::RemoteBunker(auth_session) => shell_auth::sign_remote_auth_runtime_text_note(
+            Self::RemoteAuthRuntime(auth_session) => shell_auth::sign_remote_auth_runtime_text_note(
                 app_handle,
                 auth_session,
                 content,
@@ -1857,10 +1873,13 @@ fn resolve_text_note_signer<R: tauri::Runtime>(
         return Ok(None);
     };
 
-    if matches!(auth_session.access.kind, LoginAccessKind::Bunker)
+    if matches!(
+        auth_session.access.kind,
+        LoginAccessKind::Bunker | LoginAccessKind::NostrConnect
+    )
         && matches!(auth_runtime.state, AuthRuntimeState::Connected)
     {
-        return Ok(Some(TextNoteSigner::RemoteBunker(auth_session.clone())));
+        return Ok(Some(TextNoteSigner::RemoteAuthRuntime(auth_session.clone())));
     }
 
     Ok(None)
@@ -3815,9 +3834,12 @@ mod tests {
     }
 
     #[test]
-    fn send_message_rejects_when_remote_signer_is_connected_without_send_support() {
+    fn send_message_in_open_circle_with_remote_nostrconnect_auth_waits_for_runtime_receipt() {
         let guard = test_app();
         let app_handle = guard.app.handle();
+        let (relay_url, relay_handle) = spawn_bunker_signer_relay_server();
+        let signer_pubkey = bunker_signer_public_key_hex();
+
         seed_authenticated_shell_runtime(
             app_handle,
             "mika",
@@ -3835,21 +3857,52 @@ mod tests {
                 updated_at: "2026-04-19T09:10:00Z".into(),
             },
         );
+        auth_runtime_binding_store::save(
+            app_handle,
+            &auth_runtime_binding_store::StoredAuthRuntimeBinding {
+                login_method: LoginMethod::Signer,
+                access_kind: LoginAccessKind::NostrConnect,
+                value: format!(
+                    "nostrconnect://{signer_pubkey}?relay={relay_url}&secret={TEST_BUNKER_SHARED_SECRET}&perms=sign_event&name=Desk%20Client"
+                ),
+                stored_at: "2026-04-19T09:10:00Z".into(),
+            },
+        )
+        .expect("failed to seed remote nostrConnect binding");
 
-        let error = send_message(
+        let seed = send_message(
             app_handle,
             SendMessageInput {
                 session_id: "mika".into(),
-                body: "Connected remote signer should still stay blocked for send.".into(),
+                body: "Remote nostrConnect signer should also wait for relay OK.".into(),
                 reply_to_message_id: None,
             },
         )
-        .expect_err("send should stay blocked until remote signer send support exists");
+        .expect("failed to send message");
 
-        assert_eq!(
-            error,
-            "chat_send_blocked:Remote signer is connected, but message send still requires remote event-signing support."
+        let last_message = seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .expect("missing appended message");
+
+        assert!(matches!(
+            last_message.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+        assert!(last_message
+            .remote_id
+            .as_deref()
+            .is_some_and(is_lower_hex_64));
+        assert_signed_nostr_event(
+            last_message,
+            "Remote nostrConnect signer should also wait for relay OK.",
         );
+        assert_eq!(last_message.acked_at, None);
+
+        relay_handle
+            .join()
+            .expect("test relay thread should finish cleanly");
     }
 
     #[test]
@@ -4201,9 +4254,9 @@ mod tests {
                 access_kind: LoginAccessKind::Bunker,
                 label: "bunker://relay".into(),
                 pubkey: None,
-                error: Some("Remote signer handshake is not implemented yet.".into()),
+                error: Some("Remote signer handshake is pending.".into()),
                 can_send_messages: false,
-                send_blocked_reason: Some("Remote signer handshake is not implemented yet.".into()),
+                send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                 persisted_in_native_store: false,
                 credential_persisted_in_native_store: false,
                 updated_at: "2026-04-19T09:00:00Z".into(),
@@ -4221,7 +4274,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "chat_send_blocked:Remote signer handshake is not implemented yet."
+            "chat_send_blocked:Remote signer handshake is pending."
         );
     }
 
@@ -5106,6 +5159,26 @@ mod tests {
         assert_eq!(
             result.seed.circles.first().map(|circle| circle.id.as_str()),
             Some(result.circle_id.as_str())
+        );
+    }
+
+    #[test]
+    fn normalize_custom_circle_relay_resolves_public_shortcuts() {
+        assert_eq!(
+            normalize_custom_circle_relay("damus").as_deref(),
+            Some("wss://relay.damus.io")
+        );
+        assert_eq!(
+            normalize_custom_circle_relay(" nos ").as_deref(),
+            Some("wss://nos.lol")
+        );
+        assert_eq!(
+            normalize_custom_circle_relay("PRIMAL").as_deref(),
+            Some("wss://relay.primal.net")
+        );
+        assert_eq!(
+            normalize_custom_circle_relay("0xchat").as_deref(),
+            Some("wss://relay.0xchat.com")
         );
     }
 

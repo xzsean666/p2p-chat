@@ -103,13 +103,13 @@ pub fn resolve_auth_runtime_binding(
         }
         LoginAccessKind::NostrConnect => {
             let value = normalized_non_empty(access.value.as_deref()).ok_or_else(|| {
-                "remote signer nostrConnect URI must be a valid `nostrconnect://<client-pubkey>?relay=...&secret=...` URI".to_string()
+                "remote signer nostrConnect URI must be a valid `nostrconnect://<remote-signer-pubkey>?relay=...&secret=...` URI".to_string()
             })?;
             parse_auth_runtime_binding_uri(
                 value,
                 NOSTRCONNECT_SCHEME,
                 true,
-                "remote signer nostrConnect URI must be a valid `nostrconnect://<client-pubkey>?relay=...&secret=...` URI",
+                "remote signer nostrConnect URI must be a valid `nostrconnect://<remote-signer-pubkey>?relay=...&secret=...` URI",
             )?
         }
         _ => return Ok(None),
@@ -484,6 +484,7 @@ mod tests {
                 invite_code: None,
                 name: None,
                 relay: None,
+                relays: None,
             },
             logged_in_at: Some("2026-04-19T08:00:00Z".into()),
         }

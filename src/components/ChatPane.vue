@@ -26,6 +26,10 @@ import {
   videoMessagePreviewUrl,
   videoMessageRemoteUrl,
 } from "../features/chat/videoMessageMeta";
+import {
+  resolveMessageAuthorInitials,
+  resolveMessageAuthorLabel,
+} from "../features/chat/messageAuthor";
 import type { CircleItem, ContactItem, MessageItem, SessionItem } from "../types/chat";
 
 const props = defineProps<{
@@ -90,7 +94,7 @@ const subtitle = computed(() => {
   }
 
   if (props.session.kind === "self") {
-    return "Private note space";
+    return "Add notes to yourself here.";
   }
 
   if (props.session.kind === "group") {
@@ -252,14 +256,56 @@ function messageTextSegments(body: string) {
 }
 
 function composerReplyAuthorLabel(message: MessageItem) {
-  switch (message.author) {
-    case "me":
-      return "You";
-    case "peer":
-      return props.session?.kind === "direct" ? props.session.name : "Peer";
-    default:
-      return "System";
+  return resolveMessageAuthorLabel(props.session, message);
+}
+
+function messageAuthorLabel(message: MessageItem) {
+  return resolveMessageAuthorLabel(props.session, message);
+}
+
+function messageAuthorInitials(message: MessageItem) {
+  return resolveMessageAuthorInitials(props.session, message);
+}
+
+function isPeerClusterBoundary(message: MessageItem, messageIndex: number) {
+  if (message.author !== "peer") {
+    return false;
   }
+
+  for (let index = messageIndex - 1; index >= 0; index -= 1) {
+    const previousMessage = props.messages[index];
+    if (previousMessage.kind === "system") {
+      continue;
+    }
+
+    return (
+      previousMessage.author !== "peer" ||
+      previousMessage.authorContactId !== message.authorContactId ||
+      previousMessage.authorName !== message.authorName
+    );
+  }
+
+  return true;
+}
+
+function showMessageAuthor(message: MessageItem, messageIndex: number) {
+  return props.session?.kind === "group" && isPeerClusterBoundary(message, messageIndex);
+}
+
+function showPeerAvatar(message: MessageItem, messageIndex: number) {
+  if (message.author !== "peer" || props.session?.kind === "self") {
+    return false;
+  }
+
+  if (props.session?.kind === "group") {
+    return isPeerClusterBoundary(message, messageIndex);
+  }
+
+  return true;
+}
+
+function showPeerAvatarSpacer(message: MessageItem, messageIndex: number) {
+  return props.session?.kind === "group" && message.author === "peer" && !isPeerClusterBoundary(message, messageIndex);
 }
 
 function mentionSuggestionCaption(contact: ContactItem) {
@@ -426,7 +472,7 @@ watch(
             />
           </div>
 
-          <template v-for="message in messages" :key="message.id">
+          <template v-for="(message, messageIndex) in messages" :key="message.id">
             <div v-if="message.kind === 'system'" class="system-line">
               {{ message.body }}
             </div>
@@ -442,13 +488,21 @@ watch(
               ]"
             >
               <Avatar
-                v-if="message.author === 'peer' && session.kind !== 'self'"
-                :label="session.initials"
+                v-if="showPeerAvatar(message, messageIndex)"
+                :label="messageAuthorInitials(message)"
                 shape="circle"
                 class="bubble-avatar"
               />
+              <span
+                v-else-if="showPeerAvatarSpacer(message, messageIndex)"
+                class="bubble-avatar-spacer"
+                aria-hidden="true"
+              ></span>
 
               <div class="message-cluster">
+                <span v-if="showMessageAuthor(message, messageIndex)" class="message-author">
+                  {{ messageAuthorLabel(message) }}
+                </span>
                 <div
                   :class="[
                     'message-bubble',
@@ -937,6 +991,11 @@ watch(
   margin-bottom: 20px;
 }
 
+.bubble-avatar-spacer {
+  flex: 0 0 32px;
+  width: 32px;
+}
+
 .message-scroll {
   min-height: 0;
 }
@@ -978,6 +1037,14 @@ watch(
 
 .message-row.mine .message-cluster {
   justify-items: end;
+}
+
+.message-author {
+  padding: 0 4px;
+  color: var(--shell-text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 .message-bubble {

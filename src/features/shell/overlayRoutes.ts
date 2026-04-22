@@ -6,6 +6,7 @@ export type OverlayPage =
   | { kind: "settings-detail"; settingId: SettingPageId }
   | { kind: "message-detail"; sessionId: string; messageId: string }
   | { kind: "new-message" }
+  | { kind: "circle-invite" }
   | { kind: "self-chat-confirm" }
   | { kind: "group-select-members" }
   | { kind: "group-create"; memberContactIds: string[] }
@@ -54,6 +55,7 @@ function parseOverlayPageRecord(value: unknown): OverlayPage | null {
   switch (kind) {
     case "circle-directory":
     case "new-message":
+    case "circle-invite":
     case "self-chat-confirm":
     case "group-select-members":
     case "archived":
@@ -144,6 +146,8 @@ export function overlayRouteHash(pages: OverlayPage[]): string {
       return `#/messages/${encodeURIComponent(page.sessionId)}/${encodeURIComponent(page.messageId)}`;
     case "new-message":
       return "#/new-message";
+    case "circle-invite":
+      return "#/new-message/invite";
     case "self-chat-confirm":
       return "#/new-message/self";
     case "group-select-members":
@@ -199,6 +203,10 @@ export function parseOverlayRouteHash(hash: string): OverlayPage[] {
 
   if (segments[0] === "messages" && segments[1] && segments[2]) {
     return [{ kind: "message-detail", sessionId: segments[1], messageId: segments[2] }];
+  }
+
+  if (segments[0] === "new-message" && segments[1] === "invite") {
+    return [{ kind: "circle-invite" }];
   }
 
   if (segments[0] === "new-message" && segments[1] === "self") {

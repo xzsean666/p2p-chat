@@ -5,9 +5,11 @@ import InputText from "primevue/inputtext";
 import Tag from "primevue/tag";
 import ToggleSwitch from "primevue/toggleswitch";
 import OverlayPageShell from "./OverlayPageShell.vue";
+import { loadAuthRuntimeClientUri } from "../services/chatShell";
 import type {
   AdvancedPreferences,
   AuthRuntimeBindingSummary,
+  AuthRuntimeClientUriSummary,
   AuthRuntimeSummary,
   AuthSessionSummary,
   AppPreferences,
@@ -55,6 +57,10 @@ const emit = defineEmits<{
 
 const copyFeedback = ref("");
 const authRuntimeErrorDraft = ref("");
+const authRuntimeClientUri = ref<AuthRuntimeClientUriSummary | null>(null);
+const authRuntimeClientUriError = ref("");
+const authRuntimeClientUriLoading = ref(false);
+let authRuntimeClientUriRequestSerial = 0;
 
 const transportMetrics = computed(() => {
   if (!props.transportSnapshot) {
@@ -165,6 +171,13 @@ const canUpdateAuthRuntime = computed(() => {
 
 const canSyncAuthRuntime = computed(() => {
   return !!props.authSession && props.authSession.loginMethod !== "quickStart";
+});
+
+const supportsAuthRuntimeClientUri = computed(() => {
+  return props.settingId === "about" && (
+    props.authSession?.access.kind === "bunker" ||
+    props.authSession?.access.kind === "nostrConnect"
+  );
 });
 
 const authRuntimeSyncLabel = computed(() => {
@@ -372,6 +385,55 @@ watch(
   () => props.authRuntime?.error ?? "",
   (value) => {
     authRuntimeErrorDraft.value = value;
+  },
+  { immediate: true },
+);
+
+watch(
+  () => [
+    supportsAuthRuntimeClientUri.value,
+    props.authSession?.loggedInAt ?? "",
+    props.authRuntimeBinding?.updatedAt ?? "",
+  ],
+  async ([enabled]) => {
+    authRuntimeClientUriRequestSerial += 1;
+    const requestSerial = authRuntimeClientUriRequestSerial;
+
+    if (!enabled) {
+      authRuntimeClientUri.value = null;
+      authRuntimeClientUriError.value = "";
+      authRuntimeClientUriLoading.value = false;
+      return;
+    }
+
+    authRuntimeClientUriLoading.value = true;
+    authRuntimeClientUriError.value = "";
+
+    try {
+      const summary = await loadAuthRuntimeClientUri();
+      if (requestSerial !== authRuntimeClientUriRequestSerial) {
+        return;
+      }
+
+      authRuntimeClientUri.value = summary;
+      if (!summary) {
+        authRuntimeClientUriError.value = "Desktop native client URI is unavailable for this session.";
+      }
+    } catch (error) {
+      if (requestSerial !== authRuntimeClientUriRequestSerial) {
+        return;
+      }
+
+      authRuntimeClientUri.value = null;
+      authRuntimeClientUriError.value =
+        error instanceof Error && error.message.trim()
+          ? error.message.trim()
+          : "Desktop native client URI could not be generated.";
+    } finally {
+      if (requestSerial === authRuntimeClientUriRequestSerial) {
+        authRuntimeClientUriLoading.value = false;
+      }
+    }
   },
   { immediate: true },
 );
@@ -979,6 +1041,48 @@ watch(
             <strong>Binding Updated</strong>
             <p>{{ authRuntimeBinding.updatedAt }}</p>
           </div>
+          <div v-if="supportsAuthRuntimeClientUri" class="info-row auth-runtime-controls">
+            <strong>Standard Client URI</strong>
+            <div class="auth-runtime-panel">
+              <p class="runtime-note">
+                Share this standard `nostrconnect://...?metadata=...` client URI with a signer app that expects the
+                current NIP-46 client flow.
+              </p>
+              <p v-if="authRuntimeClientUriLoading" class="runtime-note">Generating desktop client URI...</p>
+              <template v-else-if="authRuntimeClientUri">
+                <textarea
+                  class="uri-preview"
+                  readonly
+                  :value="authRuntimeClientUri.uri"
+                />
+                <p class="runtime-note">
+                  {{ authRuntimeClientUri.clientName }} · {{ authRuntimeClientUri.relayCount }} relays
+                </p>
+                <p v-if="authRuntimeClientUri.relays.length" class="runtime-note">
+                  {{ authRuntimeClientUri.relays.join(", ") }}
+                </p>
+                <div class="auth-runtime-actions">
+                  <Button
+                    label="Copy Client URI"
+                    icon="pi pi-copy"
+                    text
+                    severity="info"
+                    @click="copyValue('Client URI', authRuntimeClientUri.uri)"
+                  />
+                  <Button
+                    label="Copy Client Pubkey"
+                    icon="pi pi-key"
+                    text
+                    severity="secondary"
+                    @click="copyValue('Client Pubkey', authRuntimeClientUri.publicKey)"
+                  />
+                </div>
+              </template>
+              <p v-else-if="authRuntimeClientUriError" class="runtime-note failure-copy">
+                {{ authRuntimeClientUriError }}
+              </p>
+            </div>
+          </div>
           <div v-if="authSession" class="info-row auth-runtime-controls">
             <strong>Auth Runtime Controls</strong>
             <div class="auth-runtime-panel">
@@ -1322,6 +1426,19 @@ watch(
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.uri-preview {
+  min-height: 108px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--shell-border);
+  border-radius: 16px;
+  background: var(--shell-surface-strong);
+  color: var(--shell-text-default);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
 }
 
 .runtime-note {

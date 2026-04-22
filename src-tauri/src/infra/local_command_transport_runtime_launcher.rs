@@ -539,8 +539,7 @@ mod tests {
 
         let TransportRuntimeProcessProbe { detail } = probe;
         assert!(detail.contains("exited with status"));
-        let followup_probe =
-            probe_local_command_runtime(&circle_id).expect("probe should succeed");
+        let followup_probe = probe_local_command_runtime(&circle_id).expect("probe should succeed");
         let TransportRuntimeProcessProbe { detail } =
             followup_probe.expect("released handle should report missing registration");
         assert!(detail.contains("is not registered in this app session"));

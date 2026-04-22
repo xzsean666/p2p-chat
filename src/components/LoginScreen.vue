@@ -1,12 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import InputText from "primevue/inputtext";
 import Textarea from "primevue/textarea";
 import onboardingWelcomeImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-welcome.png";
 import onboardingNostrImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-nostr.png";
 import onboardingCircleImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-circle.png";
 import onboardingRelaysImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-relays.png";
+import {
+  awaitPendingAuthRuntimeClientPairing,
+  bootstrapAuthSession,
+  loadPendingAuthRuntimeClientUri,
+} from "../services/chatShell";
 import type {
+  AuthRuntimeClientUriSummary,
   CircleItem,
   LoginAccessInput,
   LoginCircleSelectionMode,
@@ -16,8 +23,19 @@ import type {
   UserProfile,
 } from "../types/chat";
 
-type CircleSheetMode = "invite" | "custom";
+type CircleSelectionMode = LoginCircleSelectionMode | "privatePreview";
+type CircleSheetMode = "custom";
+type CirclePageKind =
+  | "restore"
+  | "privateOverview"
+  | "privateLearnMore"
+  | "privateCapacity"
+  | "privateDuration"
+  | "privateCheckout"
+  | "privateActivated";
 type InfoSheetKind = "nostr" | "relay";
+type PrivatePlanId = "lovers" | "family" | "community";
+type PrivateBillingPeriod = "yearly" | "monthly";
 
 const props = defineProps<{
   circles: CircleItem[];
@@ -54,9 +72,52 @@ const slides = [
 
 const NOSTR_BECH32_DATA_CHARS = "[023456789acdefghjklmnpqrstuvwxyz]+";
 const NSEC_PATTERN = new RegExp(`^nsec1${NOSTR_BECH32_DATA_CHARS}$`, "i");
-const NPUB_PATTERN = new RegExp(`^npub1${NOSTR_BECH32_DATA_CHARS}$`, "i");
 const HEX_KEY_PATTERN = /^[a-f0-9]{64}$/i;
 const HEX_PUBKEY_PATTERN = /^[a-f0-9]{64}$/i;
+const PUBLIC_RELAY_SHORTCUTS = {
+  "0xchat": "wss://relay.0xchat.com",
+  damus: "wss://relay.damus.io",
+  nos: "wss://nos.lol",
+  primal: "wss://relay.primal.net",
+  yabu: "wss://yabu.me",
+  nostrband: "wss://relay.nostr.band",
+} as const;
+const PRIVATE_PROGRESS_LABELS = ["CAPACITY", "DURATION", "CHECKOUT"] as const;
+const PRIVATE_PLAN_OPTIONS = [
+  {
+    id: "lovers",
+    title: "≤ 2 Members",
+    planName: "2 Members",
+    maxUsers: 2,
+    description: "For you and your partner.",
+    monthlyPrice: "$4.99",
+    yearlyPrice: "$49.99",
+    accent: "rose",
+    mostPopular: false,
+  },
+  {
+    id: "family",
+    title: "≤ 6 Members",
+    planName: "6 Members",
+    maxUsers: 6,
+    description: "Complete privacy for home.",
+    monthlyPrice: "$9.99",
+    yearlyPrice: "$99.99",
+    accent: "blue",
+    mostPopular: true,
+  },
+  {
+    id: "community",
+    title: "≤ 20 Members",
+    planName: "20 Members",
+    maxUsers: 20,
+    description: "For groups & creators.",
+    monthlyPrice: "$24.99",
+    yearlyPrice: "$249.99",
+    accent: "lavender",
+    mostPopular: false,
+  },
+] as const;
 
 const currentSlide = ref(0);
 const currentStep = ref(0);
@@ -64,28 +125,54 @@ const selectedMethod = ref<LoginMethod>("quickStart");
 const accountKey = ref("");
 const handle = ref(props.profile.handle);
 const profileStatus = ref(props.profile.status);
-const circleMode = ref<LoginCircleSelectionMode>(defaultCircleModeForMethod("quickStart"));
+const circleMode = ref<CircleSelectionMode | null>(defaultCircleModeForMethod("quickStart"));
 const selectedCircleId = ref(props.circles[0]?.id ?? "");
-const selectedRestoreRelay = ref(props.restorableCircles[0]?.relay ?? "");
-const inviteCode = ref("");
-const inviteName = ref("");
+const selectedRestoreRelays = ref(props.restorableCircles.map((circle) => circle.relay));
 const customCircleName = ref("");
 const customRelay = ref("");
 const activeCircleSheet = ref<CircleSheetMode | null>(null);
+const activeCirclePage = ref<CirclePageKind | null>(null);
 const activeInfoSheet = ref<InfoSheetKind | null>(null);
+const showSignerPairingPage = ref(false);
+const avatarInput = ref<HTMLInputElement | null>(null);
+const avatarPreviewUrl = ref("");
+const privateCircleName = ref("My Private Circle");
+const selectedPrivatePlanId = ref<PrivatePlanId>("family");
+const selectedPrivateBilling = ref<PrivateBillingPeriod>("yearly");
+const pendingSignerClientUri = ref<AuthRuntimeClientUriSummary | null>(null);
+const pendingSignerClientUriLoading = ref(false);
+const pendingSignerPairingWaiting = ref(false);
+const pendingSignerPairingError = ref("");
+const loginPreparationBusy = ref(false);
+const loginPreparationError = ref("");
 
 const seededName = splitName(props.profile.name);
 const firstName = ref(seededName.first);
 const lastName = ref(seededName.last);
 
 let timer: number | undefined;
+let pendingSignerClientUriRequestSerial = 0;
 
-const selectedRestorableCircle = computed(() => {
-  return props.restorableCircles.find((circle) => circle.relay === selectedRestoreRelay.value) ?? null;
+const selectedRestorableCircles = computed(() => {
+  return props.restorableCircles.filter((circle) =>
+    selectedRestoreRelays.value.some((relay) => sameRelay(relay, circle.relay)),
+  );
 });
 
 const hasRestorableCircles = computed(() => {
   return props.restorableCircles.length > 0;
+});
+
+const restorePageTitle = computed(() => {
+  return hasRestorableCircles.value ? "Welcome Back" : "Restore Circle Access";
+});
+
+const restorePageDescription = computed(() => {
+  if (hasRestorableCircles.value) {
+    return `We found ${props.restorableCircles.length} circles linked to your account. Select the ones you want to restore to this device.`;
+  }
+
+  return "No private circles are preloaded on this device yet. This restore entry stays available so archived circles can appear here when local or synced restore data becomes available.";
 });
 
 const displayName = computed(() => {
@@ -119,27 +206,6 @@ const credentialValid = computed(() => {
   return accountKeyAccessKind.value !== null;
 });
 
-const remoteSignerSelected = computed(() => {
-  return accountKeyAccessKind.value === "bunker" || accountKeyAccessKind.value === "nostrConnect";
-});
-
-const nostrConnectSelected = computed(() => {
-  return accountKeyAccessKind.value === "nostrConnect";
-});
-
-const invalidRemoteSignerHintVisible = computed(() => {
-  const value = normalizedAccountKey.value.toLowerCase();
-  if (accountKeyAccessKind.value !== null) {
-    return false;
-  }
-
-  return value.startsWith("bunker://") || value.startsWith("nostrconnect://");
-});
-
-const npubSelected = computed(() => {
-  return accountKeyAccessKind.value === "npub";
-});
-
 const invalidNsecHintVisible = computed(() => {
   const value = normalizedAccountKey.value.toLowerCase();
   return value.startsWith("nsec") && value.length >= 10 && accountKeyAccessKind.value !== "nsec";
@@ -153,21 +219,17 @@ const canReuseExistingCircleImmediately = computed(() => {
   return selectedMethod.value === "existingAccount" && props.circles.length > 0;
 });
 
-const needsCircleSelectionStep = computed(() => {
-  if (selectedMethod.value === "quickStart") {
-    return true;
-  }
-
-  return !canReuseExistingCircleImmediately.value;
-});
-
 const profileValid = computed(() => {
   return displayName.value.length >= 2;
 });
 
 const circleStepReady = computed(() => {
+  if (!circleMode.value) {
+    return false;
+  }
+
   if (circleMode.value === "restore") {
-    return canRestoreCirclesAfterLogin.value && !!selectedRestorableCircle.value;
+    return canRestoreCirclesAfterLogin.value && selectedRestorableCircles.value.length > 0;
   }
 
   if (circleMode.value === "existing") {
@@ -178,10 +240,6 @@ const circleStepReady = computed(() => {
 });
 
 const circleSheetValid = computed(() => {
-  if (activeCircleSheet.value === "invite") {
-    return inviteCode.value.trim().length >= 6;
-  }
-
   if (activeCircleSheet.value === "custom") {
     return relayLooksValid(customRelay.value);
   }
@@ -189,8 +247,91 @@ const circleSheetValid = computed(() => {
   return false;
 });
 
-const normalizedCustomRelayPreview = computed(() => {
-  return normalizeRelayLikeValue(customRelay.value);
+const restoreActionLabel = computed(() => {
+  return selectedRestorableCircles.value.length > 1
+    ? `Restore ${selectedRestorableCircles.value.length} Circles`
+    : "Restore Selected Circle";
+});
+
+const selectedPrivatePlan = computed(() => {
+  return PRIVATE_PLAN_OPTIONS.find((plan) => plan.id === selectedPrivatePlanId.value) ?? PRIVATE_PLAN_OPTIONS[1];
+});
+
+const privateOverviewStartingPrice = computed(() => {
+  return PRIVATE_PLAN_OPTIONS[0].monthlyPrice;
+});
+
+const privateYearlySavingsPercent = computed(() => {
+  const monthly = parsePriceAmount(selectedPrivatePlan.value.monthlyPrice);
+  const yearly = parsePriceAmount(selectedPrivatePlan.value.yearlyPrice);
+  if (!monthly || !yearly) {
+    return null;
+  }
+
+  const twelveMonths = monthly * 12;
+  if (!twelveMonths) {
+    return null;
+  }
+
+  return Math.round(Math.max(0, Math.min(100, ((twelveMonths - yearly) / twelveMonths) * 100)));
+});
+
+const privatePageTitle = computed(() => {
+  if (activeCirclePage.value === "privateOverview") {
+    return "OVERVIEW";
+  }
+
+  if (activeCirclePage.value === "privateLearnMore") {
+    return "Learn More";
+  }
+
+  return "";
+});
+
+const privateProgressStep = computed(() => {
+  if (activeCirclePage.value === "privateCapacity") {
+    return 1;
+  }
+
+  if (activeCirclePage.value === "privateDuration") {
+    return 2;
+  }
+
+  if (activeCirclePage.value === "privateCheckout") {
+    return 3;
+  }
+
+  return 0;
+});
+
+const privateBillingLabel = computed(() => {
+  return selectedPrivateBilling.value === "yearly" ? "Yearly" : "Monthly";
+});
+
+const privateDurationSubtitle = computed(() => {
+  return privateYearlySavingsPercent.value !== null
+    ? `Save up to ${privateYearlySavingsPercent.value}% with yearly billing.`
+    : "Save with yearly billing.";
+});
+
+const privateDurationSaveLabel = computed(() => {
+  return privateYearlySavingsPercent.value !== null
+    ? `SAVE ${privateYearlySavingsPercent.value}%`
+    : "Save";
+});
+
+const privateSelectedPrice = computed(() => {
+  return selectedPrivateBilling.value === "yearly"
+    ? selectedPrivatePlan.value.yearlyPrice
+    : selectedPrivatePlan.value.monthlyPrice;
+});
+
+const privateSelectedPriceSuffix = computed(() => {
+  return selectedPrivateBilling.value === "yearly" ? "/year" : "/month";
+});
+
+const privateInviteRemaining = computed(() => {
+  return Math.max(selectedPrivatePlan.value.maxUsers - 1, 0);
 });
 
 const stepValid = computed(() => {
@@ -207,12 +348,24 @@ const stepValid = computed(() => {
 });
 
 const primaryActionLabel = computed(() => {
+  if (loginPreparationBusy.value) {
+    return "Loading...";
+  }
+
   if (currentStep.value === 1) {
     return "LOGIN";
   }
 
+  if (currentStep.value === 2) {
+    return "Next";
+  }
+
   if (currentStep.value === 3) {
-    return "Connect";
+    if (circleMode.value === "invite" || circleMode.value === "privatePreview") {
+      return "Continue to Circle Setup";
+    }
+
+    return "Continue";
   }
 
   return "Continue";
@@ -222,7 +375,7 @@ watch(
   [selectedMethod, () => props.restorableCircles.length],
   ([method, restorableCount]) => {
     if (circleMode.value === "restore" && (method === "quickStart" || restorableCount === 0)) {
-      circleMode.value = "invite";
+      circleMode.value = defaultCircleModeForMethod(method);
     }
   },
   { immediate: true },
@@ -235,7 +388,7 @@ watch(
       selectedCircleId.value = "";
       if (circleMode.value === "existing") {
         circleMode.value =
-          selectedMethod.value !== "quickStart" && props.restorableCircles.length ? "restore" : "invite";
+          selectedMethod.value !== "quickStart" && props.restorableCircles.length ? "restore" : defaultCircleModeForMethod(selectedMethod.value);
       }
       return;
     }
@@ -248,19 +401,31 @@ watch(
 );
 
 watch(
+  [selectedMethod, normalizedAccountKey, displayName, normalizedHandle, profileStatus],
+  () => {
+    loginPreparationError.value = "";
+  },
+);
+
+watch(
   () => props.restorableCircles,
   (restorableCircles) => {
     if (!restorableCircles.length) {
-      selectedRestoreRelay.value = "";
+      selectedRestoreRelays.value = [];
+      if (activeCirclePage.value === "restore") {
+        activeCirclePage.value = null;
+      }
       if (circleMode.value === "restore") {
-        circleMode.value = "invite";
+        circleMode.value = defaultCircleModeForMethod(selectedMethod.value);
       }
       return;
     }
 
-    if (!restorableCircles.some((circle) => circle.relay === selectedRestoreRelay.value)) {
-      selectedRestoreRelay.value = restorableCircles[0]?.relay ?? "";
-    }
+    const availableRelays = restorableCircles.map((circle) => circle.relay);
+    const nextSelectedRelays = selectedRestoreRelays.value.filter((relay) =>
+      availableRelays.some((candidate) => sameRelay(candidate, relay)),
+    );
+    selectedRestoreRelays.value = nextSelectedRelays.length ? nextSelectedRelays : availableRelays;
   },
   { deep: true, immediate: true },
 );
@@ -296,6 +461,8 @@ onBeforeUnmount(() => {
   if (timer) {
     window.clearInterval(timer);
   }
+
+  revokeAvatarPreviewUrl();
 });
 
 function relayLooksValid(value: string) {
@@ -329,25 +496,53 @@ function splitName(value: string) {
   };
 }
 
+function resolvePublicRelayShortcut(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  return PUBLIC_RELAY_SHORTCUTS[normalized as keyof typeof PUBLIC_RELAY_SHORTCUTS] ?? null;
+}
+
 function normalizeRelayLikeValue(value: string) {
   const trimmed = value.trim();
   if (!trimmed) {
     return "";
   }
 
-  return trimmed.includes("://") ? trimmed : `wss://${trimmed}`;
+  return resolvePublicRelayShortcut(trimmed) ?? (trimmed.includes("://") ? trimmed : `wss://${trimmed}`);
 }
 
-function defaultCircleModeForMethod(method: LoginMethod): LoginCircleSelectionMode {
-  if (method === "quickStart") {
-    return "invite";
+function sameRelay(left: string, right: string) {
+  return normalizeRelayLikeValue(left).toLowerCase() === normalizeRelayLikeValue(right).toLowerCase();
+}
+
+function parsePriceAmount(value: string) {
+  const parsed = Number.parseFloat(value.replace(/[^0-9.]+/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isRestoreCircleSelected(relay: string) {
+  return selectedRestoreRelays.value.some((candidate) => sameRelay(candidate, relay));
+}
+
+function toggleRestoreCircle(relay: string) {
+  if (isRestoreCircleSelected(relay)) {
+    selectedRestoreRelays.value = selectedRestoreRelays.value.filter((candidate) => !sameRelay(candidate, relay));
+    return;
   }
 
-  return props.restorableCircles.length > 0 ? "restore" : "invite";
+  selectedRestoreRelays.value = [...selectedRestoreRelays.value, relay];
+}
+
+function defaultCircleModeForMethod(_method: LoginMethod): CircleSelectionMode | null {
+  return null;
 }
 
 function resetLoginFlow() {
   const nextName = splitName(props.profile.name);
+  revokeAvatarPreviewUrl();
   currentSlide.value = 0;
   currentStep.value = 0;
   selectedMethod.value = "quickStart";
@@ -356,13 +551,20 @@ function resetLoginFlow() {
   profileStatus.value = props.profile.status;
   circleMode.value = defaultCircleModeForMethod("quickStart");
   selectedCircleId.value = props.circles[0]?.id ?? "";
-  selectedRestoreRelay.value = props.restorableCircles[0]?.relay ?? "";
-  inviteCode.value = "";
-  inviteName.value = "";
+  selectedRestoreRelays.value = props.restorableCircles.map((circle) => circle.relay);
   customCircleName.value = "";
   customRelay.value = "";
   activeCircleSheet.value = null;
+  activeCirclePage.value = null;
   activeInfoSheet.value = null;
+  showSignerPairingPage.value = false;
+  privateCircleName.value = "My Private Circle";
+  selectedPrivatePlanId.value = "family";
+  selectedPrivateBilling.value = "yearly";
+  pendingSignerClientUri.value = null;
+  pendingSignerClientUriLoading.value = false;
+  pendingSignerPairingWaiting.value = false;
+  pendingSignerPairingError.value = "";
   firstName.value = nextName.first;
   lastName.value = nextName.last;
 }
@@ -378,16 +580,8 @@ function deriveAccountKeyAccessKind(value: string): LoginAccessInput["kind"] | n
     return NSEC_PATTERN.test(trimmed) ? "nsec" : null;
   }
 
-  if (lowered.startsWith("npub")) {
-    return NPUB_PATTERN.test(trimmed) ? "npub" : null;
-  }
-
   if (lowered.startsWith("bunker://")) {
     return remoteSignerUriLooksValid(trimmed, "bunker", false) ? "bunker" : null;
-  }
-
-  if (lowered.startsWith("nostrconnect://")) {
-    return remoteSignerUriLooksValid(trimmed, "nostrconnect", true) ? "nostrConnect" : null;
   }
 
   return HEX_KEY_PATTERN.test(trimmed) ? "hexKey" : null;
@@ -424,7 +618,9 @@ function openQuickStart() {
   currentStep.value = 2;
   circleMode.value = defaultCircleModeForMethod("quickStart");
   activeCircleSheet.value = null;
+  activeCirclePage.value = null;
   activeInfoSheet.value = null;
+  showSignerPairingPage.value = false;
 }
 
 function openExistingAccount() {
@@ -432,12 +628,59 @@ function openExistingAccount() {
   currentStep.value = 1;
   circleMode.value = defaultCircleModeForMethod("existingAccount");
   activeCircleSheet.value = null;
+  activeCirclePage.value = null;
   activeInfoSheet.value = null;
+  showSignerPairingPage.value = false;
 }
 
 function goBack() {
+  if (showSignerPairingPage.value) {
+    closeSignerPairingPage();
+    return;
+  }
+
+  if (activeInfoSheet.value) {
+    activeInfoSheet.value = null;
+    return;
+  }
+
+  if (activeCirclePage.value === "privateLearnMore") {
+    activeCirclePage.value = "privateOverview";
+    return;
+  }
+
+  if (activeCirclePage.value === "privateCapacity") {
+    activeCirclePage.value = "privateOverview";
+    return;
+  }
+
+  if (activeCirclePage.value === "privateDuration") {
+    activeCirclePage.value = "privateCapacity";
+    return;
+  }
+
+  if (activeCirclePage.value === "privateCheckout") {
+    activeCirclePage.value = "privateDuration";
+    return;
+  }
+
+  if (activeCirclePage.value === "privateActivated") {
+    activeCirclePage.value = "privateCheckout";
+    return;
+  }
+
+  if (activeCirclePage.value === "restore") {
+    activeCirclePage.value = null;
+    circleMode.value = defaultCircleModeForMethod(selectedMethod.value);
+    return;
+  }
+
+  if (activeCirclePage.value) {
+    activeCirclePage.value = null;
+    return;
+  }
+
   activeCircleSheet.value = null;
-  activeInfoSheet.value = null;
   if (currentStep.value === 1 || currentStep.value === 2) {
     currentStep.value = 0;
     return;
@@ -446,22 +689,38 @@ function goBack() {
   currentStep.value = selectedMethod.value === "quickStart" ? 2 : 1;
 }
 
-function handlePrimaryAction() {
+async function handlePrimaryAction() {
   if (!stepValid.value) {
     return;
   }
 
   if (currentStep.value === 1) {
-    if (needsCircleSelectionStep.value) {
-      currentStep.value = 3;
+    const prepared = await prepareLoginBeforeCircleSelection();
+    if (!prepared) {
       return;
     }
 
-    submit();
+    if (canRestoreCirclesAfterLogin.value) {
+      currentStep.value = 3;
+      openRestorePage();
+      return;
+    }
+
+    if (canReuseExistingCircleImmediately.value) {
+      submit();
+      return;
+    }
+
+    currentStep.value = 3;
     return;
   }
 
   if (currentStep.value === 2) {
+    const prepared = await prepareLoginBeforeCircleSelection();
+    if (!prepared) {
+      return;
+    }
+
     currentStep.value = 3;
     return;
   }
@@ -486,16 +745,6 @@ function buildInitials(name: string) {
     .toUpperCase();
 }
 
-function buildInviteCircleName() {
-  const trimmed = inviteName.value.trim();
-  if (trimmed) {
-    return trimmed;
-  }
-
-  const suffix = inviteCode.value.trim().slice(0, 6).toUpperCase();
-  return suffix ? `Invite ${suffix}` : "Invite Circle";
-}
-
 function buildCustomCircleName() {
   const trimmed = customCircleName.value.trim();
   if (trimmed) {
@@ -511,33 +760,189 @@ function buildCustomCircleName() {
   return relayLabel || "Custom Relay";
 }
 
-function archivedAtCopy(value: string) {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return value;
+function buildSubmittedUserProfile() {
+  return {
+    name: displayName.value || props.profile.name || "XChat User",
+    handle: normalizedHandle.value,
+    initials: buildInitials(displayName.value || props.profile.name),
+    status: profileStatus.value.trim() || "Circle member",
+  };
+}
+
+function buildPreparationCircleSelection(): LoginCompletionInput["circleSelection"] {
+  if (selectedMethod.value === "existingAccount" && hasRestorableCircles.value) {
+    return {
+      mode: "restore",
+      relay: props.restorableCircles[0]?.relay,
+      relays: props.restorableCircles.map((circle) => circle.relay),
+    };
   }
 
-  return parsed.toLocaleString();
+  if (selectedMethod.value === "existingAccount" && canReuseExistingCircleImmediately.value) {
+    return {
+      mode: "existing",
+      circleId: selectedCircleId.value || props.circles[0]?.id || "",
+    };
+  }
+
+  return {
+    mode: "invite",
+  };
 }
 
-function buildCircleMeta(circle: CircleItem | RestorableCircleEntry) {
-  return `${circle.type} circle`;
+function buildLoginPreparationInput(): LoginCompletionInput {
+  const resolvedAccessKind = accountKeyAccessKind.value;
+  const access: LoginAccessInput =
+    selectedMethod.value === "quickStart"
+      ? {
+          kind: "localProfile",
+        }
+      : {
+          kind: resolvedAccessKind ?? "hexKey",
+          value: normalizedAccountKey.value,
+        };
+
+  return {
+    method: deriveSubmittedMethod(access.kind),
+    access,
+    userProfile: buildSubmittedUserProfile(),
+    circleSelection: buildPreparationCircleSelection(),
+    loggedInAt: new Date().toISOString(),
+  };
 }
 
-function selectCircleMode(mode: LoginCircleSelectionMode) {
+async function prepareLoginBeforeCircleSelection() {
+  if (loginPreparationBusy.value) {
+    return false;
+  }
+
+  loginPreparationBusy.value = true;
+  loginPreparationError.value = "";
+
+  try {
+    await bootstrapAuthSession(buildLoginPreparationInput());
+    return true;
+  } catch (error) {
+    loginPreparationError.value = describePairingError(
+      error,
+      selectedMethod.value === "quickStart"
+        ? "Profile setup could not prepare the account runtime."
+        : "Login could not prepare the account runtime.",
+    );
+    return false;
+  } finally {
+    loginPreparationBusy.value = false;
+  }
+}
+
+function selectCircleMode(mode: CircleSelectionMode) {
   circleMode.value = mode;
-  if (mode !== "invite" && mode !== "custom") {
+  if (mode !== "custom") {
     activeCircleSheet.value = null;
   }
 }
 
 function openCircleSheet(mode: CircleSheetMode) {
+  if (mode === "custom" && !customRelay.value.trim()) {
+    customRelay.value = "damus";
+  }
+
   circleMode.value = mode;
   activeCircleSheet.value = mode;
 }
 
 function closeCircleSheet() {
   activeCircleSheet.value = null;
+}
+
+function openRestorePage() {
+  if (!hasRestorableCircles.value) {
+    return;
+  }
+
+  circleMode.value = "restore";
+  activeCirclePage.value = "restore";
+}
+
+function openPrivateLearnMore() {
+  activeCirclePage.value = "privateLearnMore";
+}
+
+function openPrivateCapacity() {
+  activeCirclePage.value = "privateCapacity";
+}
+
+function openPrivateDuration() {
+  activeCirclePage.value = "privateDuration";
+}
+
+function openPrivateCheckout() {
+  activeCirclePage.value = "privateCheckout";
+}
+
+function openPrivateActivated() {
+  activeCirclePage.value = "privateActivated";
+}
+
+function closeCirclePage() {
+  activeCirclePage.value = null;
+}
+
+function skipRestorePage() {
+  activeCirclePage.value = null;
+  if (selectedMethod.value === "existingAccount" && canReuseExistingCircleImmediately.value) {
+    submit();
+    return;
+  }
+
+  circleMode.value = defaultCircleModeForMethod(selectedMethod.value);
+}
+
+function confirmRestorePage() {
+  if (!selectedRestorableCircles.value.length) {
+    return;
+  }
+
+  if (!canRestoreCirclesAfterLogin.value) {
+    activeCirclePage.value = null;
+    selectedMethod.value = "existingAccount";
+    currentStep.value = 1;
+    circleMode.value = defaultCircleModeForMethod("existingAccount");
+    return;
+  }
+
+  activeCirclePage.value = null;
+  submit();
+}
+
+function editPrivateCircleName() {
+  const nextValue = window.prompt("Name your circle", privateCircleName.value)?.trim();
+  if (nextValue) {
+    privateCircleName.value = nextValue;
+  }
+}
+
+async function sharePrivateInvitePreview() {
+  const inviteLink = "https://0xchat.com/x/invite/private-circle-preview";
+  const webShare = (navigator as Navigator & {
+    share?: (data: { title?: string; url?: string }) => Promise<void>;
+  }).share;
+
+  try {
+    if (typeof webShare === "function") {
+      await webShare({
+        title: privateCircleName.value,
+        url: inviteLink,
+      });
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(inviteLink);
+  } catch {}
 }
 
 function openInfoSheet(kind: InfoSheetKind) {
@@ -548,22 +953,183 @@ function closeInfoSheet() {
   activeInfoSheet.value = null;
 }
 
+async function loadSignerPairingClientUri(force = false) {
+  if (pendingSignerClientUriLoading.value) {
+    return;
+  }
+  if (pendingSignerClientUri.value && !force) {
+    pendingSignerPairingError.value = "";
+    return;
+  }
+
+  pendingSignerClientUriRequestSerial += 1;
+  const requestSerial = pendingSignerClientUriRequestSerial;
+  pendingSignerClientUriLoading.value = true;
+  pendingSignerPairingError.value = "";
+
+  try {
+    const summary = await loadPendingAuthRuntimeClientUri();
+    if (requestSerial !== pendingSignerClientUriRequestSerial) {
+      return;
+    }
+
+    pendingSignerClientUri.value = summary;
+    if (!summary) {
+      pendingSignerPairingError.value =
+        "Desktop signer pairing is unavailable in browser preview.";
+    }
+  } catch (error) {
+    if (requestSerial !== pendingSignerClientUriRequestSerial) {
+      return;
+    }
+
+    pendingSignerClientUri.value = null;
+    pendingSignerPairingError.value = describePairingError(
+      error,
+      "Desktop signer pairing could not generate a client URI.",
+    );
+  } finally {
+    if (requestSerial === pendingSignerClientUriRequestSerial) {
+      pendingSignerClientUriLoading.value = false;
+    }
+  }
+}
+
+function openSignerPairingPage() {
+  showSignerPairingPage.value = true;
+  void loadSignerPairingClientUri();
+}
+
+function closeSignerPairingPage() {
+  showSignerPairingPage.value = false;
+  pendingSignerPairingWaiting.value = false;
+  pendingSignerPairingError.value = "";
+}
+
+async function copySignerPairingUri() {
+  if (!pendingSignerClientUri.value?.uri) {
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(pendingSignerClientUri.value.uri);
+    pendingSignerPairingError.value = "";
+  } catch (error) {
+    pendingSignerPairingError.value = describePairingError(
+      error,
+      "Clipboard is unavailable for signer pairing on this device.",
+    );
+  }
+}
+
+async function confirmSignerPairingApproval() {
+  if (pendingSignerPairingWaiting.value) {
+    return;
+  }
+
+  if (!pendingSignerClientUri.value) {
+    await loadSignerPairingClientUri();
+    if (!pendingSignerClientUri.value) {
+      return;
+    }
+  }
+
+  pendingSignerPairingWaiting.value = true;
+  pendingSignerPairingError.value = "";
+
+  try {
+    const pairedBunkerUri = await awaitPendingAuthRuntimeClientPairing();
+    if (!pairedBunkerUri) {
+      pendingSignerPairingError.value =
+        "Desktop signer pairing is unavailable in browser preview.";
+      return;
+    }
+
+    accountKey.value = pairedBunkerUri;
+    closeSignerPairingPage();
+  } catch (error) {
+    pendingSignerPairingError.value = describePairingError(
+      error,
+      "Desktop signer pairing did not complete.",
+    );
+  } finally {
+    pendingSignerPairingWaiting.value = false;
+  }
+}
+
+function describePairingError(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+
+  return fallback;
+}
+
+async function openExternalUrl(url: string) {
+  try {
+    await openUrl(url);
+    return;
+  } catch {}
+
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function openPrivacyPolicy() {
+  return openExternalUrl("https://0xchat.com/protocols/xchat-privacy-policy.html");
+}
+
+function openTermsOfUse() {
+  return openExternalUrl("https://0xchat.com/protocols/xchat-terms-of-use.html");
+}
+
+function revokeAvatarPreviewUrl() {
+  if (avatarPreviewUrl.value.startsWith("blob:")) {
+    URL.revokeObjectURL(avatarPreviewUrl.value);
+  }
+
+  avatarPreviewUrl.value = "";
+}
+
+function openAvatarPicker() {
+  avatarInput.value?.click();
+}
+
+function handleAvatarSelected(event: Event) {
+  const input = event.target as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) {
+    return;
+  }
+
+  revokeAvatarPreviewUrl();
+  avatarPreviewUrl.value = URL.createObjectURL(file);
+  input.value = "";
+}
+
 function applyRelaySuggestion(value: string) {
   customRelay.value = value;
 }
 
 function handleCircleConnect() {
+  if (!circleMode.value) {
+    return;
+  }
+
   if (circleMode.value === "restore" || circleMode.value === "existing") {
+    if (circleMode.value === "restore" && !selectedRestorableCircles.value.length) {
+      openRestorePage();
+      return;
+    }
+
     submit();
     return;
   }
 
-  if (circleMode.value === "invite") {
-    if (inviteCode.value.trim().length < 6) {
-      openCircleSheet("invite");
-      return;
-    }
-
+  if (circleMode.value === "invite" || circleMode.value === "privatePreview") {
     submit();
     return;
   }
@@ -594,7 +1160,7 @@ function deriveSubmittedMethod(accessKind: LoginAccessInput["kind"]): LoginMetho
 }
 
 function submit() {
-  if (!stepValid.value) {
+  if (!stepValid.value || !circleMode.value) {
     return;
   }
 
@@ -613,28 +1179,22 @@ function submit() {
   const payload: LoginCompletionInput = {
     method,
     access,
-    userProfile: {
-      name: displayName.value || props.profile.name || "XChat User",
-      handle: normalizedHandle.value,
-      initials: buildInitials(displayName.value || props.profile.name),
-      status: profileStatus.value.trim() || "Circle member",
-    },
+    userProfile: buildSubmittedUserProfile(),
     circleSelection:
       selectedMethod.value === "existingAccount" && canReuseExistingCircleImmediately.value
         ? {
             mode: "existing",
             circleId: selectedCircleId.value || props.circles[0]?.id || "",
           }
-        : circleMode.value === "invite"
+        : circleMode.value === "invite" || circleMode.value === "privatePreview"
             ? {
                 mode: "invite",
-                inviteCode: inviteCode.value.trim(),
-                name: buildInviteCircleName(),
               }
             : circleMode.value === "restore"
               ? {
                   mode: "restore",
-                  relay: selectedRestorableCircle.value?.relay,
+                  relay: selectedRestorableCircles.value[0]?.relay,
+                  relays: selectedRestorableCircles.value.map((circle) => circle.relay),
                 }
               : {
                   mode: "custom",
@@ -681,12 +1241,11 @@ function submit() {
         </button>
 
         <div class="terms-row">
-          <span class="terms-check" aria-hidden="true"></span>
           <p>
             By continuing, you agree to our
-            <span class="terms-link">Privacy Policy</span>
+            <button type="button" class="terms-link-button" @click="openPrivacyPolicy">Privacy Policy</button>
             and
-            <span class="terms-link">Terms of Use</span>
+            <button type="button" class="terms-link-button" @click="openTermsOfUse">Terms of Use</button>
           </p>
         </div>
       </div>
@@ -704,7 +1263,7 @@ function submit() {
       <div class="mobile-body">
         <template v-if="currentStep === 1">
           <section class="page-section auth-section">
-            <h2 class="page-title page-title-left">Use Nostr key or remote signer to login:</h2>
+            <h2 class="page-title page-title-left">Use your Nostr key or bunker URI to log in:</h2>
 
             <Textarea
               id="account-key"
@@ -712,31 +1271,16 @@ function submit() {
               rows="4"
               auto-resize
               class="wide-input"
-              placeholder="Enter nsec, npub, hex, or signer URI"
+              placeholder="Enter nsec, hex key, or bunker:// URI"
             />
 
             <p class="section-footnote">
-              Enter your nostr private key or remote signer URI link.
+              Enter your Nostr private key, hex key, or bunker URI.
               <button type="button" class="inline-link-button" @click="openInfoSheet('nostr')">Learn more</button>
             </p>
 
             <p v-if="invalidNsecHintVisible" class="inline-hint tone-error">
               The NSEC you entered is invalid. Please enter it again.
-            </p>
-            <p v-else-if="invalidRemoteSignerHintVisible" class="inline-hint tone-error">
-              Signer URI must include a 64-character pubkey and at least one <code>ws://</code> or <code>wss://</code> relay. <code>nostrconnect://</code> also requires a secret.
-            </p>
-            <p v-else-if="npubSelected" class="inline-hint tone-warn">
-              <code>npub</code> import is read-only and cannot send messages yet.
-            </p>
-            <p v-else-if="nostrConnectSelected" class="inline-hint tone-warn">
-              <code>nostrconnect://</code> login can bootstrap signer state, but desktop send is still blocked on the local client-URI flow.
-            </p>
-            <p v-else-if="remoteSignerSelected" class="inline-hint tone-info">
-              Remote signer login will continue through signer bootstrap after you tap LOGIN.
-            </p>
-            <p v-else-if="canReuseExistingCircleImmediately" class="inline-hint tone-info">
-              Saved circles already exist in this shell. Login will return directly to the current circle.
             </p>
           </section>
         </template>
@@ -750,12 +1294,20 @@ function submit() {
               </p>
             </div>
 
-            <button type="button" class="avatar-preview" aria-label="Profile preview">
-              <span class="profile-avatar">{{ buildInitials(displayName || "XC") }}</span>
+            <button type="button" class="avatar-preview" aria-label="Select avatar" @click="openAvatarPicker">
+              <img v-if="avatarPreviewUrl" :src="avatarPreviewUrl" alt="" class="profile-avatar-image" />
+              <span v-else class="profile-avatar">{{ buildInitials(displayName || "XC") }}</span>
               <span class="avatar-badge">
                 <i class="pi pi-camera" />
               </span>
             </button>
+            <input
+              ref="avatarInput"
+              type="file"
+              accept="image/*"
+              class="hidden-file-input"
+              @change="handleAvatarSelected"
+            />
 
             <div class="input-stack">
               <InputText id="first-name" v-model="firstName" class="wide-input" placeholder="First Name" />
@@ -763,7 +1315,6 @@ function submit() {
             </div>
 
             <p class="section-footnote">This is how others will see you. You can change this anytime.</p>
-            <p class="inline-hint tone-muted">Username will be saved as {{ normalizedHandle }}</p>
           </section>
         </template>
 
@@ -771,7 +1322,7 @@ function submit() {
           <section class="page-section circle-section">
             <div class="page-copy centered-copy">
               <h2 class="page-title">Add Circle</h2>
-              <p class="page-subtitle">Connect to your circle using an invite link or choose a relay provider.</p>
+              <p class="page-subtitle">Choose how to continue into circle setup after login.</p>
             </div>
 
             <div class="option-stack">
@@ -785,7 +1336,7 @@ function submit() {
                 </span>
                 <span class="option-copy">
                   <strong>I have an invite</strong>
-                  <small>Scan QR code or enter invitation link</small>
+                  <small>Open the invite handoff after login</small>
                 </span>
                 <i class="pi pi-angle-right option-arrow" />
               </button>
@@ -797,14 +1348,18 @@ function submit() {
               </div>
 
               <div class="recommended-card">
-                <span class="recommended-badge">RECOMMENDED</span>
-                <button type="button" class="option-card option-card-disabled" disabled>
+                <span class="recommended-badge">Most Popular</span>
+                <button
+                  type="button"
+                  :class="['option-card', { active: circleMode === 'privatePreview' }]"
+                  @click="selectCircleMode('privatePreview')"
+                >
                   <span class="option-icon">
                     <i class="pi pi-diamond" />
                   </span>
                   <span class="option-copy">
                     <strong>Get Private Circle</strong>
-                    <small>Hosted dedicated high-speed relay with built-in secure media server</small>
+                    <small>Continue to the Private Circle handoff after login</small>
                   </span>
                 </button>
               </div>
@@ -819,51 +1374,34 @@ function submit() {
                 </span>
                 <span class="option-copy">
                   <strong>Custom Relay</strong>
-                  <small>Community or Self-hosted nodes</small>
+                  <small>Use a community or self-hosted relay</small>
                 </span>
                 <i class="pi pi-angle-right option-arrow" />
               </button>
             </div>
 
-            <p class="inline-hint tone-muted">
-              Private Circle stays paused in this desktop rebuild because it depends on backend services.
-            </p>
-
             <button
               type="button"
-              :class="['restore-link', { active: circleMode === 'restore', disabled: !canRestoreCirclesAfterLogin }]"
-              :disabled="!canRestoreCirclesAfterLogin"
-              @click="selectCircleMode('restore')"
+              :class="['restore-link', { active: circleMode === 'restore', disabled: !hasRestorableCircles }]"
+              :disabled="!hasRestorableCircles"
+              @click="openRestorePage"
             >
-              Restore private circle
+              Restore saved circles
             </button>
-
-            <div v-if="circleMode === 'restore'" class="detail-panel">
-              <div v-if="props.restorableCircles.length" class="selection-list">
-                <button
-                  v-for="circle in props.restorableCircles"
-                  :key="circle.relay"
-                  type="button"
-                  :class="['selection-card', { active: selectedRestoreRelay === circle.relay }]"
-                  @click="selectedRestoreRelay = circle.relay"
-                >
-                  <div class="selection-head">
-                    <strong>{{ circle.name }}</strong>
-                    <span class="selection-pill">{{ buildCircleMeta(circle) }}</span>
-                  </div>
-                  <p>{{ circle.description || "No archived description available." }}</p>
-                  <span class="selection-meta">{{ circle.relay }}</span>
-                  <span class="selection-meta">Archived {{ archivedAtCopy(circle.archivedAt) }}</span>
-                </button>
-              </div>
-              <p v-else class="inline-hint tone-muted">No private circle is available to restore right now.</p>
-            </div>
           </section>
         </template>
       </div>
 
       <footer class="mobile-footer">
-        <button type="button" class="action-button action-dark" :disabled="!stepValid" @click="handlePrimaryAction">
+        <p v-if="loginPreparationError && currentStep !== 3" class="inline-hint tone-error mobile-footer-hint">
+          {{ loginPreparationError }}
+        </p>
+        <button
+          type="button"
+          class="action-button action-dark"
+          :disabled="!stepValid || loginPreparationBusy"
+          @click="handlePrimaryAction"
+        >
           {{ primaryActionLabel }}
         </button>
       </footer>
@@ -875,48 +1413,28 @@ function submit() {
           <span class="circle-sheet-grabber" aria-hidden="true"></span>
 
           <div class="circle-sheet-copy">
-            <h3>{{ activeCircleSheet === "invite" ? "Enter Invitation Link" : "Add Relay" }}</h3>
-            <p v-if="activeCircleSheet === 'invite'">
-              Paste your invite link or invitation code, then continue into the selected circle.
-            </p>
-            <p v-else>
+            <h3>Add Custom Relay</h3>
+            <p>
               Enter the relay address to join.
               <button type="button" class="inline-link-button" @click="openInfoSheet('relay')">What is a Relay?</button>
             </p>
           </div>
 
           <div class="circle-sheet-body">
-            <template v-if="activeCircleSheet === 'invite'">
-              <label class="field-label" for="invite-code-sheet">Invitation Link</label>
-              <InputText
-                id="invite-code-sheet"
-                v-model="inviteCode"
-                class="wide-input"
-                placeholder="circle://..., invite://..., or invitation code"
-              />
-            </template>
-
-            <template v-else>
-              <label class="field-label" for="custom-relay-sheet">Relay URL or name</label>
+            <template v-if="activeCircleSheet === 'custom'">
+              <label class="field-label" for="custom-relay-sheet">Enter relay URL or name</label>
               <InputText
                 id="custom-relay-sheet"
                 v-model="customRelay"
                 class="wide-input"
-                placeholder="wss://relay.example.com"
+                placeholder="Enter relay URL or name"
               />
 
-              <div class="relay-suggestions">
-                <button type="button" class="relay-chip" @click="applyRelaySuggestion('0xchat')">0xchat</button>
-                <button type="button" class="relay-chip" @click="applyRelaySuggestion('damus')">damus</button>
-              </div>
-
               <p class="section-footnote sheet-footnote">
-                You can enter a full URL like <code>wss://relay.example.com</code> or use a shortcut relay name
-                such as <code>0xchat</code> or <code>damus</code>.
-              </p>
-
-              <p v-if="normalizedCustomRelayPreview" class="inline-hint tone-muted">
-                Relay will be saved as {{ normalizedCustomRelayPreview }}
+                You can enter a full URL (e.g., <code>wss://relay.example.com</code>) or use a shortcut like
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('0xchat')">0xchat</button>
+                or
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('damus')">damus</button>.
               </p>
             </template>
           </div>
@@ -929,7 +1447,7 @@ function submit() {
               :disabled="!circleSheetValid"
               @click="confirmCircleSheet"
             >
-              Connect
+              Join
             </button>
           </div>
         </div>
@@ -937,85 +1455,623 @@ function submit() {
     </Transition>
 
     <Transition name="sheet-fade">
-      <div v-if="activeInfoSheet" class="circle-sheet-layer" @click.self="closeInfoSheet">
-        <div class="circle-sheet-card info-sheet-card" role="dialog" aria-modal="true">
-          <span class="circle-sheet-grabber" aria-hidden="true"></span>
+      <div v-if="activeCirclePage" class="circle-page-layer">
+        <div class="circle-page-shell" role="dialog" aria-modal="true">
+          <header class="circle-page-header">
+            <button type="button" class="topbar-back" aria-label="Go back" @click="goBack">
+              <span class="topbar-chevron">‹</span>
+            </button>
+            <h2 class="circle-page-title">{{ privatePageTitle }}</h2>
+            <span class="topbar-side" aria-hidden="true"></span>
+          </header>
 
-          <div class="circle-sheet-copy">
-            <h3>{{ activeInfoSheet === "nostr" ? "Understanding Nostr" : "What is a Circle?" }}</h3>
-            <p v-if="activeInfoSheet === 'nostr'">
-              Learn about Nostr keys, signer URIs, and the safest way to authenticate on this device.
-            </p>
-            <p v-else>
-              Your circle is the relay hub that stores encrypted messages until you and your contacts sync them.
+          <div v-if="activeCirclePage === 'restore'" class="circle-page-body restore-page">
+            <div class="restore-copy">
+              <div class="restore-icon">
+                <i class="pi pi-cloud" />
+              </div>
+              <h3>{{ restorePageTitle }}</h3>
+              <p>{{ restorePageDescription }}</p>
+            </div>
+
+            <div v-if="props.restorableCircles.length" class="restore-list">
+              <button
+                v-for="circle in props.restorableCircles"
+                :key="circle.relay"
+                type="button"
+                :class="['restore-card', { active: isRestoreCircleSelected(circle.relay) }]"
+                @click="toggleRestoreCircle(circle.relay)"
+              >
+                <div class="restore-avatar">
+                  {{ buildInitials(circle.name) }}
+                </div>
+                <div class="restore-card-copy">
+                  <strong>{{ circle.name }}</strong>
+                  <p>{{ circle.relay }}</p>
+                </div>
+                <span :class="['restore-check', { active: isRestoreCircleSelected(circle.relay) }]">
+                  <i v-if="isRestoreCircleSelected(circle.relay)" class="pi pi-check" />
+                </span>
+              </button>
+            </div>
+            <p v-else class="inline-hint tone-muted">No saved circles are ready to restore yet.</p>
+          </div>
+
+          <div v-else-if="activeCirclePage === 'privateOverview'" class="circle-page-body private-overview-page">
+            <div class="private-hero">
+              <div class="private-hero-icon">
+                <i class="pi pi-diamond" />
+              </div>
+              <h3>Get Private Circle</h3>
+              <p>Own your data with a dedicated relay and file server.</p>
+              <p class="private-hero-price">Starts at just {{ privateOverviewStartingPrice }}/mo.</p>
+              <button type="button" class="inline-link-button private-learn-more" @click="openPrivateLearnMore">
+                Learn More
+                <i class="pi pi-arrow-right" />
+              </button>
+            </div>
+
+            <div class="private-feature-list">
+              <article class="private-feature">
+                <span class="private-feature-icon lavender"><i class="pi pi-server" /></span>
+                <div>
+                  <strong>Your Private Relay</strong>
+                  <p>Get a dedicated Nostr relay instance exclusive to your circle.</p>
+                </div>
+              </article>
+              <article class="private-feature">
+                <span class="private-feature-icon blue"><i class="pi pi-images" /></span>
+                <div>
+                  <strong>Media File Server</strong>
+                  <p>Includes a secure file server for your photos and videos.</p>
+                </div>
+              </article>
+              <article class="private-feature">
+                <span class="private-feature-icon rose"><i class="pi pi-shield" /></span>
+                <div>
+                  <strong>Total Sovereignty</strong>
+                  <p>Privacy first. Permanently wipe your relay and data anytime.</p>
+                </div>
+              </article>
+            </div>
+          </div>
+
+          <div v-else-if="activeCirclePage === 'privateLearnMore'" class="circle-page-body private-learn-page">
+            <div class="learn-brand">
+              <p>Get Private Circle</p>
+              <span></span>
+            </div>
+
+            <div class="learn-section">
+              <h4>Features</h4>
+              <article class="info-card">
+                <p>Dedicated hosted relay server</p>
+              </article>
+              <article class="info-card">
+                <p>Free file storage service, 50MB per upload, files stored for 30 days</p>
+              </article>
+              <article class="info-card">
+                <p>Member management and file cleanup</p>
+              </article>
+            </div>
+
+            <div class="learn-section">
+              <h4>Privacy</h4>
+              <article class="info-card">
+                <p>Zero logging to protect your privacy</p>
+              </article>
+              <article class="info-card">
+                <p>Encrypted storage. Server cannot view file contents</p>
+              </article>
+              <article class="info-card">
+                <p>When admin deletes circle, all members' local data will be automatically cleared</p>
+              </article>
+              <article class="info-card">
+                <p>When member is removed, their local data will be automatically cleared</p>
+              </article>
+            </div>
+
+            <div class="learn-section">
+              <h4>Pricing</h4>
+              <article class="learn-pricing-card">
+                <div
+                  v-for="(plan, index) in PRIVATE_PLAN_OPTIONS"
+                  :key="plan.id"
+                  :class="['learn-pricing-item', { divided: index > 0 }]"
+                >
+                  <div class="learn-pricing-head">
+                    <strong>{{ plan.planName }}</strong>
+                    <span>Yearly plan</span>
+                  </div>
+                  <div class="learn-pricing-values">
+                    <strong>{{ plan.monthlyPrice }}/month</strong>
+                    <span>{{ plan.yearlyPrice }}/year</span>
+                  </div>
+                </div>
+              </article>
+              <p class="learn-disclaimer">
+                Subscriptions automatically renew unless auto-renew is turned off at least 24-hours before the end of
+                the current period.
+              </p>
+            </div>
+          </div>
+
+          <div v-else-if="activeCirclePage === 'privateCapacity'" class="circle-page-body private-capacity-page">
+            <div class="private-progress">
+              <div class="private-progress-bars">
+                <span
+                  v-for="(label, index) in PRIVATE_PROGRESS_LABELS"
+                  :key="label"
+                  :class="['private-progress-bar', { active: index < privateProgressStep }]"
+                />
+              </div>
+              <div class="private-progress-labels">
+                <span v-for="label in PRIVATE_PROGRESS_LABELS" :key="label">{{ label }}</span>
+              </div>
+            </div>
+
+            <div class="private-step-copy">
+              <h3>How big is your circle?</h3>
+              <p>Choose a capacity that fits your needs.</p>
+            </div>
+
+            <div class="private-option-list">
+              <button
+                v-for="plan in PRIVATE_PLAN_OPTIONS"
+                :key="plan.id"
+                type="button"
+                :class="['private-select-card', { active: selectedPrivatePlanId === plan.id }]"
+                @click="selectedPrivatePlanId = plan.id"
+              >
+                <span :class="['private-plan-icon', plan.accent]">
+                  <i class="pi pi-users" />
+                </span>
+                <div class="private-select-copy">
+                  <div class="private-select-head">
+                    <strong>{{ plan.title }}</strong>
+                    <span v-if="plan.mostPopular" class="private-inline-badge">Most Popular</span>
+                  </div>
+                  <p>{{ plan.description }}</p>
+                </div>
+                <span :class="['private-radio', { active: selectedPrivatePlanId === plan.id }]">
+                  <i v-if="selectedPrivatePlanId === plan.id" class="pi pi-check" />
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div v-else-if="activeCirclePage === 'privateDuration'" class="circle-page-body private-duration-page">
+            <div class="private-progress">
+              <div class="private-progress-bars">
+                <span
+                  v-for="(label, index) in PRIVATE_PROGRESS_LABELS"
+                  :key="label"
+                  :class="['private-progress-bar', { active: index < privateProgressStep }]"
+                />
+              </div>
+              <div class="private-progress-labels">
+                <span v-for="label in PRIVATE_PROGRESS_LABELS" :key="label">{{ label }}</span>
+              </div>
+            </div>
+
+            <div class="private-step-copy">
+              <h3>How often to pay?</h3>
+              <p>{{ privateDurationSubtitle }}</p>
+            </div>
+
+            <div class="private-option-list">
+              <button
+                type="button"
+                :class="['private-select-card', { active: selectedPrivateBilling === 'yearly' }]"
+                @click="selectedPrivateBilling = 'yearly'"
+              >
+                <div class="private-select-copy">
+                  <div class="private-select-head">
+                    <strong>Yearly</strong>
+                    <span v-if="selectedPrivateBilling === 'yearly'" class="private-save-badge">{{ privateDurationSaveLabel }}</span>
+                  </div>
+                  <span class="private-price-line">{{ selectedPrivatePlan.yearlyPrice }}</span>
+                  <p>Billed every 12 months</p>
+                </div>
+                <span :class="['private-radio', { active: selectedPrivateBilling === 'yearly' }]">
+                  <i v-if="selectedPrivateBilling === 'yearly'" class="pi pi-check" />
+                </span>
+              </button>
+
+              <button
+                type="button"
+                :class="['private-select-card', { active: selectedPrivateBilling === 'monthly' }]"
+                @click="selectedPrivateBilling = 'monthly'"
+              >
+                <div class="private-select-copy">
+                  <div class="private-select-head">
+                    <strong>Monthly</strong>
+                  </div>
+                  <span class="private-price-line">{{ selectedPrivatePlan.monthlyPrice }}</span>
+                  <p>Billed every month</p>
+                </div>
+                <span :class="['private-radio', { active: selectedPrivateBilling === 'monthly' }]">
+                  <i v-if="selectedPrivateBilling === 'monthly'" class="pi pi-check" />
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div v-else-if="activeCirclePage === 'privateCheckout'" class="circle-page-body private-checkout-page">
+            <div class="private-progress">
+              <div class="private-progress-bars">
+                <span
+                  v-for="(label, index) in PRIVATE_PROGRESS_LABELS"
+                  :key="label"
+                  :class="['private-progress-bar', { active: index < privateProgressStep }]"
+                />
+              </div>
+              <div class="private-progress-labels">
+                <span v-for="label in PRIVATE_PROGRESS_LABELS" :key="label">{{ label }}</span>
+              </div>
+            </div>
+
+            <div class="private-step-copy">
+              <h3>Review Order</h3>
+              <p>You won't be charged until you confirm.</p>
+            </div>
+
+            <article class="private-summary-card">
+              <div class="private-summary-row">
+                <div class="private-summary-copy">
+                  <span class="private-summary-label">Plan</span>
+                  <strong>{{ selectedPrivatePlan.planName }}</strong>
+                  <p>{{ selectedPrivatePlan.maxUsers }} Max Users • Unlimited Secure Storage</p>
+                </div>
+                <div class="private-summary-side">
+                  <span class="private-summary-label">Billing</span>
+                  <strong>{{ privateBillingLabel }}</strong>
+                </div>
+              </div>
+
+              <div class="private-summary-divider"></div>
+
+              <div class="private-summary-total">
+                <strong>Total</strong>
+                <div class="private-summary-price">
+                  <span>{{ privateSelectedPrice }}</span>
+                  <small>{{ privateSelectedPriceSuffix }}</small>
+                </div>
+              </div>
+            </article>
+
+            <p class="checkout-terms">
+              By subscribing you agree to our
+              <button type="button" class="checkout-link" @click="openPrivacyPolicy">Privacy Policy</button>
+              and
+              <button type="button" class="checkout-link" @click="openTermsOfUse">Terms of Use</button>.
             </p>
           </div>
 
-          <div class="circle-sheet-body info-sheet-body">
-            <template v-if="activeInfoSheet === 'nostr'">
-              <article class="info-card">
-                <h4>What is Nostr?</h4>
-                <p>
-                  Nostr is a decentralized protocol that uses cryptographic keys for identity, signing, and message
-                  exchange without a central account server.
-                </p>
-              </article>
+          <div v-else class="circle-page-body private-activated-page">
+            <div class="activated-success">
+              <div class="activated-success-icon">
+                <i class="pi pi-check-circle" />
+              </div>
+              <h3>Circle Activated!</h3>
+              <p>Your secure private relay is live. Customize your circle to get started.</p>
+            </div>
 
-              <article class="info-card">
-                <h4>Private keys and <code>nsec</code></h4>
-                <p>
-                  Your private key proves your identity and signs outgoing events. A normal login key usually starts
-                  with <code>nsec1...</code>, while this desktop rebuild also accepts raw 64-character hex keys.
-                </p>
-              </article>
+            <section class="activated-section">
+              <div class="activated-step-header">
+                <span class="activated-step-index">1</span>
+                <strong>Name your circle</strong>
+              </div>
 
-              <article class="info-card">
-                <h4>Remote signer</h4>
-                <p>
-                  A remote signer keeps the private key off-device and signs on your behalf through
-                  <code>bunker://</code> or <code>nostrconnect://</code> links.
-                </p>
-              </article>
+              <button type="button" class="activated-card activated-edit-card" @click="editPrivateCircleName">
+                <span>{{ privateCircleName }}</span>
+                <i class="pi pi-pencil" />
+              </button>
+            </section>
 
-              <article class="info-card">
-                <h4>How to use it</h4>
-                <ol class="info-step-list">
-                  <li class="info-step-item">Enter your <code>nsec</code> or 64-character hex key for direct login.</li>
-                  <li class="info-step-item">Or paste a valid <code>bunker://</code> or <code>nostrconnect://</code> signer URI.</li>
-                  <li class="info-step-item">The app will authenticate and continue into profile or circle setup.</li>
-                </ol>
-              </article>
+            <section class="activated-section">
+              <div class="activated-step-header">
+                <span class="activated-step-index">2</span>
+                <strong>Invite members</strong>
+              </div>
+
+              <div class="activated-card activated-plan-card">
+                <div class="activated-plan-head">
+                  <div class="activated-plan-copy">
+                    <span class="activated-plan-icon"><i class="pi pi-diamond" /></span>
+                    <div>
+                      <strong>{{ selectedPrivatePlan.planName }}</strong>
+                      <p>Unlimited Secure Storage</p>
+                    </div>
+                  </div>
+
+                  <div class="activated-member-copy">
+                    <strong>1/{{ selectedPrivatePlan.maxUsers }}</strong>
+                    <span>MEMBERS</span>
+                  </div>
+                </div>
+
+                <div class="activated-progress">
+                  <span :style="{ width: `${100 / selectedPrivatePlan.maxUsers}%` }"></span>
+                </div>
+
+                <button type="button" class="activated-share-button" @click="sharePrivateInvitePreview">
+                  <i class="pi pi-share-alt" />
+                  <span>Share Preview Link</span>
+                </button>
+
+                <p class="activated-hint">
+                  Share a private-circle preview with up to {{ privateInviteRemaining }} more people.
+                </p>
+              </div>
+            </section>
+          </div>
+
+          <footer v-if="activeCirclePage !== 'privateLearnMore'" class="circle-page-footer">
+            <template v-if="activeCirclePage === 'restore'">
+              <button type="button" class="action-button action-dark" :disabled="!selectedRestorableCircles.length" @click="confirmRestorePage">
+                {{ restoreActionLabel }}
+              </button>
+              <button type="button" class="restore-skip-button" @click="skipRestorePage">Skip</button>
+            </template>
+
+            <template v-else-if="activeCirclePage === 'privateOverview'">
+              <button type="button" class="action-button action-dark" @click="openPrivateCapacity">
+                <span class="action-button-content">
+                  <span>CONFIGURE PLAN</span>
+                  <i class="pi pi-arrow-right action-button-arrow" />
+                </span>
+              </button>
+            </template>
+
+            <template v-else-if="activeCirclePage === 'privateCapacity'">
+              <button type="button" class="action-button action-dark" @click="openPrivateDuration">
+                <span class="action-button-content">
+                  <span>Continue</span>
+                  <i class="pi pi-arrow-right action-button-arrow" />
+                </span>
+              </button>
+            </template>
+
+            <template v-else-if="activeCirclePage === 'privateDuration'">
+              <button type="button" class="action-button action-dark" @click="openPrivateCheckout">
+                <span class="action-button-content">
+                  <span>Continue</span>
+                  <i class="pi pi-arrow-right action-button-arrow" />
+                </span>
+              </button>
+            </template>
+
+            <template v-else-if="activeCirclePage === 'privateCheckout'">
+              <button type="button" class="action-button action-dark" @click="openPrivateActivated">Subscribe</button>
+            </template>
+
+            <template v-else-if="activeCirclePage === 'privateActivated'">
+              <button type="button" class="action-button action-dark" @click="closeCirclePage">
+                <span class="action-button-content">
+                  <span>Enter My Private Circle</span>
+                  <i class="pi pi-arrow-right action-button-arrow" />
+                </span>
+              </button>
             </template>
 
             <template v-else>
-              <article class="info-card">
-                <h4>Your private communication hub</h4>
-                <p>
-                  A circle is the relay address your chats use for delivery, storage, and sync. Messages stay
-                  encrypted, so the relay moves data without being able to read it.
-                </p>
-              </article>
-
-              <article class="info-card">
-                <h4>Think of it like a mailroom</h4>
-                <p>The relay receives messages, holds them until recipients sync, and forwards them to the right contacts.</p>
-                <p>Community circles are shared public relays. Private circles are dedicated relays with more control.</p>
-              </article>
-
-              <article class="info-card">
-                <h4>How it works</h4>
-                <ol class="info-step-list">
-                  <li class="info-step-item">You send a message to the circle relay.</li>
-                  <li class="info-step-item">The relay stores the encrypted event until recipients fetch it.</li>
-                  <li class="info-step-item">Your contacts sync from the same relay and decrypt locally.</li>
-                  <li class="info-step-item">You can enter a full <code>wss://</code> URL or a shortcut like <code>0xchat</code>.</li>
-                </ol>
-              </article>
+              <button type="button" class="action-button action-dark" @click="closeCirclePage">Close</button>
             </template>
+          </footer>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="sheet-fade">
+      <div v-if="showSignerPairingPage" class="info-page-layer">
+        <div class="info-page-shell pairing-page-shell" role="dialog" aria-modal="true">
+          <header class="info-page-header">
+            <button type="button" class="topbar-back" aria-label="Go back" @click="closeSignerPairingPage">
+              <span class="topbar-chevron">‹</span>
+            </button>
+            <h2 class="info-page-title">Pair with Signer</h2>
+            <span class="topbar-side" aria-hidden="true"></span>
+          </header>
+
+          <div class="info-page-body pairing-page-body">
+            <section class="info-page-section info-page-hero">
+              <p class="info-page-subtitle">Connect a desktop client to your signer app</p>
+              <span class="info-page-accent"></span>
+              <p class="info-page-description">
+                Copy the client URI below into your signer app, approve the connection, then return here.
+              </p>
+            </section>
+
+            <section class="info-page-section">
+              <h3 class="info-page-section-title">Client URI</h3>
+              <p v-if="pendingSignerClientUriLoading" class="section-footnote">Generating desktop client URI...</p>
+              <template v-else-if="pendingSignerClientUri">
+                <Textarea
+                  :model-value="pendingSignerClientUri.uri"
+                  rows="6"
+                  auto-resize
+                  readonly
+                  class="wide-input pairing-uri-input"
+                />
+                <p class="section-footnote">
+                  {{ pendingSignerClientUri.clientName }} · {{ pendingSignerClientUri.relayCount }} relays
+                </p>
+                <p v-if="pendingSignerClientUri.relays.length" class="section-footnote pairing-relay-list">
+                  {{ pendingSignerClientUri.relays.join(", ") }}
+                </p>
+              </template>
+
+              <p v-if="pendingSignerPairingWaiting" class="inline-hint tone-info">Waiting for signer approval...</p>
+              <p v-else-if="pendingSignerPairingError" class="inline-hint tone-error">
+                {{ pendingSignerPairingError }}
+              </p>
+            </section>
           </div>
 
-          <div class="circle-sheet-actions sheet-button-single">
-            <button type="button" class="sheet-button sheet-button-primary" @click="closeInfoSheet">Close</button>
+          <footer class="pairing-page-footer">
+            <button
+              type="button"
+              class="pairing-button pairing-button-secondary"
+              :disabled="!pendingSignerClientUri?.uri || pendingSignerClientUriLoading || pendingSignerPairingWaiting"
+              @click="copySignerPairingUri"
+            >
+              Copy URI
+            </button>
+            <button
+              type="button"
+              class="pairing-button pairing-button-primary"
+              :disabled="pendingSignerClientUriLoading || pendingSignerPairingWaiting"
+              @click="confirmSignerPairingApproval"
+            >
+              {{ pendingSignerPairingWaiting ? "Waiting..." : "I approved in signer app" }}
+            </button>
+          </footer>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="sheet-fade">
+      <div v-if="activeInfoSheet" class="info-page-layer">
+        <div class="info-page-shell" role="dialog" aria-modal="true">
+          <header class="info-page-header">
+            <button type="button" class="topbar-back" aria-label="Go back" @click="closeInfoSheet">
+              <span class="topbar-chevron">‹</span>
+            </button>
+            <h2 class="info-page-title">{{ activeInfoSheet === "nostr" ? "Understanding Nostr" : "What is a Circle?" }}</h2>
+            <span class="topbar-side" aria-hidden="true"></span>
+          </header>
+
+          <div class="info-page-body">
+            <template v-if="activeInfoSheet === 'nostr'">
+              <section class="info-page-section info-page-hero">
+                <p class="info-page-subtitle">Learn about Nostr and how to use it securely</p>
+                <span class="info-page-accent"></span>
+              </section>
+
+              <section class="info-page-section">
+                <h3 class="info-page-section-title">What is Nostr?</h3>
+                <article class="info-content-card">
+                  <span class="info-content-icon"><i class="pi pi-globe" /></span>
+                  <p>
+                    Nostr is a decentralized, censorship-resistant social media protocol. It allows users to
+                    communicate directly without relying on centralized servers, using cryptographic keys for identity
+                    and encryption.
+                  </p>
+                </article>
+              </section>
+
+              <section class="info-page-section">
+                <h3 class="info-page-section-title">Nostr Private Key</h3>
+                <article class="info-content-card">
+                  <span class="info-content-icon"><i class="pi pi-key" /></span>
+                  <p>
+                    A Nostr private key is a secret cryptographic key that proves your identity and allows you to sign
+                    messages. It's like a password that gives you access to your account.
+                  </p>
+                </article>
+                <article class="info-content-card">
+                  <span class="info-content-icon"><i class="pi pi-code" /></span>
+                  <p>
+                    Private keys are typically formatted as 'nsec1...' followed by a long string of characters. This
+                    format makes them easy to identify and use in Nostr applications.
+                  </p>
+                </article>
+              </section>
+
+              <section class="info-page-section">
+                <h3 class="info-page-section-title">Remote Signer</h3>
+                <article class="info-content-card">
+                  <span class="info-content-icon"><i class="pi pi-cloud" /></span>
+                  <p>
+                    A remote signer is a service that holds your private key securely and signs messages on your
+                    behalf. This allows you to use Nostr without storing sensitive keys on your device.
+                  </p>
+                </article>
+                <article class="info-content-card">
+                  <span class="info-content-icon"><i class="pi pi-shield" /></span>
+                  <p>
+                    The Bunker protocol (NIP-46) enables secure communication between your device and remote signers,
+                    ensuring your private key never leaves the secure environment.
+                  </p>
+                </article>
+                <p class="section-footnote">
+                  Need a bunker URI for desktop login?
+                  <button type="button" class="inline-link-button info-section-link" @click="openSignerPairingPage">
+                    Pair with signer app
+                  </button>
+                </p>
+              </section>
+
+              <section class="info-page-section">
+                <h3 class="info-page-section-title">How to Use</h3>
+                <div class="info-step-card">
+                  <div class="info-step-row">
+                    <span class="info-content-icon"><i class="pi pi-key" /></span>
+                    <p>1. Enter your nsec private key for direct login</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-content-icon"><i class="pi pi-cloud" /></span>
+                    <p>2. Or use a bunker:// URI for remote signer login</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-content-icon"><i class="pi pi-sign-in" /></span>
+                    <p>3. The app will securely connect and authenticate you</p>
+                  </div>
+                </div>
+              </section>
+            </template>
+
+            <template v-else>
+              <section class="info-page-section info-page-hero">
+                <p class="info-page-subtitle">Your private communication hub</p>
+                <span class="info-page-accent"></span>
+                <p class="info-page-description">
+                  A Circle is like your own private mailroom that handles all your encrypted messages. It helps you
+                  chat with friends while keeping everything secure and private.
+                </p>
+              </section>
+
+              <section class="info-page-section">
+                <h3 class="info-page-section-title">Think of it like a mailroom</h3>
+                <div class="info-step-card">
+                  <div class="info-step-row">
+                    <span class="info-content-icon"><i class="pi pi-inbox" /></span>
+                    <p>📬 A Circle is like a mailroom in an apartment building - it receives, stores, and delivers messages for everyone in your community.</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-content-icon"><i class="pi pi-send" /></span>
+                    <p>🔒 All messages are locked in sealed envelopes - the mailroom can't read what's inside, only you and your friends can.</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-content-icon"><i class="pi pi-shield" /></span>
+                    <p>🏢 Community Circles are like shared mailrooms (free and easy). Private Circles are like having your own personal mailbox (more control).</p>
+                  </div>
+                </div>
+              </section>
+
+              <section class="info-page-section">
+                <h3 class="info-page-section-title">How does it work?</h3>
+                <div class="info-step-card">
+                  <div class="info-step-row">
+                    <span class="info-step-badge">1</span>
+                    <p>📱 You send a message to your friends through the Circle</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-step-badge">2</span>
+                    <p>📦 The Circle stores it safely (like a mailbox)</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-step-badge">3</span>
+                    <p>📨 Your friends pick up the message from the Circle</p>
+                  </div>
+                  <div class="info-step-row">
+                    <span class="info-step-badge">4</span>
+                    <p>✨ Your messages are encrypted and private.</p>
+                  </div>
+                </div>
+              </section>
+            </template>
           </div>
         </div>
       </div>
@@ -1025,10 +2081,11 @@ function submit() {
 
 <style scoped>
 .login-screen {
-  min-height: calc(100vh - 24px);
+  min-height: 100vh;
   display: grid;
   place-items: center;
   padding: 12px;
+  background: linear-gradient(180deg, #5e79bd 0%, #6d86c5 42%, #7c93ca 100%);
 }
 
 .entry-shell {
@@ -1152,6 +2209,18 @@ function submit() {
   opacity: 0.52;
 }
 
+.action-button-content {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.action-button-arrow {
+  font-size: 0.95rem;
+}
+
 .action-primary {
   background: #ffffff;
   color: #214481;
@@ -1169,40 +2238,26 @@ function submit() {
 }
 
 .terms-row {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
+  display: block;
   color: rgba(246, 248, 255, 0.72);
   font-size: 0.8rem;
   line-height: 1.6;
+  text-align: center;
 }
 
 .terms-row p {
   margin: 0;
 }
 
-.terms-link {
+.terms-link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 0.14em;
-}
-
-.terms-check {
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  border-radius: 4px;
-  margin-top: 2px;
-}
-
-.terms-check::after {
-  content: "";
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
-  background: rgba(255, 255, 255, 0.9);
 }
 
 .mobile-page {
@@ -1316,6 +2371,11 @@ function submit() {
   text-underline-offset: 0.16em;
 }
 
+.footnote-divider {
+  margin: 0 0.3rem;
+  color: rgba(123, 140, 165, 0.9);
+}
+
 .avatar-preview {
   width: 88px;
   height: 88px;
@@ -1324,7 +2384,7 @@ function submit() {
   border: 0;
   background: transparent;
   position: relative;
-  cursor: default;
+  cursor: pointer;
 }
 
 .profile-avatar {
@@ -1337,6 +2397,15 @@ function submit() {
   color: #17345c;
   font-size: 1.35rem;
   font-weight: 700;
+  margin: 0 auto;
+}
+
+.profile-avatar-image {
+  width: 80px;
+  height: 80px;
+  display: block;
+  border-radius: 999px;
+  object-fit: cover;
   margin: 0 auto;
 }
 
@@ -1353,6 +2422,10 @@ function submit() {
   color: #ffffff;
   border: 2px solid #ffffff;
   font-size: 0.72rem;
+}
+
+.hidden-file-input {
+  display: none;
 }
 
 .input-stack,
@@ -1374,10 +2447,6 @@ function submit() {
 
 .tone-error {
   color: #c95353;
-}
-
-.tone-warn {
-  color: #9a6820;
 }
 
 .tone-info {
@@ -1551,18 +2620,795 @@ function submit() {
   line-height: 1.6;
 }
 
-.selection-pill {
-  padding: 6px 10px;
-  border-radius: 999px;
-  background: rgba(41, 87, 153, 0.08);
-  color: #44628c;
-  font-size: 0.72rem;
-  text-transform: capitalize;
-}
-
 .mobile-footer {
   padding: 16px 30px 24px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 24%);
+}
+
+.mobile-footer-hint {
+  margin: 0 0 10px;
+  text-align: center;
+}
+
+.circle-page-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 26;
+  background: #ffffff;
+}
+
+.circle-page-shell,
+.restore-copy,
+.restore-list,
+.restore-card,
+.restore-card-copy,
+.private-hero,
+.private-feature-list,
+.private-feature,
+.learn-brand,
+.learn-section,
+.learn-pricing-card,
+.learn-pricing-item,
+.private-progress,
+.private-progress-bars,
+.private-progress-labels,
+.private-step-copy,
+.private-option-list,
+.private-select-card,
+.private-select-copy,
+.private-summary-card,
+.private-summary-copy,
+.private-summary-side,
+.activated-success,
+.activated-section,
+.activated-card {
+  display: grid;
+}
+
+.circle-page-shell {
+  width: min(430px, 100vw);
+  min-height: 100vh;
+  margin: 0 auto;
+  background: #ffffff;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.circle-page-header {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  align-items: center;
+  padding: 16px 18px 10px;
+}
+
+.circle-page-title {
+  min-height: 24px;
+  margin: 0;
+  text-align: center;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: #223553;
+}
+
+.circle-page-body {
+  overflow: auto;
+  padding: 20px 30px 24px;
+}
+
+.circle-page-footer {
+  display: grid;
+  gap: 12px;
+  padding: 16px 30px 24px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 24%);
+}
+
+.circle-page-note {
+  text-align: center;
+}
+
+.restore-page,
+.private-overview-page,
+.private-learn-page,
+.private-capacity-page,
+.private-duration-page,
+.private-checkout-page,
+.private-activated-page {
+  gap: 24px;
+}
+
+.restore-copy {
+  gap: 12px;
+}
+
+.restore-copy h3,
+.restore-copy p,
+.restore-card-copy p,
+.restore-card-copy span,
+.private-hero h3,
+.private-hero p,
+.private-feature p,
+.restore-card-copy strong,
+.private-feature strong {
+  margin: 0;
+}
+
+.restore-copy h3,
+.private-hero h3 {
+  color: #20324f;
+  font-size: 1.9rem;
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+  font-weight: 700;
+}
+
+.restore-copy p,
+.private-hero p,
+.private-feature p,
+.private-step-copy p,
+.private-summary-copy p,
+.activated-success p,
+.activated-plan-copy p,
+.activated-hint,
+.learn-disclaimer,
+.checkout-terms {
+  color: #73859d;
+  line-height: 1.6;
+}
+
+.restore-icon,
+.private-hero-icon {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: #e6eefc;
+  color: #2b6fce;
+  font-size: 1.25rem;
+}
+
+.restore-list {
+  gap: 12px;
+}
+
+.restore-card {
+  width: 100%;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 16px;
+  border: 1px solid rgba(211, 221, 232, 0.95);
+  border-radius: 16px;
+  background: #ffffff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.restore-card.active {
+  border-color: rgba(83, 132, 193, 0.82);
+  background: linear-gradient(180deg, #f8fbff 0%, #f6fbf8 100%);
+}
+
+.restore-avatar {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #4f8fe6 0%, #68be9a 100%);
+  color: #ffffff;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.restore-card-copy {
+  gap: 4px;
+  min-width: 0;
+}
+
+.restore-card-copy p,
+.restore-card-copy span {
+  color: #6d8098;
+  font-size: 0.88rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.restore-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.restore-check {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 2px solid rgba(141, 159, 184, 0.38);
+  color: transparent;
+}
+
+.restore-check.active {
+  border-color: #2b6fce;
+  background: #2b6fce;
+  color: #ffffff;
+}
+
+.restore-skip-button {
+  justify-self: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #61738d;
+  font: inherit;
+  cursor: pointer;
+}
+
+.private-hero {
+  justify-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.private-hero-icon {
+  width: 80px;
+  height: 80px;
+  border-radius: 18px;
+  background: #214481;
+  color: #ffffff;
+  font-size: 2rem;
+}
+
+.private-hero-price {
+  margin: -6px 0 0;
+  color: #61738d;
+  font-size: 0.96rem;
+  font-weight: 600;
+}
+
+.private-learn-more {
+  justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.private-feature-list {
+  gap: 24px;
+}
+
+.private-feature {
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.private-feature strong,
+.learn-section h4 {
+  color: #20324f;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.private-feature-icon {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  font-size: 1.15rem;
+}
+
+.private-feature-icon.lavender {
+  background: #ece7ff;
+  color: #6f5ad9;
+}
+
+.private-feature-icon.blue {
+  background: #e3f0ff;
+  color: #2b80da;
+}
+
+.private-feature-icon.rose {
+  background: #ffe8ef;
+  color: #d94b67;
+}
+
+.learn-brand {
+  gap: 8px;
+}
+
+.learn-pricing-card {
+  gap: 0;
+  padding: 6px 0;
+  border-radius: 12px;
+  border: 1px solid rgba(210, 221, 233, 0.82);
+}
+
+.learn-pricing-item {
+  gap: 10px;
+  padding: 12px 16px;
+}
+
+.learn-pricing-item.divided {
+  border-top: 1px solid rgba(210, 221, 233, 0.82);
+}
+
+.learn-pricing-head,
+.learn-pricing-values {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.learn-pricing-head strong,
+.learn-pricing-values strong,
+.learn-pricing-values span,
+.learn-pricing-head span {
+  margin: 0;
+}
+
+.learn-pricing-head strong,
+.learn-pricing-values strong {
+  color: #20324f;
+  font-weight: 700;
+}
+
+.learn-pricing-head span,
+.learn-pricing-values span {
+  color: #7b8ca5;
+  font-size: 0.83rem;
+}
+
+.learn-brand p,
+.learn-disclaimer,
+.checkout-terms {
+  margin: 0;
+}
+
+.learn-brand p {
+  color: #2d74dd;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.learn-brand span {
+  width: 60px;
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2d74dd 0%, rgba(45, 116, 221, 0.2) 100%);
+}
+
+.private-learn-page,
+.learn-section {
+  gap: 12px;
+}
+
+.pricing-info-head,
+.private-select-head,
+.private-summary-row,
+.private-summary-total,
+.activated-step-header,
+.activated-plan-head,
+.activated-share-button {
+  display: flex;
+  align-items: center;
+}
+
+.pricing-info-head {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pricing-info-head strong,
+.pricing-info-head span,
+.private-step-copy h3,
+.private-step-copy p,
+.private-select-copy strong,
+.private-select-copy p,
+.private-summary-copy strong,
+.private-summary-side strong,
+.private-summary-label,
+.private-summary-price span,
+.private-summary-price small,
+.activated-success h3,
+.activated-step-header strong,
+.activated-card span,
+.activated-plan-copy strong,
+.activated-member-copy strong,
+.activated-member-copy span {
+  margin: 0;
+}
+
+.pricing-info-head strong,
+.pricing-info-head span {
+  color: #20324f;
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
+.learn-disclaimer {
+  font-size: 0.84rem;
+}
+
+.private-progress {
+  gap: 8px;
+}
+
+.private-progress-bars {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.private-progress-bar {
+  display: block;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(111, 127, 150, 0.24);
+}
+
+.private-progress-bar.active {
+  background: #2d74dd;
+}
+
+.private-progress-labels {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.private-progress-labels span {
+  color: #8a97aa;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.private-progress-labels span:nth-child(2) {
+  text-align: center;
+}
+
+.private-progress-labels span:nth-child(3) {
+  text-align: right;
+}
+
+.private-step-copy {
+  gap: 8px;
+}
+
+.private-step-copy h3 {
+  color: #20324f;
+  font-size: 1.9rem;
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+  font-weight: 700;
+}
+
+.private-option-list {
+  gap: 16px;
+}
+
+.private-select-card {
+  width: 100%;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 20px;
+  border: 1px solid rgba(210, 221, 233, 0.82);
+  border-radius: 16px;
+  background: #ffffff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.private-select-card.active {
+  border-color: #214481;
+  box-shadow: inset 0 0 0 1px rgba(33, 68, 129, 0.2);
+}
+
+.private-plan-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  font-size: 1.05rem;
+}
+
+.private-plan-icon.lavender {
+  background: #f0e5ff;
+  color: #6f5ad9;
+}
+
+.private-plan-icon.blue {
+  background: #e5f0ff;
+  color: #2d74dd;
+}
+
+.private-plan-icon.rose {
+  background: #ffe5f1;
+  color: #d94b67;
+}
+
+.private-select-copy {
+  gap: 6px;
+}
+
+.private-select-head {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.private-select-copy strong {
+  color: #20324f;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.private-select-copy p {
+  color: #73859d;
+  font-size: 0.9rem;
+}
+
+.private-price-line {
+  color: #20324f;
+  font-size: 1.55rem;
+  line-height: 1.1;
+  font-weight: 700;
+}
+
+.private-inline-badge,
+.private-save-badge {
+  padding: 4px 7px;
+  border-radius: 6px;
+  color: #ffffff;
+  font-size: 0.67rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.private-inline-badge {
+  background: #214481;
+}
+
+.private-save-badge {
+  background: #2f9b61;
+}
+
+.private-radio {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 2px solid rgba(141, 159, 184, 0.42);
+  color: transparent;
+}
+
+.private-radio.active {
+  border-color: #214481;
+  background: #214481;
+  color: #ffffff;
+}
+
+.private-summary-card {
+  gap: 16px;
+  padding: 20px;
+  border-radius: 16px;
+  background: #f7fafc;
+}
+
+.private-summary-row,
+.private-summary-total,
+.activated-plan-head {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.private-summary-copy,
+.private-summary-side {
+  gap: 4px;
+}
+
+.private-summary-side {
+  justify-items: end;
+  text-align: right;
+}
+
+.private-summary-label {
+  color: #8794a7;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.private-summary-copy strong,
+.private-summary-side strong,
+.private-summary-total strong {
+  color: #20324f;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.private-summary-divider {
+  height: 1px;
+  background: rgba(117, 133, 155, 0.16);
+}
+
+.private-summary-price {
+  display: grid;
+  justify-items: end;
+}
+
+.private-summary-price span {
+  color: #20324f;
+  font-size: 1.5rem;
+  line-height: 1.1;
+  font-weight: 700;
+}
+
+.private-summary-price small {
+  color: #73859d;
+  font-size: 0.85rem;
+}
+
+.checkout-terms {
+  text-align: center;
+  font-size: 0.82rem;
+}
+
+.checkout-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2d74dd;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 0.14em;
+}
+
+.activated-success {
+  justify-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.activated-success-icon {
+  width: 64px;
+  height: 64px;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  background: #e5f6ed;
+  color: #2f9b61;
+  font-size: 2.1rem;
+}
+
+.activated-success h3 {
+  color: #20324f;
+  font-size: 1.9rem;
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+  font-weight: 700;
+}
+
+.activated-section {
+  gap: 12px;
+}
+
+.activated-step-header {
+  gap: 8px;
+}
+
+.activated-step-index {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #172334;
+  color: #ffffff;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.activated-step-header strong {
+  color: #20324f;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.activated-card {
+  gap: 14px;
+  padding: 16px;
+  border-radius: 14px;
+  background: #f7fafc;
+}
+
+.activated-edit-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.activated-edit-card span,
+.activated-plan-copy strong,
+.activated-member-copy strong {
+  color: #20324f;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.activated-edit-card i {
+  color: #7e8ea4;
+}
+
+.activated-plan-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.activated-plan-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  color: #f0b323;
+  font-size: 1rem;
+}
+
+.activated-plan-copy p,
+.activated-member-copy span {
+  color: #7b8ca5;
+  font-size: 0.83rem;
+  line-height: 1.45;
+  margin: 2px 0 0;
+}
+
+.activated-member-copy {
+  text-align: right;
+}
+
+.activated-progress {
+  height: 4px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(117, 133, 155, 0.18);
+}
+
+.activated-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #2d74dd;
+}
+
+.activated-share-button {
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1.5px solid rgba(117, 133, 155, 0.28);
+  border-radius: 12px;
+  background: #ffffff;
+  color: #172334;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.activated-hint,
+.activated-feedback {
+  text-align: center;
 }
 
 .circle-sheet-layer {
@@ -1577,8 +3423,7 @@ function submit() {
 .circle-sheet-card,
 .circle-sheet-copy,
 .circle-sheet-body,
-.circle-sheet-actions,
-.relay-suggestions {
+.circle-sheet-actions {
   display: grid;
 }
 
@@ -1630,26 +3475,19 @@ function submit() {
   margin: 0;
 }
 
-.relay-suggestions {
-  grid-auto-flow: column;
-  grid-auto-columns: max-content;
-  gap: 8px;
+.inline-relay-shortcut {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2b6fce;
+  font: inherit;
+  cursor: pointer;
 }
 
-.relay-chip,
 .sheet-button {
   border: 0;
   cursor: pointer;
   font: inherit;
-}
-
-.relay-chip {
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: #eef4fb;
-  color: #315279;
-  font-size: 0.9rem;
-  font-weight: 600;
 }
 
 .circle-sheet-actions {
@@ -1678,12 +3516,183 @@ function submit() {
   color: #ffffff;
 }
 
-.info-sheet-card {
-  gap: 20px;
+.info-page-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 27;
+  background: #ffffff;
 }
 
-.info-sheet-body {
-  gap: 14px;
+.info-page-shell {
+  width: min(430px, 100vw);
+  min-height: 100vh;
+  margin: 0 auto;
+  background: #ffffff;
+}
+
+.pairing-page-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.info-page-header {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  align-items: center;
+  padding: 16px 18px 10px;
+}
+
+.info-page-title {
+  margin: 0;
+  color: #223553;
+  text-align: center;
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
+.info-page-body,
+.info-page-section,
+.info-step-card,
+.info-how-card,
+.info-faq-card {
+  display: grid;
+}
+
+.info-page-body {
+  gap: 24px;
+  padding: 20px 30px 24px;
+}
+
+.pairing-page-body {
+  padding-bottom: 12px;
+}
+
+.info-page-section {
+  gap: 16px;
+}
+
+.info-section-link {
+  margin-left: 0.25rem;
+}
+
+.info-page-hero {
+  gap: 8px;
+}
+
+.info-page-subtitle,
+.info-page-description,
+.info-content-card p,
+.info-step-row p,
+.info-qa-card p,
+.info-how-card p,
+.info-faq-card p {
+  margin: 0;
+}
+
+.info-page-subtitle {
+  color: #2d74dd;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.info-page-description {
+  color: #667a94;
+  line-height: 1.6;
+  font-size: 0.92rem;
+}
+
+.info-page-accent {
+  width: 60px;
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2d74dd 0%, rgba(45, 116, 221, 0.2) 100%);
+}
+
+.info-page-section-title {
+  margin: 0;
+  color: #20324f;
+  font-size: 1.35rem;
+  line-height: 1.2;
+  font-weight: 700;
+}
+
+.info-content-card,
+.info-step-card,
+.info-qa-card,
+.info-how-card,
+.info-faq-card {
+  gap: 12px;
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(210, 221, 233, 0.82);
+  background: #ffffff;
+}
+
+.info-content-card,
+.info-step-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.info-content-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(45, 116, 221, 0.1);
+  color: #2d74dd;
+  font-size: 1.05rem;
+}
+
+.info-content-card p,
+.info-step-row p,
+.info-qa-card p,
+.info-how-card p,
+.info-faq-card p {
+  color: #667a94;
+  line-height: 1.6;
+  font-size: 0.92rem;
+}
+
+.info-step-badge {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #2d74dd;
+  color: #ffffff;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.info-step-card {
+  gap: 12px;
+}
+
+.info-qa-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.info-qa-dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: #2d74dd;
+}
+
+.info-qa-head strong,
+.info-faq-card strong {
+  color: #20324f;
+  font-size: 0.98rem;
+  line-height: 1.4;
+  font-weight: 700;
 }
 
 .info-card {
@@ -1715,14 +3724,56 @@ function submit() {
   font-size: 0.92rem;
 }
 
+.pairing-uri-input {
+  word-break: break-all;
+}
+
+.pairing-relay-list {
+  word-break: break-word;
+}
+
+.pairing-page-footer {
+  display: grid;
+  gap: 10px;
+  padding: 0 30px 24px;
+}
+
+.pairing-button {
+  min-height: 48px;
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+
+.pairing-button:hover:enabled {
+  transform: translateY(-1px);
+}
+
+.pairing-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.pairing-button-secondary {
+  background: #eef4fb;
+  color: #27426d;
+}
+
+.pairing-button-primary {
+  background: #0f1729;
+  color: #ffffff;
+}
+
 .info-step-list {
   display: grid;
   gap: 10px;
   padding-left: 1.2rem;
-}
-
-.sheet-button-single {
-  grid-template-columns: 1fr;
 }
 
 .sheet-fade-enter-active,
@@ -1731,7 +3782,9 @@ function submit() {
 }
 
 .sheet-fade-enter-active .circle-sheet-card,
-.sheet-fade-leave-active .circle-sheet-card {
+.sheet-fade-leave-active .circle-sheet-card,
+.sheet-fade-enter-active .info-page-shell,
+.sheet-fade-leave-active .info-page-shell {
   transition:
     transform 0.18s ease,
     opacity 0.18s ease;
@@ -1743,7 +3796,9 @@ function submit() {
 }
 
 .sheet-fade-enter-from .circle-sheet-card,
-.sheet-fade-leave-to .circle-sheet-card {
+.sheet-fade-leave-to .circle-sheet-card,
+.sheet-fade-enter-from .info-page-shell,
+.sheet-fade-leave-to .info-page-shell {
   transform: translateY(16px);
   opacity: 0.96;
 }
@@ -1786,7 +3841,9 @@ code {
   }
 
   .mobile-body,
-  .mobile-footer {
+  .mobile-footer,
+  .info-page-body,
+  .pairing-page-footer {
     padding-left: 20px;
     padding-right: 20px;
   }

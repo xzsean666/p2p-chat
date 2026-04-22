@@ -7,21 +7,27 @@
 ## 当前阶段硬约束
 
 1. 当前阶段唯一 P0 目标是: `通过 Nostr relay 完成真实聊天`，优先打通 `登录/凭据 -> signer/runtime -> relay publish -> inbound sync -> 消息展示/回执` 这条主链。
-2. 凡是需要独立后端、圈子服务端、对象存储服务、付款/订阅服务或任何额外服务端接口配合的任务，一律暂停，除非用户明确重新开启。
-3. 暂停范围至少包括:
+2. 当前产品范围明确收敛为: `简单 P2P 聊天 MVP`。凡是不属于 MVP 聊天闭环的能力，即使 `tmp/xchat-app-main` 里存在，也不能抢在主链之前实现。
+3. 凡是需要独立后端、圈子服务端、对象存储服务、付款/订阅服务或任何额外服务端接口配合的任务，一律暂停，除非用户明确重新开启。
+4. 暂停范围至少包括:
    - `file server` 管理页与对应数据模型迁移
    - `NIP-96 / Blossom / MinIO / S3 / presigned URL / paid circle S3 config`
    - 任何 `upload / download / media backend` 扩展
    - `purchase / subscription / private cloud / paid relay backend`
    - `push / share / scan / permission / tor` 中依赖服务端协作的部分
-4. 若某项功能必须依赖后端才能成立，不要继续扩展该方向，也不要临时发明新的 mock backend、env backend 或服务端合同；应明确标记为 `deferred`，转而继续推进 Nostr 聊天主链。
-5. 当前允许继续做的重点只包括:
+5. 若某项功能必须依赖后端才能成立，不要继续扩展该方向，也不要临时发明新的 mock backend、env backend 或服务端合同；应明确标记为 `deferred`，转而继续推进 Nostr 聊天主链。
+6. 当前允许继续做的重点只包括:
    - 本地 `nsec / hexKey` 登录与签名
    - `bunker / NIP-46` 远端 signer 握手与签名
+   - 基于公共 `wss` relay 的 Nostr 聊天 MVP，优先支持 `damus / nos / primal / 0xchat` 这类公开 relay 入口
    - relay 连接、发布、订阅、增量同步、回执与去重
    - Nostr direct/group message 映射、持久化与会话展示
    - 不依赖后端的消息域模型收敛与错误处理
-6. `Nostr 聊天主链` 的完成标准里，不接受“必须用户手动进入 diagnostics 或先点一次 `Connect` 才能工作”这种前提；登录后、选圈后、建圈后，runtime auto-start / auto-recover 必须默认成立。
+7. `Nostr 聊天主链` 的完成标准里，不接受“必须用户手动进入 diagnostics 或先点一次 `Connect` 才能工作”这种前提；登录后、选圈后、建圈后，runtime auto-start / auto-recover 必须默认成立。
+8. 若“完整复刻 `tmp/xchat-app-main`”与“先出简单 P2P 聊天 MVP”发生冲突，以 `MVP 范围优先`:
+   - 先实现 `MVP` 必需页面和交互
+   - `subscription / checkout / paid private circle` 等非 MVP 页面不进入主流程
+   - 待 MVP 聊天闭环稳定后，再决定是否补齐源项目里的非 MVP 页面
 
 ## 协作原则
 
@@ -32,7 +38,8 @@
 5. 先完成最小可运行闭环，再逐步接入真实聊天域模型、P2P 能力和本地持久化；当前闭环以 `Nostr 聊天主链` 为唯一优先级，不扩展后端依赖功能。
 6. 发生架构调整、阶段推进或开发流程变化时，同步更新 `BuildProgress.md` 和相关项目文档。
 7. 这是一个重构项目；涉及现有功能页重做时，优先对齐 `tmp/xchat-app-main` 的信息架构、交互节奏和视觉层级，不要先做自定义大改版，尤其是 `login / onboarding / circle entry`。
-8. 除非用户明确要求做 GUI 运行验收，否则不要依赖不可控的桌面自动点按、自动截图或无监督界面操作来下结论；优先做源码对照、静态实现和可复现的构建/测试验证。
+8. `UI 完全一样` 的要求，当前只适用于 `MVP` 保留范围内的页面与流程；不要为了追求全量页面复刻，把 `订阅 / 支付 / private cloud` 之类非 MVP 模块重新带回主流程。
+9. 除非用户明确要求做 GUI 运行验收，否则不要依赖不可控的桌面自动点按、自动截图或无监督界面操作来下结论；优先做源码对照、静态实现和可复现的构建/测试验证。
 
 ## 目录约定
 
@@ -52,10 +59,12 @@
 4. 常用开发、校验和打包入口统一走 `pnpm`，至少持续保证 `pnpm version:check`、`pnpm build`、`pnpm native:test`、`pnpm verify`、默认稳定打包入口 `pnpm desktop:build`、Linux 发布整理入口 `pnpm release:linux` 以及一键发布准备入口 `pnpm release:prepare <version>` 可用。
 5. 本地 preview runtime 相关改动要同时维护 companion binary、launch arguments 与本地命令解析回退，不允许只假设命令已经在全局 `PATH` 中存在。
 6. 若任务选择出现冲突，优先级固定为:
+   - `简单 P2P 聊天 MVP`
    - `Nostr 文本聊天主链`
    - `Nostr signer/runtime 稳定性`
    - `消息同步/回执/持久化`
-   - 其他全部延后，尤其是任何后端依赖能力
+   - `MVP 范围内页面的 source-like UI 对齐`
+   - 其他全部延后，尤其是任何后端依赖能力或非 MVP 页面复刻
 
 ## 完成定义
 

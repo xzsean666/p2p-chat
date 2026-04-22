@@ -4,6 +4,7 @@ const RELAY_QUERY_PATTERN = /^(wss?:\/\/|mesh:\/\/)/i;
 const INVITE_QUERY_PATTERN =
   /^(invite:\/\/|p2pchat:\/\/|circle:\/\/|xchat:\/\/|https?:\/\/)/i;
 const ACCOUNT_SCHEME_PATTERN = /^(bunker:\/\/|nostrconnect:\/\/)/i;
+const PUBLIC_RELAY_SHORTCUTS = new Set(["0xchat", "damus", "nos", "primal", "yabu", "nostrband"]);
 
 export function classifyChatQuery(query: string): ChatQueryKind | null {
   const trimmed = query.trim();
@@ -12,6 +13,10 @@ export function classifyChatQuery(query: string): ChatQueryKind | null {
   }
 
   if (RELAY_QUERY_PATTERN.test(trimmed)) {
+    return "relay";
+  }
+
+  if (PUBLIC_RELAY_SHORTCUTS.has(trimmed.toLowerCase())) {
     return "relay";
   }
 

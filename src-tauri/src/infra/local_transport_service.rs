@@ -1669,8 +1669,8 @@ fn trim_transport_activities(activities: Vec<TransportActivityItem>) -> Vec<Tran
 
 #[cfg(test)]
 mod tests {
-    use crate::app::chat_mutations;
     use super::*;
+    use crate::app::chat_mutations;
     use crate::domain::chat::{
         AuthRuntimeState, AuthRuntimeSummary, AuthSessionSummary, CircleItem, CircleType,
         ContactItem, GroupMember, GroupProfile, GroupRole, LoginAccessKind, LoginAccessSummary,
@@ -2043,13 +2043,15 @@ mod tests {
         std::env::var("P2P_CHAT_LIVE_RELAY_URL")
             .ok()
             .or_else(|| {
-                std::env::var("P2P_CHAT_LIVE_RELAY_URLS").ok().and_then(|value| {
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .find(|value| !value.is_empty())
-                        .map(str::to_string)
-                })
+                std::env::var("P2P_CHAT_LIVE_RELAY_URLS")
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .find(|value| !value.is_empty())
+                            .map(str::to_string)
+                    })
             })
             .unwrap_or_else(|| "wss://nos.lol".into())
     }
@@ -3882,9 +3884,8 @@ mod tests {
         let app_handle = guard.app.handle();
         ensure_live_runtime_binary_ready();
         let relay_url = manual_live_service_relay_url();
-        let contact_pubkey = valid_pubkey_hex(
-            "6666666666666666666666666666666666666666666666666666666666666666",
-        );
+        let contact_pubkey =
+            valid_pubkey_hex("6666666666666666666666666666666666666666666666666666666666666666");
 
         let mut seed = load_seed_from_store(app_handle);
         set_circle_relay(&mut seed, "main-circle", &relay_url);
@@ -4009,7 +4010,11 @@ mod tests {
         let final_message = final_seed
             .message_store
             .get("mika")
-            .and_then(|messages| messages.iter().find(|message| message.id == sent_message.id))
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.id == sent_message.id)
+            })
             .cloned();
 
         assert!(
@@ -4039,9 +4044,8 @@ mod tests {
         let app_handle = guard.app.handle();
         ensure_live_runtime_binary_ready();
         let relay_url = manual_live_service_relay_url();
-        let contact_pubkey = valid_pubkey_hex(
-            "6666666666666666666666666666666666666666666666666666666666666666",
-        );
+        let contact_pubkey =
+            valid_pubkey_hex("6666666666666666666666666666666666666666666666666666666666666666");
 
         let mut seed = load_seed_from_store(app_handle);
         set_circle_relay(&mut seed, "main-circle", &relay_url);
@@ -4167,13 +4171,20 @@ mod tests {
         let final_message = final_seed
             .message_store
             .get("mika")
-            .and_then(|messages| messages.iter().find(|message| message.id == sent_message.id))
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.id == sent_message.id)
+            })
             .cloned();
 
-        assert!(matches!(
-            latest_runtime.state,
-            TransportRuntimeState::Active | TransportRuntimeState::Starting
-        ), "latest runtime session={latest_runtime:?}");
+        assert!(
+            matches!(
+                latest_runtime.state,
+                TransportRuntimeState::Active | TransportRuntimeState::Starting
+            ),
+            "latest runtime session={latest_runtime:?}"
+        );
         assert!(
             background_sync_scheduled,
             "load_snapshot should schedule automatic background relay sync for the connected live runtime; markers={:?}",

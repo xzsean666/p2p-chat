@@ -4,6 +4,7 @@ import ArchivedChatsPage from "./components/ArchivedChatsPage.vue";
 import ChatPane from "./components/ChatPane.vue";
 import CircleDirectoryPage from "./components/CircleDirectoryPage.vue";
 import CircleDetailPage from "./components/CircleDetailPage.vue";
+import CircleInvitePage from "./components/CircleInvitePage.vue";
 import CircleSwitcher from "./components/CircleSwitcher.vue";
 import ContactProfilePage from "./components/ContactProfilePage.vue";
 import ConversationDetailsDrawer from "./components/ConversationDetailsDrawer.vue";
@@ -31,6 +32,8 @@ const appVersion = "0.1.0";
 const {
   searchText,
   composerText,
+  findPeopleSubmitting,
+  findPeopleErrorMessage,
   isAuthenticated,
   authSession,
   authRuntime,
@@ -97,6 +100,7 @@ const {
   chooseCircle,
   toggleCircleSwitcher,
   openNewMessage,
+  openCircleInvitePage,
   openSelfChatConfirmPage,
   openFindPeoplePage,
   openCircleManagement,
@@ -160,6 +164,40 @@ const {
   closeTopOverlayPage,
   dismissTransportNotice,
 } = useChatShell();
+
+async function shareCircleInvite() {
+  const url = inviteLink.value.trim();
+  if (!url) {
+    return;
+  }
+
+  const share = (navigator as Navigator & {
+    share?: (data: { title?: string; text?: string; url?: string }) => Promise<void>;
+  }).share;
+
+  if (typeof share === "function") {
+    try {
+      await share({
+        title: activeCircle.value?.name ?? "Circle Invite",
+        text: activeCircle.value ? `Invite to ${activeCircle.value.name}` : "Circle invite",
+        url,
+      });
+      return;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+    }
+  }
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      // The invite page keeps its own copy affordance; this fallback stays silent.
+    }
+  }
+}
 </script>
 
 <template>
@@ -272,12 +310,24 @@ const {
       :current-circle-contact-ids="currentCircleContactIds"
       :circle="activeCircle"
       :invite-link="inviteLink"
+      :can-invite="!!activeCircle"
+      :can-add-friends="!!activeCircle"
       @close="closeTopOverlayPage"
       @open-contact="openContactProfile"
       @select-contact="startConversation"
       @open-self-confirm="openSelfChatConfirmPage"
       @open-group-select="openGroupSelectMembersPage"
       @open-find-people="openFindPeoplePage"
+      @open-invite="openCircleInvitePage"
+    />
+
+    <CircleInvitePage
+      v-else-if="activeOverlayPage?.kind === 'circle-invite'"
+      key="circle-invite"
+      :circle-name="activeCircle?.name ?? 'Circle Invite'"
+      :invite-link="inviteLink"
+      @close="closeTopOverlayPage"
+      @share="shareCircleInvite"
     />
 
     <SelfChatConfirmPage
@@ -316,6 +366,8 @@ const {
       :current-circle-contact-ids="currentCircleContactIds"
       :circle="activeCircle"
       :mode="activeOverlayPage.mode ?? 'chat'"
+      :submitting="findPeopleSubmitting"
+      :submit-error="findPeopleErrorMessage"
       @close="closeTopOverlayPage"
       @open-contact="openContactProfile"
       @select-contact="startConversation"

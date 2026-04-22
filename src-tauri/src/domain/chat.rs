@@ -181,6 +181,8 @@ pub struct LoginCircleSelectionInput {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relays: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +261,19 @@ pub struct AuthRuntimeBindingSummary {
     pub client_name: Option<String>,
     pub persisted_in_native_store: bool,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRuntimeClientUriSummary {
+    pub uri: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub relay_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+    pub client_name: String,
+    pub stored_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

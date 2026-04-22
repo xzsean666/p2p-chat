@@ -1,10 +1,10 @@
 use crate::app::{auth_access, chat_mutations, shell_auth};
 use crate::domain::chat::{
-    default_message_page_size, AddCircleInput, ChatDomainOverview, ChatDomainSeed,
+    default_message_page_size, AddCircleInput, AuthRuntimeClientUriSummary, ChatDomainOverview, ChatDomainSeed,
     ChatSessionMessageUpdates, ChatSessionMessagesPage, ChatShellSnapshot,
-    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCircleSelectionMode,
-    LoginCompletionInput, LoginMethod, RestorableCircleEntry, RestoreCircleInput,
-    ShellStateSnapshot, UpdateAuthRuntimeInput,
+    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCircleSelectionInput,
+    LoginCircleSelectionMode, LoginCompletionInput, LoginMethod, RestorableCircleEntry,
+    RestoreCircleInput, ShellStateSnapshot, UpdateAuthRuntimeInput,
 };
 use crate::domain::chat_repository::ChatRepository;
 use crate::infra::shell_state_store;
@@ -159,6 +159,37 @@ pub fn update_auth_runtime<R: tauri::Runtime>(
     Ok(shell)
 }
 
+pub fn load_auth_runtime_client_uri<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<Option<AuthRuntimeClientUriSummary>, String> {
+    let shell = load_saved_shell_snapshot(app_handle)?;
+    let Some(auth_session) = shell.auth_session.as_ref() else {
+        return Ok(None);
+    };
+
+    if !matches!(
+        auth_session.access.kind,
+        crate::domain::chat::LoginAccessKind::Bunker
+            | crate::domain::chat::LoginAccessKind::NostrConnect
+    ) {
+        return Ok(None);
+    }
+
+    shell_auth::build_standard_nostrconnect_client_uri(app_handle, auth_session).map(Some)
+}
+
+pub fn load_pending_auth_runtime_client_uri<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<AuthRuntimeClientUriSummary, String> {
+    shell_auth::load_pending_standard_nostrconnect_client_uri(app_handle)
+}
+
+pub fn await_pending_auth_runtime_client_pairing<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<String, String> {
+    shell_auth::await_pending_standard_nostrconnect_client_pairing(app_handle)
+}
+
 pub fn load_chat_session_messages<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     input: LoadSessionMessagesInput,
@@ -274,21 +305,65 @@ fn validate_circle_selection(
                 return Err("restore selection requires at least one archived circle".into());
             }
 
-            if let Some(relay) = normalized_non_empty(input.circle_selection.relay.as_deref()) {
-                if !restorable_circles
-                    .iter()
-                    .any(|entry| same_relay(&entry.relay, relay))
-                {
-                    return Err(
-                        "restore selection relay is not present in the local restore catalog"
-                            .into(),
-                    );
-                }
-            }
+            resolve_selected_restore_entries(&input.circle_selection, restorable_circles)?;
         }
     }
 
     Ok(())
+}
+
+fn resolve_selected_restore_entries(
+    selection: &LoginCircleSelectionInput,
+    restorable_circles: &[RestorableCircleEntry],
+) -> Result<Vec<RestorableCircleEntry>, String> {
+    let mut selected_entries = Vec::new();
+    let selected_relays = selection
+        .relays
+        .as_ref()
+        .map(|relays| {
+            relays
+                .iter()
+                .filter_map(|relay| normalized_non_empty(Some(relay.as_str())).map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !selected_relays.is_empty() {
+        for relay in selected_relays {
+            let entry = restorable_circles
+                .iter()
+                .find(|entry| same_relay(&entry.relay, &relay))
+                .cloned()
+                .ok_or_else(|| {
+                    "restore selection relay is not present in the local restore catalog"
+                        .to_string()
+                })?;
+            if !selected_entries
+                .iter()
+                .any(|selected: &RestorableCircleEntry| same_relay(&selected.relay, &entry.relay))
+            {
+                selected_entries.push(entry);
+            }
+        }
+    } else if let Some(relay) = normalized_non_empty(selection.relay.as_deref()) {
+        let entry = restorable_circles
+            .iter()
+            .find(|entry| same_relay(&entry.relay, relay))
+            .cloned()
+            .ok_or_else(|| {
+                "restore selection relay is not present in the local restore catalog"
+                    .to_string()
+            })?;
+        selected_entries.push(entry);
+    } else if let Some(entry) = restorable_circles.first().cloned() {
+        selected_entries.push(entry);
+    }
+
+    if selected_entries.is_empty() {
+        return Err("restore selection requires a local catalog entry".into());
+    }
+
+    Ok(selected_entries)
 }
 
 fn resolve_login_circle_selection<R: tauri::Runtime>(
@@ -296,10 +371,9 @@ fn resolve_login_circle_selection<R: tauri::Runtime>(
     input: &LoginCompletionInput,
     restorable_circles: &[RestorableCircleEntry],
 ) -> Result<(ChatDomainSeed, Option<String>, Vec<RestorableCircleEntry>), String> {
-    let repository = SqliteChatRepository::new(app_handle);
-
     match input.circle_selection.mode {
         LoginCircleSelectionMode::Existing => {
+            let repository = SqliteChatRepository::new(app_handle);
             let domain_seed = repository.load_domain_seed()?;
             let circle_id = normalized_non_empty(input.circle_selection.circle_id.as_deref())
                 .ok_or_else(|| "existing circle selection requires a circle id".to_string())?;
@@ -367,32 +441,37 @@ fn resolve_login_circle_selection<R: tauri::Runtime>(
             Ok((result.seed, Some(result.circle_id), next_restorable_circles))
         }
         LoginCircleSelectionMode::Restore => {
-            let selected_entry = if let Some(relay) =
-                normalized_non_empty(input.circle_selection.relay.as_deref())
-            {
-                restorable_circles
-                    .iter()
-                    .find(|entry| same_relay(&entry.relay, relay))
-            } else {
-                restorable_circles.first()
-            }
-            .cloned()
-            .ok_or_else(|| "restore selection requires a local catalog entry".to_string())?;
+            let selected_entries =
+                resolve_selected_restore_entries(&input.circle_selection, restorable_circles)?;
+            let mut final_seed = None;
+            let mut primary_circle_id = None;
+            let mut next_restorable_circles = restorable_circles.to_vec();
 
-            let result = chat_mutations::restore_circle(
-                app_handle,
-                RestoreCircleInput {
-                    name: selected_entry.name.clone(),
-                    relay: selected_entry.relay.clone(),
-                    circle_type: selected_entry.circle_type.clone(),
-                    description: selected_entry.description.clone(),
-                },
-            )?;
+            for entry in selected_entries {
+                let result = chat_mutations::restore_circle(
+                    app_handle,
+                    RestoreCircleInput {
+                        name: entry.name.clone(),
+                        relay: entry.relay.clone(),
+                        circle_type: entry.circle_type.clone(),
+                        description: entry.description.clone(),
+                    },
+                )?;
+
+                if primary_circle_id.is_none() {
+                    primary_circle_id = Some(result.circle_id.clone());
+                }
+
+                next_restorable_circles =
+                    remove_restorable_circle_by_relay(&next_restorable_circles, &entry.relay);
+                final_seed = Some(result.seed);
+            }
 
             Ok((
-                result.seed,
-                Some(result.circle_id),
-                remove_restorable_circle_by_relay(restorable_circles, &selected_entry.relay),
+                final_seed
+                    .ok_or_else(|| "restore selection requires a local catalog entry".to_string())?,
+                primary_circle_id,
+                next_restorable_circles,
             ))
         }
     }
@@ -483,17 +562,33 @@ fn normalized_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn resolve_public_relay_shortcut(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0xchat" => Some("wss://relay.0xchat.com"),
+        "damus" => Some("wss://relay.damus.io"),
+        "nos" => Some("wss://nos.lol"),
+        "primal" => Some("wss://relay.primal.net"),
+        "yabu" => Some("wss://yabu.me"),
+        "nostrband" => Some("wss://relay.nostr.band"),
+        _ => None,
+    }
+}
+
 fn relay_looks_valid(value: &str) -> bool {
     let normalized = value.trim();
     if normalized.is_empty() {
         return false;
     }
 
-    let candidate = if normalized.contains("://") {
-        normalized.to_string()
-    } else {
-        format!("wss://{normalized}")
-    };
+    let candidate = resolve_public_relay_shortcut(normalized)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if normalized.contains("://") {
+                normalized.to_string()
+            } else {
+                format!("wss://{normalized}")
+            }
+        });
     let Ok(parsed) = Url::parse(&candidate) else {
         return false;
     };
@@ -598,7 +693,7 @@ mod tests {
     };
     use crate::infra::{
         auth_runtime_binding_store, auth_runtime_client_store, auth_runtime_credential_store,
-        auth_runtime_state_store,
+        auth_runtime_state_store, pending_auth_runtime_client_store,
     };
     use nostr_connect::prelude::{
         nip44, EventBuilder as NostrEventBuilder, JsonUtil, Keys as NostrKeys, NostrConnectMessage,
@@ -704,6 +799,65 @@ mod tests {
             },
         )
         .expect("failed to seed auth runtime binding store");
+    }
+
+    fn seed_pending_auth_runtime_client(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        paired_bunker_uri: Option<String>,
+    ) -> pending_auth_runtime_client_store::StoredPendingAuthRuntimeClient {
+        seed_pending_auth_runtime_client_with_relays(
+            app_handle,
+            vec![
+                "wss://relay.damus.io".into(),
+                "wss://nos.lol".into(),
+                "wss://relay.primal.net".into(),
+            ],
+            paired_bunker_uri,
+        )
+    }
+
+    fn seed_pending_auth_runtime_client_with_relays(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        relays: Vec<String>,
+        paired_bunker_uri: Option<String>,
+    ) -> pending_auth_runtime_client_store::StoredPendingAuthRuntimeClient {
+        let client_keys = NostrKeys::generate();
+        let stored_client = pending_auth_runtime_client_store::StoredPendingAuthRuntimeClient {
+            public_key: client_keys.public_key().to_hex(),
+            secret_key_hex: client_keys.secret_key().to_secret_hex(),
+            relays,
+            client_name: "XChat Desktop".into(),
+            stored_at: "2026-04-22T09:42:00Z".into(),
+            paired_bunker_uri,
+        };
+        pending_auth_runtime_client_store::save(app_handle, &stored_client)
+            .expect("failed to seed pending auth runtime client store");
+        stored_client
+    }
+
+    fn signer_login_input(uri: &str, logged_in_at: &str) -> LoginCompletionInput {
+        LoginCompletionInput {
+            method: LoginMethod::Signer,
+            access: LoginAccessInput {
+                kind: LoginAccessKind::Bunker,
+                value: Some(uri.into()),
+            },
+            user_profile: UserProfile {
+                name: "Nora Blake".into(),
+                handle: "@nora".into(),
+                initials: "NB".into(),
+                status: "Research".into(),
+            },
+            circle_selection: LoginCircleSelectionInput {
+                mode: LoginCircleSelectionMode::Custom,
+                circle_id: None,
+                invite_code: None,
+                name: Some("Public Relay".into()),
+                relay: Some("wss://relay.damus.io".into()),
+                relays: None,
+            },
+            logged_in_at: Some(logged_in_at.into()),
+        }
     }
 
     fn bunker_signer_public_key_hex() -> String {
@@ -868,6 +1022,174 @@ mod tests {
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) => {}
                     Err(error) => panic!("test bunker relay should not error: {error}"),
+                }
+            }
+        });
+
+        (format!("ws://{}", address), handle)
+    }
+
+    fn spawn_client_pairing_relay_server(
+        client_public_key_hex: String,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test relay listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test relay listener address should resolve");
+        let handle = std::thread::spawn(move || {
+            let signer_keys = NostrKeys::parse(TEST_BUNKER_SIGNER_SECRET_KEY)
+                .expect("test bunker signer secret should parse");
+            let user_public_key = NostrKeys::parse(TEST_BUNKER_USER_SECRET_KEY)
+                .expect("test bunker user secret should parse")
+                .public_key();
+            let client_public_key = NostrPublicKey::parse(&client_public_key_hex)
+                .expect("client public key should parse");
+            let (stream, _) = listener
+                .accept()
+                .expect("relay should accept one connection");
+            let mut socket = tungstenite::accept(stream).expect("relay websocket handshake");
+            socket
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("relay read timeout should be configurable");
+            let mut subscription_id = None::<String>;
+
+            loop {
+                match socket.read() {
+                    Ok(WebSocketMessage::Text(payload)) => {
+                        let message: serde_json::Value =
+                            serde_json::from_str(&payload).expect("relay payload should be json");
+                        let Some(kind) = message.get(0).and_then(|value| value.as_str()) else {
+                            continue;
+                        };
+
+                        match kind {
+                            "REQ" => {
+                                let req_id = message
+                                    .get(1)
+                                    .and_then(|value| value.as_str())
+                                    .expect("REQ should include subscription id")
+                                    .to_string();
+                                subscription_id = Some(req_id.clone());
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!(["EOSE", req_id.clone()]).to_string().into(),
+                                    ))
+                                    .expect("relay should acknowledge subscription");
+
+                                let connect_ack = NostrEventBuilder::nostr_connect(
+                                    &signer_keys,
+                                    client_public_key,
+                                    NostrConnectMessage::response(
+                                        "connect-ack",
+                                        NostrConnectResponse::new(
+                                            Some(ResponseResult::Ack),
+                                            None,
+                                        ),
+                                    ),
+                                )
+                                .expect("connect ack event should build")
+                                .sign_with_keys(&signer_keys)
+                                .expect("connect ack event should sign");
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!([
+                                            "EVENT",
+                                            subscription_id
+                                                .clone()
+                                                .expect("subscription should be registered"),
+                                            serde_json::to_value(connect_ack)
+                                                .expect("connect ack event should serialize"),
+                                        ])
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .expect("relay should send connect ack event");
+                            }
+                            "EVENT" => {
+                                let event = message
+                                    .get(1)
+                                    .cloned()
+                                    .expect("EVENT should include event payload");
+                                let sender_pubkey = NostrPublicKey::parse(
+                                    event
+                                        .get("pubkey")
+                                        .and_then(|value| value.as_str())
+                                        .expect("event should include sender pubkey"),
+                                )
+                                .expect("event pubkey should parse");
+                                let plaintext = nip44::decrypt(
+                                    signer_keys.secret_key(),
+                                    &sender_pubkey,
+                                    event["content"]
+                                        .as_str()
+                                        .expect("event content should be a string"),
+                                )
+                                .expect("relay should decrypt nip46 payload");
+                                let message = NostrConnectMessage::from_json(plaintext)
+                                    .expect("nip46 message should parse");
+                                let request_id = message.id().to_string();
+                                let request = message
+                                    .to_request()
+                                    .expect("relay should receive a request");
+                                let response = match request {
+                                    NostrConnectRequest::GetPublicKey => {
+                                        NostrConnectResponse::with_result(
+                                            ResponseResult::GetPublicKey(user_public_key),
+                                        )
+                                    }
+                                    _ => NostrConnectResponse::with_error(
+                                        "unsupported test client pairing request",
+                                    ),
+                                };
+                                let response_event = NostrEventBuilder::nostr_connect(
+                                    &signer_keys,
+                                    sender_pubkey,
+                                    NostrConnectMessage::response(request_id, response),
+                                )
+                                .expect("relay response event should build")
+                                .sign_with_keys(&signer_keys)
+                                .expect("relay response event should sign");
+                                let event_id = event
+                                    .get("id")
+                                    .and_then(|value| value.as_str())
+                                    .expect("event should include id");
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!(["OK", event_id, true, ""]).to_string().into(),
+                                    ))
+                                    .expect("relay should ack client EVENT");
+                                socket
+                                    .send(WebSocketMessage::Text(
+                                        json!([
+                                            "EVENT",
+                                            subscription_id
+                                                .clone()
+                                                .expect("subscription should be registered"),
+                                            serde_json::to_value(response_event)
+                                                .expect("response event should serialize"),
+                                        ])
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .expect("relay should forward signer response");
+                                socket
+                                    .close(None)
+                                    .expect("relay should close the websocket");
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(WebSocketMessage::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("test client pairing relay should not error: {error}"),
                 }
             }
         });
@@ -1132,6 +1454,7 @@ mod tests {
                     invite_code: None,
                     name: None,
                     relay: Some("wss://archive.example.local".into()),
+                    relays: None,
                 },
                 logged_in_at: Some("2026-04-19T08:00:00Z".into()),
             },
@@ -1270,6 +1593,7 @@ mod tests {
                     invite_code: None,
                     name: None,
                     relay: Some("wss://missing.example.local".into()),
+                    relays: None,
                 },
                 logged_in_at: Some("2026-04-19T08:00:00Z".into()),
             },
@@ -1277,6 +1601,48 @@ mod tests {
         .expect_err("restore selection should reject relay outside the local catalog");
 
         assert!(error.contains("restore selection relay is not present"));
+    }
+
+    #[test]
+    fn complete_login_accepts_public_relay_shortcut_for_custom_circle_selection() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let snapshot = complete_login(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::QuickStart,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::LocalProfile,
+                    value: None,
+                },
+                user_profile: UserProfile {
+                    name: "Sean Chen".into(),
+                    handle: "@seanchen".into(),
+                    initials: "SC".into(),
+                    status: "Circle owner".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Custom,
+                    circle_id: None,
+                    invite_code: None,
+                    name: Some("Community Circle".into()),
+                    relay: Some("damus".into()),
+                    relays: None,
+                },
+                logged_in_at: Some("2026-04-22T09:00:00Z".into()),
+            },
+        )
+        .expect("public relay shortcut should complete login");
+
+        let active_circle = snapshot
+            .domain
+            .circles
+            .iter()
+            .find(|circle| circle.id == snapshot.shell.active_circle_id)
+            .expect("active circle should exist");
+        assert_eq!(active_circle.name, "Community Circle");
+        assert_eq!(active_circle.relay, "wss://relay.damus.io");
     }
 
     #[test]
@@ -1304,6 +1670,7 @@ mod tests {
                     invite_code: None,
                     name: None,
                     relay: None,
+                    relays: None,
                 },
                 logged_in_at: Some("2026-04-19T08:30:00Z".into()),
             },
@@ -1352,6 +1719,7 @@ mod tests {
                     invite_code: None,
                     name: None,
                     relay: None,
+                    relays: None,
                 },
                 logged_in_at: Some("2026-04-19T08:30:00Z".into()),
             },
@@ -1413,6 +1781,7 @@ mod tests {
                     invite_code: None,
                     name: None,
                     relay: None,
+                    relays: None,
                 },
                 logged_in_at: Some("2026-04-19T08:00:00Z".into()),
             },
@@ -1484,6 +1853,7 @@ mod tests {
                     invite_code: None,
                     name: None,
                     relay: Some("wss://archive.example.local".into()),
+                    relays: None,
                 },
                 logged_in_at: Some("2026-04-19T08:00:00Z".into()),
             },
@@ -1497,6 +1867,101 @@ mod tests {
             .find(|circle| circle.relay == "wss://archive.example.local")
             .expect("missing restored circle");
         assert_eq!(snapshot.shell.active_circle_id, restored_circle.id);
+        assert!(snapshot.shell.selected_session_id.is_empty());
+        assert!(snapshot.shell.restorable_circles.is_empty());
+        assert!(matches!(
+            snapshot
+                .shell
+                .auth_runtime
+                .as_ref()
+                .map(|runtime| &runtime.state),
+            Some(AuthRuntimeState::Connected)
+        ));
+    }
+
+    #[test]
+    fn complete_login_restores_multiple_circles_and_keeps_first_restored_active() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: false,
+                auth_session: None,
+                auth_runtime: None,
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![
+                    RestorableCircleEntry {
+                        name: "Archive Relay".into(),
+                        relay: "wss://archive.example.local".into(),
+                        circle_type: crate::domain::chat::CircleType::Paid,
+                        description: "Recovered paid relay".into(),
+                        archived_at: "2026-04-18T10:00:00Z".into(),
+                    },
+                    RestorableCircleEntry {
+                        name: "Friends Relay".into(),
+                        relay: "wss://friends.example.local".into(),
+                        circle_type: crate::domain::chat::CircleType::Custom,
+                        description: "Recovered private relay".into(),
+                        archived_at: "2026-04-18T12:00:00Z".into(),
+                    },
+                ],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "".into(),
+                selected_session_id: "".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+
+        let snapshot = complete_login(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::ExistingAccount,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::HexKey,
+                    value: Some(VALID_HEX_SECRET_KEY.into()),
+                },
+                user_profile: UserProfile {
+                    name: "Nora Blake".into(),
+                    handle: "@nora".into(),
+                    initials: "NB".into(),
+                    status: "Research".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Restore,
+                    circle_id: None,
+                    invite_code: None,
+                    name: None,
+                    relay: Some("wss://archive.example.local".into()),
+                    relays: Some(vec![
+                        "wss://archive.example.local".into(),
+                        "wss://friends.example.local".into(),
+                    ]),
+                },
+                logged_in_at: Some("2026-04-19T08:00:00Z".into()),
+            },
+        )
+        .expect("failed to complete login with restored circles");
+
+        let archive_circle = snapshot
+            .domain
+            .circles
+            .iter()
+            .find(|circle| circle.relay == "wss://archive.example.local")
+            .expect("missing archive restored circle");
+        let friends_circle = snapshot
+            .domain
+            .circles
+            .iter()
+            .find(|circle| circle.relay == "wss://friends.example.local")
+            .expect("missing friends restored circle");
+        assert_eq!(snapshot.shell.active_circle_id, archive_circle.id);
+        assert_ne!(archive_circle.id, friends_circle.id);
         assert!(snapshot.shell.selected_session_id.is_empty());
         assert!(snapshot.shell.restorable_circles.is_empty());
         assert!(matches!(
@@ -1715,11 +2180,9 @@ mod tests {
                     access_kind: LoginAccessKind::NostrConnect,
                     label: "nostrconnect://signer.example".into(),
                     pubkey: None,
-                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    error: Some("Remote signer handshake is pending.".into()),
                     can_send_messages: false,
-                    send_blocked_reason: Some(
-                        "Remote signer handshake is not implemented yet.".into(),
-                    ),
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                     persisted_in_native_store: false,
                     credential_persisted_in_native_store: false,
                     updated_at: "2026-04-19T08:00:00Z".into(),
@@ -1768,13 +2231,8 @@ mod tests {
         assert!(matches!(runtime.state, AuthRuntimeState::Connected));
         assert_eq!(runtime.label, "Remote Signer A");
         assert!(runtime.error.is_none());
-        assert!(!runtime.can_send_messages);
-        assert_eq!(
-            runtime.send_blocked_reason.as_deref(),
-            Some(
-                "Remote signer is connected, but message send still requires remote event-signing support."
-            )
-        );
+        assert!(runtime.can_send_messages);
+        assert_eq!(runtime.send_blocked_reason, None);
         assert!(runtime.persisted_in_native_store);
         assert_eq!(runtime.updated_at, "2026-04-19T09:30:00Z");
 
@@ -2233,11 +2691,9 @@ mod tests {
                     access_kind: LoginAccessKind::NostrConnect,
                     label: "nostrconnect://signer.example".into(),
                     pubkey: None,
-                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    error: Some("Remote signer handshake is pending.".into()),
                     can_send_messages: false,
-                    send_blocked_reason: Some(
-                        "Remote signer handshake is not implemented yet.".into(),
-                    ),
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                     persisted_in_native_store: false,
                     credential_persisted_in_native_store: false,
                     updated_at: "2026-04-19T11:45:00Z".into(),
@@ -2285,15 +2741,235 @@ mod tests {
         assert!(matches!(runtime.state, AuthRuntimeState::Connected));
         assert_eq!(runtime.label, "Remote Signer A");
         assert!(runtime.error.is_none());
-        assert!(!runtime.can_send_messages);
-        assert_eq!(
-            runtime.send_blocked_reason.as_deref(),
-            Some(
-                "Remote signer is connected, but message send still requires remote event-signing support."
-            )
-        );
+        assert!(runtime.can_send_messages);
+        assert_eq!(runtime.send_blocked_reason, None);
         assert!(runtime.persisted_in_native_store);
         assert_eq!(runtime.updated_at, "2026-04-19T11:50:00Z");
+    }
+
+    #[test]
+    fn load_auth_runtime_client_uri_returns_standard_nostrconnect_client_uri_for_remote_signer() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let stored_at = "2026-04-19T11:56:00Z";
+        let signer_pubkey = valid_binding_pubkey_hex();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::Signer,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::Bunker,
+                        label: "bunker://signer.example".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Existing,
+                    logged_in_at: stored_at.into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::Pending,
+                    login_method: LoginMethod::Signer,
+                    access_kind: LoginAccessKind::Bunker,
+                    label: "bunker://signer.example".into(),
+                    pubkey: None,
+                    error: Some("Remote signer handshake is pending.".into()),
+                    can_send_messages: false,
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: stored_at.into(),
+                }),
+                auth_runtime_binding: Some(AuthRuntimeBindingSummary {
+                    access_kind: LoginAccessKind::Bunker,
+                    endpoint: "wss://relay.example.com".into(),
+                    connection_pubkey: Some(signer_pubkey),
+                    relay_count: 1,
+                    has_secret: false,
+                    requested_permissions: vec![],
+                    client_name: None,
+                    persisted_in_native_store: true,
+                    updated_at: stored_at.into(),
+                }),
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed shell state store");
+        seed_auth_runtime_binding(
+            app_handle,
+            LoginMethod::Signer,
+            LoginAccessKind::Bunker,
+            stored_at,
+        );
+
+        let summary = load_auth_runtime_client_uri(app_handle)
+            .expect("failed to load auth runtime client uri")
+            .expect("missing auth runtime client uri summary");
+        let repeated_summary = load_auth_runtime_client_uri(app_handle)
+            .expect("failed to reload auth runtime client uri")
+            .expect("missing reloaded auth runtime client uri summary");
+        let stored_client = auth_runtime_client_store::load(app_handle)
+            .expect("failed to load stored auth runtime client")
+            .expect("missing stored auth runtime client");
+
+        assert_eq!(summary.public_key, stored_client.public_key);
+        assert_eq!(summary.public_key, repeated_summary.public_key);
+        assert_eq!(summary.uri, repeated_summary.uri);
+        assert_eq!(summary.client_name, "XChat Desktop");
+        assert_eq!(summary.relay_count, 1);
+        assert_eq!(summary.stored_at, stored_at);
+        assert_eq!(stored_client.stored_at, stored_at);
+        assert_eq!(summary.relays.len(), 1);
+        assert!(summary.uri.starts_with("nostrconnect://"));
+        assert!(summary.relays[0].starts_with("wss://relay.example.com"));
+
+        let parsed = Url::parse(&summary.uri).expect("client uri should parse");
+        assert_eq!(parsed.scheme(), "nostrconnect");
+        assert_eq!(parsed.host_str(), Some(stored_client.public_key.as_str()));
+
+        let relay_values = parsed
+            .query_pairs()
+            .filter_map(|(key, value)| {
+                if key == "relay" {
+                    Some(value.into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relay_values, vec!["wss://relay.example.com".to_string()]);
+
+        let metadata = parsed
+            .query_pairs()
+            .find_map(|(key, value)| {
+                if key == "metadata" {
+                    Some(value.into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("client uri should include metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata).expect("metadata should be valid json");
+        assert_eq!(
+            metadata.get("name").and_then(|value| value.as_str()),
+            Some("XChat Desktop")
+        );
+    }
+
+    #[test]
+    fn load_pending_auth_runtime_client_uri_returns_standard_nostrconnect_client_uri() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let summary = load_pending_auth_runtime_client_uri(app_handle)
+            .expect("failed to load pending auth runtime client uri");
+        let repeated_summary = load_pending_auth_runtime_client_uri(app_handle)
+            .expect("failed to reload pending auth runtime client uri");
+        let stored_client = pending_auth_runtime_client_store::load(app_handle)
+            .expect("failed to load pending auth runtime client")
+            .expect("missing pending auth runtime client");
+
+        assert_eq!(summary.public_key, stored_client.public_key);
+        assert_eq!(summary.public_key, repeated_summary.public_key);
+        assert_eq!(summary.uri, repeated_summary.uri);
+        assert_eq!(summary.client_name, "XChat Desktop");
+        assert_eq!(summary.stored_at, stored_client.stored_at);
+        assert_eq!(summary.relay_count as usize, stored_client.relays.len());
+        assert_eq!(summary.relays, stored_client.relays);
+
+        let parsed = Url::parse(&summary.uri).expect("pending client uri should parse");
+        assert_eq!(parsed.scheme(), "nostrconnect");
+        assert_eq!(parsed.host_str(), Some(stored_client.public_key.as_str()));
+    }
+
+    #[test]
+    fn await_pending_auth_runtime_client_pairing_resolves_and_persists_bunker_uri() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let client_keys = NostrKeys::generate();
+        let client_public_key = client_keys.public_key().to_hex();
+        let (relay_url, relay_handle) =
+            spawn_client_pairing_relay_server(client_public_key.clone());
+
+        pending_auth_runtime_client_store::save(
+            app_handle,
+            &pending_auth_runtime_client_store::StoredPendingAuthRuntimeClient {
+                public_key: client_public_key.clone(),
+                secret_key_hex: client_keys.secret_key().to_secret_hex(),
+                relays: vec![relay_url.clone()],
+                client_name: "XChat Desktop".into(),
+                stored_at: "2026-04-22T09:44:00Z".into(),
+                paired_bunker_uri: None,
+            },
+        )
+        .expect("failed to seed pending auth runtime client store");
+
+        let paired_bunker_uri = await_pending_auth_runtime_client_pairing(app_handle)
+            .expect("failed to await pending auth runtime client pairing");
+        relay_handle
+            .join()
+            .expect("client pairing relay thread should join");
+
+        assert!(paired_bunker_uri.starts_with(&format!(
+            "bunker://{}",
+            bunker_signer_public_key_hex()
+        )));
+        assert!(paired_bunker_uri.contains(&format!("relay={relay_url}")));
+
+        let stored_client = pending_auth_runtime_client_store::load(app_handle)
+            .expect("failed to reload pending auth runtime client")
+            .expect("missing pending auth runtime client after pairing");
+        assert_eq!(
+            stored_client.paired_bunker_uri.as_deref(),
+            Some(paired_bunker_uri.as_str())
+        );
+    }
+
+    #[test]
+    fn bootstrap_auth_session_claims_paired_pending_auth_runtime_client() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let paired_bunker_uri = format!(
+            "bunker://{}?relay=wss://relay.example.com",
+            valid_binding_pubkey_hex()
+        );
+        let pending_client =
+            seed_pending_auth_runtime_client(app_handle, Some(paired_bunker_uri.clone()));
+
+        let shell = bootstrap_auth_session(
+            app_handle,
+            signer_login_input(&paired_bunker_uri, "2026-04-22T10:01:00Z"),
+        )
+        .expect("failed to bootstrap auth session");
+
+        let stored_client = auth_runtime_client_store::load(app_handle)
+            .expect("failed to load claimed auth runtime client")
+            .expect("missing claimed auth runtime client");
+        assert_eq!(stored_client.public_key, pending_client.public_key);
+        assert_eq!(stored_client.secret_key_hex, pending_client.secret_key_hex);
+        assert_eq!(stored_client.stored_at, "2026-04-22T10:01:00Z");
+        assert!(pending_auth_runtime_client_store::load(app_handle)
+            .expect("failed to load pending auth runtime client after bootstrap")
+            .is_none());
+
+        let stored_binding = auth_runtime_binding_store::load(app_handle)
+            .expect("failed to load persisted auth runtime binding")
+            .expect("missing persisted auth runtime binding");
+        assert_eq!(stored_binding.value, paired_bunker_uri);
+
+        let auth_session = shell
+            .auth_session
+            .expect("missing bootstrapped auth session");
+        assert!(matches!(auth_session.access.kind, LoginAccessKind::Bunker));
     }
 
     #[test]
@@ -2324,11 +3000,9 @@ mod tests {
                     access_kind: LoginAccessKind::Bunker,
                     label: "bunker://signer.example".into(),
                     pubkey: None,
-                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    error: Some("Remote signer handshake is pending.".into()),
                     can_send_messages: false,
-                    send_blocked_reason: Some(
-                        "Remote signer handshake is not implemented yet.".into(),
-                    ),
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                     persisted_in_native_store: false,
                     credential_persisted_in_native_store: false,
                     updated_at: "2026-04-19T11:46:00Z".into(),
@@ -2407,11 +3081,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_auth_runtime_marks_pasted_nostrconnect_failed_until_client_uri_support_exists() {
+    fn sync_auth_runtime_promotes_pending_nostrconnect_signer_when_handshake_succeeds() {
         let guard = test_app();
         let app_handle = guard.app.handle();
-        let relay_url = unreachable_test_relay_url();
-        let pubkey = valid_binding_pubkey_hex();
+        let (relay_url, relay_handle) = spawn_bunker_handshake_relay_server();
+        let signer_pubkey = bunker_signer_public_key_hex();
+        let user_npub = bunker_user_public_key_npub();
 
         shell_state_store::save(
             app_handle,
@@ -2433,11 +3108,9 @@ mod tests {
                     access_kind: LoginAccessKind::NostrConnect,
                     label: "nostrconnect://signer.example".into(),
                     pubkey: None,
-                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    error: Some("Remote signer handshake is pending.".into()),
                     can_send_messages: false,
-                    send_blocked_reason: Some(
-                        "Remote signer handshake is not implemented yet.".into(),
-                    ),
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                     persisted_in_native_store: false,
                     credential_persisted_in_native_store: false,
                     updated_at: "2026-04-19T11:47:00Z".into(),
@@ -2445,7 +3118,7 @@ mod tests {
                 auth_runtime_binding: Some(AuthRuntimeBindingSummary {
                     access_kind: LoginAccessKind::NostrConnect,
                     endpoint: relay_url.clone(),
-                    connection_pubkey: Some(pubkey.clone()),
+                    connection_pubkey: Some(signer_pubkey.clone()),
                     relay_count: 1,
                     has_secret: true,
                     requested_permissions: vec!["sign_event".into()],
@@ -2470,7 +3143,7 @@ mod tests {
                 login_method: LoginMethod::Signer,
                 access_kind: LoginAccessKind::NostrConnect,
                 value: format!(
-                    "nostrconnect://{pubkey}?relay={relay_url}&secret=shared-secret&perms=sign_event&name=Desk%20Client"
+                    "nostrconnect://{signer_pubkey}?relay={relay_url}&secret=shared-secret&perms=sign_event&name=Desk%20Client"
                 ),
                 stored_at: "2026-04-19T11:47:00Z".into(),
             },
@@ -2479,28 +3152,31 @@ mod tests {
 
         let shell = sync_auth_runtime(app_handle).expect("failed to sync auth runtime");
         let runtime = shell.auth_runtime.expect("missing synced auth runtime");
-        assert!(matches!(runtime.state, AuthRuntimeState::Failed));
-        assert_eq!(
-            runtime.error.as_deref(),
-            Some(
-                "Pasted nostrConnect client URIs are not supported yet; use a bunker:// handoff until desktop-generated client URIs are implemented."
-            )
-        );
-        assert_eq!(
-            runtime.send_blocked_reason.as_deref(),
-            runtime.error.as_deref()
-        );
-        assert!(!runtime.can_send_messages);
+        assert!(matches!(runtime.state, AuthRuntimeState::Connected));
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.pubkey.as_deref(), Some(user_npub.as_str()));
+        assert!(runtime.can_send_messages);
+        assert_eq!(runtime.send_blocked_reason, None);
         assert!(runtime.persisted_in_native_store);
 
         let stored_runtime = auth_runtime_state_store::load(app_handle)
             .expect("failed to load auth runtime state store")
             .expect("missing stored auth runtime state");
-        assert!(matches!(stored_runtime.state, AuthRuntimeState::Failed));
-        assert_eq!(stored_runtime.error, runtime.error);
-        assert!(auth_runtime_client_store::load(app_handle)
+        assert!(matches!(stored_runtime.state, AuthRuntimeState::Connected));
+        assert_eq!(stored_runtime.pubkey.as_deref(), Some(user_npub.as_str()));
+        assert!(stored_runtime.error.is_none());
+
+        let stored_client = auth_runtime_client_store::load(app_handle)
             .expect("failed to load auth runtime client store")
-            .is_none());
+            .expect("missing stored auth runtime client");
+        assert!(matches!(
+            stored_client.access_kind,
+            LoginAccessKind::NostrConnect
+        ));
+
+        relay_handle
+            .join()
+            .expect("test relay thread should finish cleanly");
     }
 
     #[test]
@@ -2530,11 +3206,9 @@ mod tests {
                     access_kind: LoginAccessKind::Bunker,
                     label: "bunker://signer.example".into(),
                     pubkey: None,
-                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    error: Some("Remote signer handshake is pending.".into()),
                     can_send_messages: false,
-                    send_blocked_reason: Some(
-                        "Remote signer handshake is not implemented yet.".into(),
-                    ),
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                     persisted_in_native_store: false,
                     credential_persisted_in_native_store: false,
                     updated_at: "2026-04-19T11:48:00Z".into(),
@@ -2646,11 +3320,9 @@ mod tests {
                     access_kind: LoginAccessKind::NostrConnect,
                     label: "nostrconnect://signer.example".into(),
                     pubkey: None,
-                    error: Some("Remote signer handshake is not implemented yet.".into()),
+                    error: Some("Remote signer handshake is pending.".into()),
                     can_send_messages: false,
-                    send_blocked_reason: Some(
-                        "Remote signer handshake is not implemented yet.".into(),
-                    ),
+                    send_blocked_reason: Some("Remote signer handshake is pending.".into()),
                     persisted_in_native_store: false,
                     credential_persisted_in_native_store: false,
                     updated_at: "2026-04-19T11:55:00Z".into(),
@@ -2710,13 +3382,8 @@ mod tests {
         assert!(matches!(runtime.state, AuthRuntimeState::Connected));
         assert_eq!(runtime.label, "Remote Signer A");
         assert!(runtime.error.is_none());
-        assert!(!runtime.can_send_messages);
-        assert_eq!(
-            runtime.send_blocked_reason.as_deref(),
-            Some(
-                "Remote signer is connected, but message send still requires remote event-signing support."
-            )
-        );
+        assert!(runtime.can_send_messages);
+        assert_eq!(runtime.send_blocked_reason, None);
         assert!(runtime.persisted_in_native_store);
         assert_eq!(runtime.updated_at, "2026-04-19T11:58:00Z");
 
@@ -2732,7 +3399,7 @@ mod tests {
             AuthRuntimeState::Connected
         ));
         assert_eq!(persisted_runtime.label, "Remote Signer A");
-        assert!(!persisted_runtime.can_send_messages);
+        assert!(persisted_runtime.can_send_messages);
         assert!(persisted_runtime.persisted_in_native_store);
 
         let persisted_binding = persisted_shell
