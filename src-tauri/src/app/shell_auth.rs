@@ -361,7 +361,18 @@ fn build_auth_runtime_authorization_header<R: tauri::Runtime>(
 
 pub fn derive_auth_runtime_from_session(auth_session: &AuthSessionSummary) -> AuthRuntimeSummary {
     let (state, error) = match auth_session.login_method {
-        LoginMethod::QuickStart => (AuthRuntimeState::LocalProfile, None),
+        LoginMethod::QuickStart => match auth_session.access.kind {
+            LoginAccessKind::LocalProfile => (AuthRuntimeState::LocalProfile, None),
+            LoginAccessKind::HexKey | LoginAccessKind::Nsec => (AuthRuntimeState::Connected, None),
+            LoginAccessKind::Npub => (
+                AuthRuntimeState::Failed,
+                Some("Read-only npub import cannot sign messages yet.".into()),
+            ),
+            LoginAccessKind::Bunker | LoginAccessKind::NostrConnect => (
+                AuthRuntimeState::Pending,
+                Some("Remote signer handshake is pending.".into()),
+            ),
+        },
         LoginMethod::ExistingAccount => match auth_session.access.kind {
             LoginAccessKind::Nsec | LoginAccessKind::HexKey => (AuthRuntimeState::Connected, None),
             LoginAccessKind::Npub => (
@@ -781,8 +792,14 @@ fn validate_requested_auth_runtime_state(
 ) -> Result<(), String> {
     match auth_session.login_method {
         LoginMethod::QuickStart => {
-            if !matches!(requested_state, AuthRuntimeState::LocalProfile) {
-                return Err("quick start auth runtime is fixed to `localProfile`".into());
+            if matches!(auth_session.access.kind, LoginAccessKind::LocalProfile) {
+                if !matches!(requested_state, AuthRuntimeState::LocalProfile) {
+                    return Err("legacy quick start auth runtime is fixed to `localProfile`".into());
+                }
+            } else if matches!(requested_state, AuthRuntimeState::LocalProfile) {
+                return Err(
+                    "only legacy quick start auth sessions can use `localProfile` runtime".into(),
+                );
             }
         }
         LoginMethod::ExistingAccount | LoginMethod::Signer => {

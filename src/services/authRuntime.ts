@@ -16,6 +16,7 @@ export function deriveAuthRuntimeFromAuthSession(
   }
 
   if (authSession.loginMethod === "quickStart") {
+    if (authSession.access.kind === "localProfile") {
       return {
         state: "localProfile",
         loginMethod: authSession.loginMethod,
@@ -27,6 +28,21 @@ export function deriveAuthRuntimeFromAuthSession(
         credentialPersistedInNativeStore: false,
         updatedAt: authSession.loggedInAt,
       };
+    }
+
+    if (authSession.access.kind === "nsec" || authSession.access.kind === "hexKey") {
+      return {
+        state: "connected",
+        loginMethod: authSession.loginMethod,
+        accessKind: authSession.access.kind,
+        label: authSession.access.label,
+        pubkey: authSession.access.pubkey,
+        canSendMessages: true,
+        persistedInNativeStore: false,
+        credentialPersistedInNativeStore: false,
+        updatedAt: authSession.loggedInAt,
+      };
+    }
   }
 
   if (authSession.loginMethod === "existingAccount") {
@@ -131,11 +147,11 @@ export function buildUpdatedAuthRuntime(
     return null;
   }
 
-  if (authSession.loginMethod === "quickStart" && input.state !== "localProfile") {
+  if (authSession.access.kind === "localProfile" && input.state !== "localProfile") {
     return null;
   }
 
-  if (authSession.loginMethod !== "quickStart" && input.state === "localProfile") {
+  if (authSession.access.kind !== "localProfile" && input.state === "localProfile") {
     return null;
   }
 

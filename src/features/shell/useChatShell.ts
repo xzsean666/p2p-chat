@@ -2705,7 +2705,7 @@ export function useChatShell() {
 
   function buildAuthSessionSummary(input: LoginCompletionInput): AuthSessionSummary {
     const accessLabel =
-      input.method === "quickStart"
+      input.method === "quickStart" && input.access.kind === "localProfile"
         ? "Quick Start"
         : input.access.kind === "nostrConnect"
           ? buildMaskedAccessLabel(input.access.value ?? "", {
@@ -2717,6 +2717,11 @@ export function useChatShell() {
                 prefix: 10,
                 suffix: 6,
               }) || "bunker://"
+            : input.method === "quickStart" && input.access.kind === "hexKey"
+              ? buildMaskedAccessLabel(input.access.value ?? "", {
+                  prefix: 8,
+                  suffix: 4,
+                }) || "New Account"
             : buildMaskedAccessLabel(input.access.value ?? "", {
                 prefix: 8,
                 suffix: 4,

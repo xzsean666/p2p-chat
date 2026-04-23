@@ -731,7 +731,7 @@ function buildLoginPreparationInput(): LoginCompletionInput {
   const access: LoginAccessInput =
     selectedMethod.value === "quickStart"
       ? {
-          kind: "localProfile",
+          kind: "hexKey",
         }
       : {
           kind: resolvedAccessKind ?? "hexKey",
@@ -1000,7 +1000,7 @@ function submit() {
   const access: LoginAccessInput =
     selectedMethod.value === "quickStart"
       ? {
-          kind: "localProfile",
+          kind: "hexKey",
         }
       : {
           kind: resolvedAccessKind ?? "hexKey",
@@ -1122,8 +1122,8 @@ function submit() {
             <div class="page-copy centered-copy">
               <h2 class="page-title">Create Your Profile</h2>
               <p class="page-subtitle">
-                Enter your name to get started. Your Nostr account is created automatically and its private key can be
-                exported later from Settings.
+                Enter your name to get started. A standard local Nostr account is created automatically and its private
+                key can be exported later from Settings.
               </p>
             </div>
 

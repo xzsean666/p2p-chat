@@ -172,11 +172,11 @@ const latestTransportActivity = computed(() => {
 });
 
 const canUpdateAuthRuntime = computed(() => {
-  return !!props.authSession && props.authSession.loginMethod !== "quickStart";
+  return !!props.authSession && props.authSession.access.kind !== "localProfile";
 });
 
 const canSyncAuthRuntime = computed(() => {
-  return !!props.authSession && props.authSession.loginMethod !== "quickStart";
+  return !!props.authSession && props.authSession.access.kind !== "localProfile";
 });
 
 const supportsAuthRuntimeClientUri = computed(() => {
@@ -1267,7 +1267,9 @@ watch(
               <p class="runtime-note">
                 {{
                   authSession?.loginMethod === "quickStart"
-                    ? "Get Started created a local Nostr account on this device. Back up the private key before changing devices."
+                    ? authSession?.access.kind === "localProfile"
+                      ? "This legacy Quick Start session still runs as a local profile. Export the generated private key if you want to keep it."
+                      : "Get Started created a standard local Nostr account on this device. Back up the private key before changing devices."
                     : "This session has a locally stored private key. Export it only if you intend to back it up."
                 }}
               </p>
@@ -1302,8 +1304,8 @@ watch(
             <strong>Auth Runtime Controls</strong>
             <div class="auth-runtime-panel">
               <p v-if="!canUpdateAuthRuntime" class="runtime-note">
-                Quick Start stays on `localProfile`, does not require a remote signer handshake, and can export its
-                generated private key above.
+                This legacy Quick Start session still stays on `localProfile`. New Get Started accounts now create a
+                standard local key-backed account instead.
               </p>
               <template v-else>
                 <p class="runtime-note">

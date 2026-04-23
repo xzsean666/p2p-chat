@@ -198,27 +198,41 @@ fn build_signed_nostr_event_digest(event: &SignedNostrEvent) -> Result<[u8; 32],
 }
 
 fn resolve_quick_start_access(access: &LoginAccessInput) -> Result<LoginAccessSummary, String> {
-    if !matches!(access.kind, LoginAccessKind::LocalProfile) {
-        return Err("quick start requires `localProfile` access".into());
-    }
+    match access.kind {
+        LoginAccessKind::LocalProfile => {
+            let pubkey = match normalized_non_empty(access.value.as_deref()) {
+                Some(value) => {
+                    let secret_key = parse_secret_key_hex_input(
+                        value,
+                        "quick start local profile key must be a valid 32-byte secp256k1 secret key"
+                            .to_string(),
+                    )?;
+                    Some(canonical_npub_from_secret_key(&secret_key)?)
+                }
+                None => None,
+            };
 
-    let pubkey = match normalized_non_empty(access.value.as_deref()) {
-        Some(value) => {
+            Ok(LoginAccessSummary {
+                kind: access.kind.clone(),
+                label: "Quick Start".into(),
+                pubkey,
+            })
+        }
+        LoginAccessKind::HexKey => {
+            let value = normalized_non_empty(access.value.as_deref()).ok_or_else(|| {
+                "quick start generated account key must be a valid 32-byte secp256k1 secret key"
+                    .to_string()
+            })?;
             let secret_key = parse_secret_key_hex_input(
                 value,
-                "quick start local profile key must be a valid 32-byte secp256k1 secret key"
+                "quick start generated account key must be a valid 32-byte secp256k1 secret key"
                     .to_string(),
             )?;
-            Some(canonical_npub_from_secret_key(&secret_key)?)
+            let pubkey = canonical_npub_from_secret_key(&secret_key)?;
+            Ok(build_public_key_access_summary(access.kind.clone(), pubkey))
         }
-        None => None,
-    };
-
-    Ok(LoginAccessSummary {
-        kind: access.kind.clone(),
-        label: "Quick Start".into(),
-        pubkey,
-    })
+        _ => Err("quick start requires generated local key access".into()),
+    }
 }
 
 fn resolve_existing_account_access(
@@ -623,11 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_quick_start_pubkey_from_local_profile_secret() {
+    fn resolves_quick_start_pubkey_from_generated_hex_secret() {
         let summary = resolve_login_access_summary(&make_input(
             LoginMethod::QuickStart,
             LoginAccessInput {
-                kind: LoginAccessKind::LocalProfile,
+                kind: LoginAccessKind::HexKey,
                 value: Some(
                     "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
                 ),
@@ -635,7 +649,7 @@ mod tests {
         ))
         .expect("quick start key should resolve");
 
-        assert_eq!(summary.label, "Quick Start");
+        assert!(summary.label.contains("..."));
         assert!(summary
             .pubkey
             .as_deref()

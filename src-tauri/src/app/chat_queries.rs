@@ -283,22 +283,31 @@ fn resolve_login_input<R: tauri::Runtime>(
         return Ok(input.clone());
     }
 
-    if !matches!(input.access.kind, LoginAccessKind::LocalProfile) {
-        return Err("quick start requires `localProfile` access".into());
+    if !matches!(
+        input.access.kind,
+        LoginAccessKind::LocalProfile | LoginAccessKind::HexKey
+    ) {
+        return Err("quick start requires generated local key access".into());
     }
 
     if normalized_non_empty(input.access.value.as_deref()).is_some() {
-        return Ok(input.clone());
+        let mut resolved_input = input.clone();
+        resolved_input.access.kind = LoginAccessKind::HexKey;
+        return Ok(resolved_input);
     }
 
     if let Some(previous_auth_session) = previous_shell.auth_session.as_ref().filter(|session| {
         matches!(session.login_method, LoginMethod::QuickStart)
-            && matches!(session.access.kind, LoginAccessKind::LocalProfile)
+            && matches!(
+                session.access.kind,
+                LoginAccessKind::LocalProfile | LoginAccessKind::HexKey
+            )
     }) {
         if let Some(credential) =
             shell_auth::load_auth_runtime_credential_for_session(app_handle, previous_auth_session)?
         {
             let mut resolved_input = input.clone();
+            resolved_input.access.kind = LoginAccessKind::HexKey;
             resolved_input.access.value = Some(credential.secret_key_hex);
             resolved_input.logged_in_at = Some(previous_auth_session.logged_in_at.clone());
             return Ok(resolved_input);
@@ -306,6 +315,7 @@ fn resolve_login_input<R: tauri::Runtime>(
     }
 
     let mut resolved_input = input.clone();
+    resolved_input.access.kind = LoginAccessKind::HexKey;
     resolved_input.access.value = Some(auth_access::generate_secret_key_hex());
     Ok(resolved_input)
 }
@@ -1676,7 +1686,7 @@ mod tests {
             LoginCompletionInput {
                 method: LoginMethod::QuickStart,
                 access: LoginAccessInput {
-                    kind: LoginAccessKind::LocalProfile,
+                    kind: LoginAccessKind::HexKey,
                     value: None,
                 },
                 user_profile: UserProfile {
@@ -1718,7 +1728,7 @@ mod tests {
             LoginCompletionInput {
                 method: LoginMethod::QuickStart,
                 access: LoginAccessInput {
-                    kind: LoginAccessKind::LocalProfile,
+                    kind: LoginAccessKind::HexKey,
                     value: None,
                 },
                 user_profile: UserProfile {
@@ -1746,10 +1756,7 @@ mod tests {
             .as_ref()
             .expect("quick start auth session should be present");
         assert!(matches!(auth_session.login_method, LoginMethod::QuickStart));
-        assert!(matches!(
-            auth_session.access.kind,
-            LoginAccessKind::LocalProfile
-        ));
+        assert!(matches!(auth_session.access.kind, LoginAccessKind::HexKey));
         assert!(auth_session
             .access
             .pubkey
@@ -1761,7 +1768,7 @@ mod tests {
             .expect("missing stored quick start auth runtime credential");
         assert!(matches!(
             stored_credential.access_kind,
-            LoginAccessKind::LocalProfile
+            LoginAccessKind::HexKey
         ));
         assert_eq!(stored_credential.stored_at, "2026-04-22T09:00:00Z");
         assert_eq!(
@@ -1778,7 +1785,7 @@ mod tests {
         ));
         assert!(matches!(
             secret_summary.access_kind,
-            LoginAccessKind::LocalProfile
+            LoginAccessKind::HexKey
         ));
         assert_eq!(secret_summary.pubkey, stored_credential.pubkey);
         assert_eq!(secret_summary.hex_key, stored_credential.secret_key_hex);
@@ -1791,6 +1798,11 @@ mod tests {
             .auth_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.credential_persisted_in_native_store));
+        assert!(reloaded
+            .shell
+            .auth_runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime.state, AuthRuntimeState::Connected)));
     }
 
     #[test]
@@ -1803,7 +1815,7 @@ mod tests {
             LoginCompletionInput {
                 method: LoginMethod::QuickStart,
                 access: LoginAccessInput {
-                    kind: LoginAccessKind::LocalProfile,
+                    kind: LoginAccessKind::HexKey,
                     value: None,
                 },
                 user_profile: UserProfile {
@@ -1829,6 +1841,10 @@ mod tests {
             .auth_session
             .as_ref()
             .expect("bootstrapped auth session should be present");
+        assert!(bootstrapped_shell
+            .auth_runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime.state, AuthRuntimeState::Connected)));
         let first_credential = auth_runtime_credential_store::load(app_handle)
             .expect("failed to load first quick start credential")
             .expect("missing first quick start credential");
@@ -1838,7 +1854,7 @@ mod tests {
             LoginCompletionInput {
                 method: LoginMethod::QuickStart,
                 access: LoginAccessInput {
-                    kind: LoginAccessKind::LocalProfile,
+                    kind: LoginAccessKind::HexKey,
                     value: None,
                 },
                 user_profile: UserProfile {
@@ -1877,6 +1893,10 @@ mod tests {
             second_auth_session.logged_in_at,
             first_auth_session.logged_in_at
         );
+        assert!(matches!(
+            second_auth_session.access.kind,
+            LoginAccessKind::HexKey
+        ));
         assert_eq!(
             second_auth_session.access.pubkey.as_deref(),
             Some(second_credential.pubkey.as_str())
@@ -2004,7 +2024,7 @@ mod tests {
             LoginCompletionInput {
                 method: LoginMethod::QuickStart,
                 access: LoginAccessInput {
-                    kind: LoginAccessKind::LocalProfile,
+                    kind: LoginAccessKind::HexKey,
                     value: None,
                 },
                 user_profile: UserProfile {
@@ -2036,7 +2056,7 @@ mod tests {
                 .auth_runtime
                 .as_ref()
                 .map(|runtime| &runtime.state),
-            Some(AuthRuntimeState::LocalProfile)
+            Some(AuthRuntimeState::Connected)
         ));
         assert!(snapshot.domain.message_store.contains_key("alice"));
     }
