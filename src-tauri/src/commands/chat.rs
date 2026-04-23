@@ -1,17 +1,18 @@
 use crate::app::{chat_mutations, chat_queries};
 use crate::domain::chat::{
-    AddCircleInput, AddCircleResult, AuthRuntimeClientUriSummary, CacheChatMessageMediaInput, CachedChatMessageMediaResult,
-    ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage,
-    ChatShellSnapshot, CleanupChatMediaAssetsResult, CreateGroupConversationInput,
-    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCompletionInput,
-    MergeRemoteDeliveryReceiptsInput, MergeRemoteMessagesInput, RestoreCircleInput,
-    RetryMessageDeliveryInput, SendFileMessageInput, SendImageMessageInput, SendMessageInput,
-    SendVideoMessageInput, SessionActionInput, ShellStateSnapshot, StartConversationInput,
-    StartConversationResult, StartLookupConversationInput, StartSelfConversationInput,
-    StoreChatMediaAssetInput, StoredChatMediaAsset, UpdateAuthRuntimeInput,
-    UpdateChatMessageMediaRemoteUrlInput, UpdateCircleInput, UpdateContactRemarkInput,
-    UpdateGroupMembersInput, UpdateGroupNameInput, UpdateMessageDeliveryStatusInput,
-    UpdateSessionDraftInput, UpdatedChatMessageMediaRemoteUrlResult,
+    AddCircleInput, AddCircleResult, AuthRuntimeClientUriSummary, CacheChatMessageMediaInput,
+    CachedChatMessageMediaResult, ChatDomainOverview, ChatDomainSeed, ChatSessionMessageUpdates,
+    ChatSessionMessagesPage, ChatShellSnapshot, CleanupChatMediaAssetsResult,
+    CreateGroupConversationInput, LoadSessionMessageUpdatesInput, LoadSessionMessagesInput,
+    LocalAccountSecretSummary, LoginCompletionInput, MergeRemoteDeliveryReceiptsInput,
+    MergeRemoteMessagesInput, RestoreCircleInput, RetryMessageDeliveryInput, SendFileMessageInput,
+    SendImageMessageInput, SendMessageInput, SendVideoMessageInput, SessionActionInput,
+    ShellStateSnapshot, StartConversationInput, StartConversationResult,
+    StartLookupConversationInput, StartSelfConversationInput, StoreChatMediaAssetInput,
+    StoredChatMediaAsset, UpdateAuthRuntimeInput, UpdateChatMessageMediaRemoteUrlInput,
+    UpdateCircleInput, UpdateContactRemarkInput, UpdateGroupMembersInput, UpdateGroupNameInput,
+    UpdateMessageDeliveryStatusInput, UpdateSessionDraftInput,
+    UpdatedChatMessageMediaRemoteUrlResult,
 };
 
 #[tauri::command]
@@ -66,6 +67,13 @@ pub fn load_auth_runtime_client_uri(
     app_handle: tauri::AppHandle,
 ) -> Result<Option<AuthRuntimeClientUriSummary>, String> {
     chat_queries::load_auth_runtime_client_uri(&app_handle)
+}
+
+#[tauri::command]
+pub fn load_local_account_secret_summary(
+    app_handle: tauri::AppHandle,
+) -> Result<Option<LocalAccountSecretSummary>, String> {
+    chat_queries::load_local_account_secret_summary(&app_handle)
 }
 
 #[tauri::command]

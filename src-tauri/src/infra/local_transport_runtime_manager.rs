@@ -1118,6 +1118,7 @@ mod tests {
     #[test]
     fn sync_cache_records_successful_local_command_launch_attempt() {
         let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("launch-success");
         let current_executable =
             std::env::current_exe().expect("current test executable path should resolve");
         let mut cache = TransportCache::default();
@@ -1127,7 +1128,7 @@ mod tests {
                 &TransportCache::default(),
                 &mut cache,
                 vec![TransportRuntimeProfile {
-                    circle_id: "circle-1".into(),
+                    circle_id: circle_id.clone(),
                     driver: "native-preview-relay-runtime".into(),
                     adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
                     launch_status: TransportRuntimeLaunchStatus::Ready,
@@ -1139,14 +1140,14 @@ mod tests {
                     launch_error: None,
                     recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
                     state: TransportRuntimeState::Starting,
-                    session_label: "native::ws::circle-1".into(),
-                    endpoint: "native://relay/circle-1".into(),
+                    session_label: format!("native::ws::{circle_id}"),
+                    endpoint: format!("native://relay/{circle_id}"),
                     labels: labels(),
                 }],
                 Some(&TransportCircleActionInput {
-                    circle_id: "circle-1".into(),
+                    circle_id: circle_id.clone(),
                     action: TransportCircleAction::Connect,
-                    active_circle_id: Some("circle-1".into()),
+                    active_circle_id: Some(circle_id.clone()),
                     use_tor_network: false,
                     experimental_transport: true,
                     sync_since_created_at: None,
@@ -1172,6 +1173,8 @@ mod tests {
             cache.runtime_sessions[0].last_event,
             "native runtime launch spawned"
         );
+
+        stop_local_command_runtime(&circle_id).expect("runtime cleanup should succeed");
     }
 
     #[test]
@@ -1249,6 +1252,7 @@ mod tests {
     #[test]
     fn sync_cache_records_failed_local_command_launch_attempt() {
         let manager = LocalTransportRuntimeManager;
+        let circle_id = unique_circle_id("launch-failed");
         let invalid_command = std::env::temp_dir();
         let mut cache = TransportCache::default();
 
@@ -1257,7 +1261,7 @@ mod tests {
                 &TransportCache::default(),
                 &mut cache,
                 vec![TransportRuntimeProfile {
-                    circle_id: "circle-1".into(),
+                    circle_id: circle_id.clone(),
                     driver: "native-preview-relay-runtime".into(),
                     adapter_kind: TransportRuntimeAdapterKind::LocalCommand,
                     launch_status: TransportRuntimeLaunchStatus::Ready,
@@ -1267,14 +1271,14 @@ mod tests {
                     launch_error: None,
                     recovery_policy: TransportRuntimeRecoveryPolicy::Auto,
                     state: TransportRuntimeState::Starting,
-                    session_label: "native::ws::circle-1".into(),
-                    endpoint: "native://relay/circle-1".into(),
+                    session_label: format!("native::ws::{circle_id}"),
+                    endpoint: format!("native://relay/{circle_id}"),
                     labels: labels(),
                 }],
                 Some(&TransportCircleActionInput {
-                    circle_id: "circle-1".into(),
+                    circle_id: circle_id.clone(),
                     action: TransportCircleAction::Connect,
-                    active_circle_id: Some("circle-1".into()),
+                    active_circle_id: Some(circle_id),
                     use_tor_network: false,
                     experimental_transport: true,
                     sync_since_created_at: None,

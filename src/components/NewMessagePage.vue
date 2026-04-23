@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import Avatar from "primevue/avatar";
-import Button from "primevue/button";
 import InputText from "primevue/inputtext";
 import OverlayPageShell from "./OverlayPageShell.vue";
 import SelfChatIcon from "./SelfChatIcon.vue";
@@ -18,7 +17,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: "close"): void;
-  (event: "open-contact", contactId: string): void;
   (event: "select-contact", contactId: string): void;
   (event: "open-self-confirm"): void;
   (event: "open-group-select"): void;
@@ -195,14 +193,6 @@ function openEntry(entry: MessageListEntry) {
     return;
   }
 
-  emit("open-contact", entry.contact.id);
-}
-
-function selectEntry(entry: MessageListEntry) {
-  if (entry.kind !== "contact") {
-    return;
-  }
-
   emit("select-contact", entry.contact.id);
 }
 
@@ -218,7 +208,7 @@ function openInvitePage() {
 <template>
   <OverlayPageShell
     title="New Message"
-    :subtitle="circle ? `Start a chat inside ${circle.name}` : 'Choose how you want to begin a conversation.'"
+    :subtitle="circle ? `Start a conversation in ${circle.name}` : 'Start a new conversation.'"
     @close="emit('close')"
   >
     <div class="new-message-page">
@@ -233,11 +223,6 @@ function openInvitePage() {
           />
         </div>
 
-        <div v-if="!isSearchMode" class="search-meta">
-          <span>{{ circle ? `Inside ${circle.name}` : "No active circle" }}</span>
-          <span>{{ contacts.length }} contacts</span>
-          <span>{{ currentCircleContactIds.length }} in circle</span>
-        </div>
       </section>
 
       <section v-if="!isSearchMode" class="action-section">
@@ -299,7 +284,6 @@ function openInvitePage() {
       <section v-for="group in visibleGroups" :key="group.key" class="list-section">
         <div class="section-head">
           <div class="section-heading">{{ group.label }}</div>
-          <span class="section-count">{{ group.entries.length }}</span>
         </div>
 
         <div class="contact-list">
@@ -335,16 +319,6 @@ function openInvitePage() {
                 <p>{{ entry.meta }}</p>
               </div>
             </button>
-
-            <Button
-              v-if="entry.kind === 'contact'"
-              icon="pi pi-send"
-              rounded
-              text
-              severity="secondary"
-              aria-label="Start conversation"
-              @click="selectEntry(entry)"
-            />
           </div>
         </div>
       </section>
@@ -365,22 +339,23 @@ function openInvitePage() {
 }
 
 .new-message-page {
-  gap: 16px;
+  gap: 12px;
+  padding-top: 8px;
 }
 
 .search-panel,
 .action-section,
 .list-section,
 .empty-state {
-  padding: 20px;
-  border-radius: 24px;
-  background: #f8fbfd;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .search-panel,
 .list-section,
 .empty-state {
-  gap: 14px;
+  gap: 10px;
 }
 
 .action-section,
@@ -389,7 +364,6 @@ function openInvitePage() {
 }
 
 .search-field,
-.search-meta,
 .action-row,
 .section-head,
 .contact-row,
@@ -400,10 +374,11 @@ function openInvitePage() {
 }
 
 .search-field {
-  gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid #d8e2ef;
-  border-radius: 18px;
+  gap: 8px;
+  min-height: 46px;
+  padding: 0 14px;
+  border: 1px solid #d7dde5;
+  border-radius: 14px;
   background: #ffffff;
 }
 
@@ -419,17 +394,10 @@ function openInvitePage() {
   padding-left: 0;
 }
 
-.search-meta {
-  flex-wrap: wrap;
-  gap: 8px 14px;
-  color: #70839d;
-  font-size: 0.82rem;
-}
-
 .action-row {
   gap: 14px;
   width: 100%;
-  padding: 14px 0;
+  padding: 15px 0;
   border: 0;
   background: transparent;
   text-align: left;
@@ -443,18 +411,18 @@ function openInvitePage() {
 
 .action-row + .action-row,
 .contact-row + .contact-row {
-  border-top: 1px solid #dde7f1;
+  border-top: 1px solid #e7ebf1;
 }
 
 .action-icon {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  width: 42px;
-  height: 42px;
-  border-radius: 14px;
-  background: #edf4fb;
-  color: #30557f;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: #f1f4f7;
+  color: #45627f;
 }
 
 .action-copy,
@@ -490,18 +458,18 @@ function openInvitePage() {
 }
 
 .section-head {
-  justify-content: space-between;
-  gap: 12px;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 4px 2px 0;
 }
 
 .section-heading {
   color: #6a7d98;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
-  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  font-size: 0.68rem;
 }
 
-.section-count,
 .row-badge {
   display: inline-flex;
   align-items: center;
@@ -513,26 +481,29 @@ function openInvitePage() {
   font-weight: 600;
 }
 
-.section-count {
-  min-width: 28px;
-  padding: 4px 9px;
-}
-
 .contact-row {
   gap: 10px;
   justify-content: space-between;
-  padding: 14px 0;
+  padding: 0;
 }
 
 .contact-row-single {
   justify-content: flex-start;
 }
 
+.action-section,
+.contact-list {
+  padding: 0 16px;
+  border-radius: 20px;
+  background: #ffffff;
+  border: 1px solid #e4e9ef;
+}
+
 .contact-main {
   flex: 1;
   gap: 12px;
   min-width: 0;
-  padding: 0;
+  padding: 14px 0;
   border: 0;
   background: transparent;
   text-align: left;
@@ -540,10 +511,10 @@ function openInvitePage() {
 }
 
 .contact-avatar {
-  width: 42px;
-  height: 42px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
+  width: 40px;
+  height: 40px;
+  background: #eef3f8;
+  color: #274c74;
   font-weight: 700;
 }
 
@@ -567,7 +538,10 @@ function openInvitePage() {
 
 .row-badge {
   flex-shrink: 0;
-  padding: 3px 8px;
+  padding: 2px 8px;
+  background: #edf2f7;
+  color: #5b7692;
+  font-size: 0.72rem;
 }
 
 .online-dot {
@@ -582,6 +556,7 @@ function openInvitePage() {
 .search-placeholder {
   justify-items: center;
   gap: 12px;
+  padding: 32px 12px;
   text-align: center;
 }
 

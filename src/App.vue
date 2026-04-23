@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref, watch } from "vue";
 import Button from "primevue/button";
 import ArchivedChatsPage from "./components/ArchivedChatsPage.vue";
 import ChatPane from "./components/ChatPane.vue";
@@ -105,7 +106,6 @@ const {
   openFindPeoplePage,
   openCircleManagement,
   openCircleDetail,
-  openDetailsDrawer,
   openContactProfile,
   openMessageDetailPage,
   openGroupSelectMembersPage,
@@ -164,6 +164,49 @@ const {
   closeTopOverlayPage,
   dismissTransportNotice,
 } = useChatShell();
+
+const showSessionChatPage = ref(false);
+
+watch(
+  isAuthenticated,
+  (authenticated) => {
+    if (!authenticated) {
+      showSessionChatPage.value = false;
+    }
+  },
+  { immediate: true },
+);
+
+watch(selectedSessionId, (nextSessionId, previousSessionId) => {
+  if (!isAuthenticated.value) {
+    return;
+  }
+
+  if (!nextSessionId) {
+    showSessionChatPage.value = false;
+    return;
+  }
+
+  if (
+    nextSessionId !== previousSessionId &&
+    (showSessionChatPage.value || !!activeOverlayPage.value)
+  ) {
+    showSessionChatPage.value = true;
+  }
+});
+
+watch(activeCircleId, () => {
+  showSessionChatPage.value = false;
+});
+
+function openSessionChatPage(sessionId: string) {
+  selectSession(sessionId);
+  showSessionChatPage.value = true;
+}
+
+function closeSessionChatPage() {
+  showSessionChatPage.value = false;
+}
 
 async function shareCircleInvite() {
   const url = inviteLink.value.trim();
@@ -498,43 +541,70 @@ async function shareCircleInvite() {
     </Transition>
 
     <template v-if="isAuthenticated">
-      <HomeTopBar
-        :user="userProfile"
-        :circle="activeCircle"
-        @avatar-click="showSettingsDrawer = true"
-        @title-click="toggleCircleSwitcher"
-        @add-click="openNewMessage"
-      />
+      <section
+        class="authenticated-shell"
+        :class="{ 'authenticated-shell-stacked': showSessionChatPage || !!activeOverlayPage }"
+      >
+        <section
+          class="primary-page"
+          :aria-hidden="showSessionChatPage || !!activeOverlayPage ? 'true' : 'false'"
+        >
+          <HomeTopBar
+            :user="userProfile"
+            :circle="activeCircle"
+            @avatar-click="showSettingsDrawer = true"
+            @title-click="toggleCircleSwitcher"
+            @add-click="openNewMessage"
+          />
 
-      <Transition name="overlay-fade">
-        <div v-if="showCircleSwitcher" class="overlay-layer">
-          <div class="overlay-mask" @click="closeCircleOverlay"></div>
-          <div class="overlay-content">
-            <CircleSwitcher
-              :circles="circles"
-              :active-circle-id="activeCircleId"
-              @select="chooseCircle"
-              @join="openCircleManagement"
-              @restore="handleSettingsAction('restore')"
+          <Transition name="overlay-fade">
+            <div v-if="showCircleSwitcher" class="overlay-layer">
+              <div class="overlay-mask" @click="closeCircleOverlay"></div>
+              <div class="overlay-content">
+                <CircleSwitcher
+                  :circles="circles"
+                  :active-circle-id="activeCircleId"
+                  @select="chooseCircle"
+                  @join="openCircleManagement"
+                  @restore="handleSettingsAction('restore')"
+                />
+              </div>
+            </div>
+          </Transition>
+
+          <section class="content-list">
+            <SessionList
+              v-model:search-text="searchText"
+              :sessions="filteredSessions"
+              :active-session-id="selectedSessionId"
+              :active-circle="activeCircle"
+              :archived-count="archivedSessionsForCircle.length"
+              @select-session="openSessionChatPage"
+              @empty-action="!activeCircle || activeCircle.type === 'paid' ? openFindPeoplePage('join-circle') : openFindPeoplePage('chat')"
+              @session-action="handleSessionAction"
+              @open-archived="openArchivedPage"
             />
-          </div>
-        </div>
-      </Transition>
+          </section>
+        </section>
+      </section>
+    </template>
 
-      <section class="content-grid">
-        <SessionList
-          v-model:search-text="searchText"
-          :sessions="filteredSessions"
-          :active-session-id="selectedSessionId"
-          :active-circle="activeCircle"
-          :archived-count="archivedSessionsForCircle.length"
-          @select-session="selectSession"
-          @empty-action="!activeCircle || activeCircle.type === 'paid' ? openFindPeoplePage('join-circle') : openFindPeoplePage('chat')"
-          @session-action="handleSessionAction"
-          @open-archived="openArchivedPage"
-        />
+    <LoginScreen
+      v-else
+      :circles="circles"
+      :restorable-circles="restorableCircles"
+      :profile="userProfile"
+      @complete="completeLogin"
+    />
 
+    <Transition name="page-sheet">
+      <section
+        v-if="isAuthenticated && showSessionChatPage && selectedSession"
+        class="chat-page-layer"
+      >
         <ChatPane
+          presentation="page"
+          :show-back-button="true"
           :session="selectedSession"
           :active-circle="activeCircle"
           :messages="activeMessages"
@@ -549,6 +619,7 @@ async function shareCircleInvite() {
           :can-send-messages="canSendMessages"
           :send-blocked-reason="sendBlockedReason"
           :runtime-error="runtimeDiagnosticError"
+          @back="closeSessionChatPage"
           @load-older="loadOlderMessages"
           @update:composer-text="updateComposerText"
           @mention-navigate="navigateMentionSuggestions"
@@ -565,46 +636,74 @@ async function shareCircleInvite() {
           @send="sendPreviewMessage"
           @retry-message="retryMessageDelivery"
           @open-profile="openProfilePage"
-          @open-details="openDetailsDrawer"
+          @open-details="openProfilePage"
         />
       </section>
-    </template>
-
-    <LoginScreen
-      v-else
-      :circles="circles"
-      :restorable-circles="restorableCircles"
-      :profile="userProfile"
-      @complete="completeLogin"
-    />
+    </Transition>
   </main>
 </template>
 
 <style>
+@font-face {
+  font-family: "OX Font";
+  src: url("../tmp/xchat-app-main/assets/fonts/font_regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "OX Font";
+  src: url("../tmp/xchat-app-main/assets/fonts/font_medium.ttf") format("truetype");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "OX Font";
+  src: url("../tmp/xchat-app-main/assets/fonts/font_bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Lato";
+  src: url("../tmp/xchat-app-main/assets/fonts/Lato-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --shell-page-bg:
-    radial-gradient(circle at top left, rgba(95, 166, 255, 0.18), transparent 22%),
-    radial-gradient(circle at right bottom, rgba(95, 216, 176, 0.16), transparent 18%),
-    #eef3f7;
-  --shell-page-text: #172033;
-  --shell-surface: rgba(255, 255, 255, 0.92);
-  --shell-surface-strong: rgba(255, 255, 255, 0.97);
-  --shell-surface-muted: #f7fafd;
-  --shell-surface-soft: #f3f7fb;
-  --shell-border: rgba(210, 220, 232, 0.9);
-  --shell-border-soft: rgba(224, 232, 240, 0.9);
-  --shell-hover: rgba(236, 243, 250, 0.92);
-  --shell-selected: linear-gradient(135deg, #eff5ff 0%, #eefaf5 100%);
-  --shell-selected-border: rgba(170, 198, 228, 0.92);
-  --shell-text-strong: #18253d;
-  --shell-text-default: #31425e;
-  --shell-text-muted: #6c7f98;
-  --shell-text-soft: #7a8ca3;
-  --shell-avatar-bg: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  --shell-avatar-text: #16355c;
-  --shell-shadow-soft: 0 20px 50px rgba(24, 46, 84, 0.08);
-  --shell-shadow-strong: 0 26px 64px rgba(17, 36, 66, 0.2);
-  font-family: "IBM Plex Sans", "Noto Sans SC", "Segoe UI", sans-serif;
+    radial-gradient(circle at top left, rgba(219, 230, 241, 0.72), transparent 18%),
+    radial-gradient(circle at right bottom, rgba(232, 238, 244, 0.78), transparent 22%),
+    #f6f7f9;
+  --shell-page-text: #1d1c21;
+  --shell-surface: rgba(255, 255, 255, 0.94);
+  --shell-surface-strong: rgba(255, 255, 255, 0.99);
+  --shell-surface-muted: #f7f8fa;
+  --shell-surface-soft: #eef2f5;
+  --shell-border: rgba(215, 220, 228, 0.92);
+  --shell-border-soft: rgba(228, 232, 237, 0.9);
+  --shell-hover: rgba(44, 108, 181, 0.06);
+  --shell-selected: linear-gradient(180deg, rgba(44, 108, 181, 0.1), rgba(44, 108, 181, 0.03));
+  --shell-selected-border: rgba(44, 108, 181, 0.18);
+  --shell-text-strong: #1a1b1e;
+  --shell-text-default: #404753;
+  --shell-text-muted: #7a8593;
+  --shell-text-soft: #95a0ad;
+  --shell-accent: #2c6cb5;
+  --shell-accent-soft: rgba(44, 108, 181, 0.12);
+  --shell-danger: #ff6767;
+  --shell-success: #4caf7a;
+  --shell-avatar-bg: linear-gradient(135deg, rgba(44, 108, 181, 0.12), rgba(44, 108, 181, 0.18));
+  --shell-avatar-text: #29568c;
+  --shell-shadow-soft: 0 18px 42px rgba(35, 47, 65, 0.06);
+  --shell-shadow-strong: 0 28px 68px rgba(35, 47, 65, 0.14);
+  font-family: "OX Font", "Lato", "Noto Sans SC", "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -618,27 +717,31 @@ html[data-shell-theme="light"] {
 html[data-shell-theme="ink"] {
   color-scheme: dark;
   --shell-page-bg:
-    radial-gradient(circle at top left, rgba(91, 138, 211, 0.18), transparent 24%),
-    radial-gradient(circle at right bottom, rgba(66, 154, 127, 0.16), transparent 22%),
-    #0f1726;
-  --shell-page-text: #e8eef8;
-  --shell-surface: rgba(18, 28, 44, 0.9);
-  --shell-surface-strong: rgba(18, 28, 44, 0.96);
-  --shell-surface-muted: rgba(28, 40, 60, 0.92);
-  --shell-surface-soft: rgba(26, 37, 57, 0.88);
-  --shell-border: rgba(79, 101, 135, 0.44);
-  --shell-border-soft: rgba(79, 101, 135, 0.32);
-  --shell-hover: rgba(39, 54, 79, 0.92);
-  --shell-selected: linear-gradient(135deg, rgba(46, 73, 110, 0.9) 0%, rgba(27, 82, 72, 0.82) 100%);
-  --shell-selected-border: rgba(103, 146, 205, 0.46);
-  --shell-text-strong: #f1f6ff;
-  --shell-text-default: #d7e1f1;
-  --shell-text-muted: #97a8c4;
-  --shell-text-soft: #8a9bb6;
-  --shell-avatar-bg: linear-gradient(135deg, rgba(68, 104, 160, 0.88) 0%, rgba(43, 117, 99, 0.82) 100%);
-  --shell-avatar-text: #f4f8ff;
-  --shell-shadow-soft: 0 22px 52px rgba(4, 10, 20, 0.34);
-  --shell-shadow-strong: 0 28px 70px rgba(2, 8, 18, 0.45);
+    radial-gradient(circle at top left, rgba(111, 97, 232, 0.2), transparent 24%),
+    radial-gradient(circle at right bottom, rgba(143, 130, 255, 0.18), transparent 24%),
+    #1f1c38;
+  --shell-page-text: #f5f5f7;
+  --shell-surface: rgba(34, 29, 62, 0.92);
+  --shell-surface-strong: rgba(34, 29, 62, 0.97);
+  --shell-surface-muted: rgba(43, 34, 80, 0.96);
+  --shell-surface-soft: rgba(53, 45, 96, 0.84);
+  --shell-border: rgba(126, 116, 194, 0.42);
+  --shell-border-soft: rgba(126, 116, 194, 0.28);
+  --shell-hover: rgba(111, 97, 232, 0.16);
+  --shell-selected: linear-gradient(180deg, rgba(111, 97, 232, 0.3), rgba(111, 97, 232, 0.14));
+  --shell-selected-border: rgba(156, 145, 242, 0.42);
+  --shell-text-strong: #ffffff;
+  --shell-text-default: #ece9ff;
+  --shell-text-muted: #b5aed7;
+  --shell-text-soft: #9d96c2;
+  --shell-accent: #8e81ff;
+  --shell-accent-soft: rgba(142, 129, 255, 0.16);
+  --shell-danger: #ff7c7c;
+  --shell-success: #7edca7;
+  --shell-avatar-bg: linear-gradient(135deg, rgba(142, 129, 255, 0.28), rgba(111, 97, 232, 0.44));
+  --shell-avatar-text: #f7f5ff;
+  --shell-shadow-soft: 0 22px 54px rgba(10, 8, 24, 0.34);
+  --shell-shadow-strong: 0 30px 78px rgba(8, 7, 21, 0.5);
 }
 
 html[data-shell-text-size="compact"] {
@@ -684,37 +787,86 @@ textarea {
 .app-shell {
   position: relative;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 16px;
+  grid-template-rows: minmax(0, 1fr);
   min-height: 100vh;
-  padding: 18px;
+  overflow: hidden;
+}
+
+.authenticated-shell,
+.primary-page {
+  min-height: 0;
+}
+
+.authenticated-shell {
+  position: relative;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  height: 100vh;
+  background: var(--shell-page-bg);
+}
+
+.primary-page {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 14px 14px;
+  transition:
+    transform 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.24s ease,
+    filter 0.3s ease;
+  will-change: transform, opacity;
+}
+
+.authenticated-shell-stacked .primary-page {
+  transform: translateX(-10%) scale(0.985);
+  opacity: 0.9;
+  filter: saturate(0.92);
+  pointer-events: none;
 }
 
 .content-grid {
   display: grid;
-  grid-template-columns: 360px minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns: 340px minmax(0, 1fr);
+  gap: 14px;
   min-height: 0;
+}
+
+.content-list {
+  display: grid;
+  min-height: 0;
+  max-width: min(100%, 560px);
 }
 
 .overlay-layer {
   position: fixed;
   inset: 0;
-  z-index: 20;
+  z-index: 18;
+  display: grid;
+  align-items: start;
+  padding-top: 74px;
+}
+
+.chat-page-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 24;
+  background: var(--shell-surface-strong);
 }
 
 .overlay-mask {
   position: absolute;
   inset: 0;
-  background: rgba(17, 26, 41, 0.28);
-  backdrop-filter: blur(4px);
+  background: rgba(14, 16, 21, 0.2);
 }
 
 .overlay-content {
-  position: absolute;
-  top: 86px;
-  left: 50%;
-  transform: translateX(-50%);
+  position: relative;
+  z-index: 1;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  padding: 0 12px;
 }
 
 .launch-fade-enter-active,
@@ -734,8 +886,8 @@ textarea {
 .page-sheet-enter-active,
 .page-sheet-leave-active {
   transition:
-    opacity 0.24s ease,
-    transform 0.28s ease;
+    opacity 0.22s ease,
+    transform 0.34s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .launch-fade-enter-from,
@@ -749,7 +901,7 @@ textarea {
 
 .page-sheet-enter-from,
 .page-sheet-leave-to {
-  transform: translateX(24px);
+  transform: translateX(100%);
 }
 
 .notice-slide-enter-from,
@@ -759,6 +911,11 @@ textarea {
 }
 
 .transport-notice {
+  position: fixed;
+  top: 12px;
+  left: 14px;
+  right: 14px;
+  z-index: 32;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
@@ -813,24 +970,33 @@ textarea {
 }
 
 @media (max-width: 920px) {
-  .content-grid {
-    grid-template-columns: 1fr;
+  .content-list {
+    max-width: none;
+  }
+
+  .primary-page {
+    padding: 12px 12px 12px;
   }
 
   .overlay-content {
-    top: 78px;
-    width: 100%;
-    padding: 0 12px;
+    padding: 0 10px;
   }
 }
 
 @media (max-width: 720px) {
-  .app-shell {
-    padding: 12px;
+  .primary-page {
+    gap: 8px;
+    padding: 10px 10px calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .authenticated-shell-stacked .primary-page {
+    transform: translateX(-18%) scale(0.985);
   }
 
   .transport-notice {
     grid-template-columns: 1fr;
+    left: 10px;
+    right: 10px;
   }
 
   .transport-notice-dismiss {

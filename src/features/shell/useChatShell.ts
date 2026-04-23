@@ -190,6 +190,32 @@ function documentHidden() {
   return typeof document !== "undefined" && document.hidden;
 }
 
+function isLikelyMobileShellEnvironment() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const mobileByUserAgentData = (() => {
+    const navigatorWithUserAgentData = navigator as Navigator & {
+      userAgentData?: {
+        mobile?: boolean;
+      };
+    };
+
+    return navigatorWithUserAgentData.userAgentData?.mobile === true;
+  })();
+  if (mobileByUserAgentData) {
+    return true;
+  }
+
+  const userAgent = navigator.userAgent || "";
+  if (/(Android|iPhone|iPad|iPod|Mobile)/i.test(userAgent)) {
+    return true;
+  }
+
+  return /Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1;
+}
+
 export function useChatShell() {
   const initialShellState = createEmptyShellState();
   const isShellStateReady = ref(false);
@@ -782,6 +808,8 @@ export function useChatShell() {
         return "Archive action failed";
       case "unarchive":
         return "Restore chat failed";
+      case "clearUnread":
+        return "Unread update failed";
       case "delete":
         return "Delete chat failed";
       default:
@@ -2392,18 +2420,40 @@ export function useChatShell() {
     return true;
   }
 
+  async function persistClearedSessionUnread(
+    sessionId: string,
+    options: {
+      showFailureNotice?: boolean;
+    } = {},
+  ) {
+    const mutation = await runFallbackEligibleMutation(
+      () => applyChatSessionAction({ sessionId, action: "clearUnread" }),
+      options.showFailureNotice === false
+        ? undefined
+        : {
+            title: "Unread update failed",
+            fallbackDetail: "Desktop chat state could not persist the cleared unread state.",
+          },
+    );
+
+    return mutation.canFallbackLocally;
+  }
+
+  function clearSessionUnreadLocally(sessionId: string) {
+    updateSession(sessionId, {
+      unreadCount: undefined,
+    });
+  }
+
   function selectSession(sessionId: string) {
     selectedSessionId.value = sessionId;
-    sessions.value = sessions.value.map((session) => {
-      if (session.id === sessionId) {
-        return {
-          ...session,
-          unreadCount: undefined,
-        };
-      }
+    const session = sessions.value.find((item) => item.id === sessionId);
+    if (!session?.unreadCount) {
+      return;
+    }
 
-      return session;
-    });
+    clearSessionUnreadLocally(sessionId);
+    void persistClearedSessionUnread(sessionId);
   }
 
   function resetFindPeopleRequestState() {
@@ -2893,8 +2943,8 @@ export function useChatShell() {
       selection.mode === "custom"
         ? {
             mode: "custom",
-            name: selection.name?.trim() || "Custom Relay",
-            relay: selection.relay?.trim() || "",
+            name: selection.name?.trim() || normalizeCustomRelayInput(selection.relay ?? "") || "Custom Relay",
+            relay: normalizeCustomRelayInput(selection.relay ?? "") || selection.relay?.trim() || "",
           }
         : {
             mode: "invite",
@@ -3330,15 +3380,6 @@ export function useChatShell() {
     );
   }
 
-  function humanizeLabel(value: string) {
-    return value
-      .trim()
-      .split(/[^a-zA-Z0-9]+/)
-      .filter(Boolean)
-      .map((token) => token.charAt(0).toUpperCase() + token.slice(1).toLowerCase())
-      .join(" ");
-  }
-
   function buildSuggestedGroupName(memberContacts: ContactItem[]) {
     const ownerName = userProfile.value.name.trim() || "My";
     if (memberContacts.length === 1) {
@@ -3352,18 +3393,12 @@ export function useChatShell() {
   function inferCircleInputFromQuery(query: string): AddCircleInput {
     const trimmed = query.trim();
     if (classifyChatQuery(trimmed) === "relay") {
-      let relayLabel = "Custom Relay";
-      try {
-        const url = new URL(trimmed);
-        relayLabel = humanizeLabel(url.hostname.split(".")[0] ?? url.hostname) || relayLabel;
-      } catch {
-        relayLabel = humanizeLabel(trimmed.replace(/^[a-z]+:\/\//i, "")) || relayLabel;
-      }
+      const normalizedRelay = normalizeCustomRelayInput(trimmed);
 
       return {
         mode: "custom",
-        name: relayLabel,
-        relay: trimmed,
+        name: normalizedRelay || "Custom Relay",
+        relay: normalizedRelay || trimmed,
       };
     }
 
@@ -3533,6 +3568,32 @@ export function useChatShell() {
     }
   }
 
+  function showUnsupportedAttachmentFileActionNotice(
+    action: "open" | "reveal" | "copy-path",
+    selected: { session: SessionItem; message: MessageItem },
+  ) {
+    const title =
+      action === "open"
+        ? "Attachment open unavailable"
+        : action === "reveal"
+          ? "Reveal in folder unavailable"
+          : "Copy path unavailable";
+    const detail =
+      action === "open"
+        ? "This device does not expose a desktop file manager for opening cached attachment paths."
+        : action === "reveal"
+          ? "This device does not expose a desktop file browser for revealing cached attachment paths."
+          : "This device does not expose a stable desktop file path to copy for cached attachments.";
+
+    showTransportNotice({
+      id: `${action}-attachment-unsupported-${selected.session.id}-${selected.message.id}`,
+      tone: "info",
+      title,
+      detail,
+      circleId: selected.session.circleId,
+    });
+  }
+
   function clipboardMessageContent(message: MessageItem) {
     switch (message.kind) {
       case "image":
@@ -3662,6 +3723,11 @@ export function useChatShell() {
       return;
     }
 
+    if (isLikelyMobileShellEnvironment()) {
+      showUnsupportedAttachmentFileActionNotice("open", selected);
+      return;
+    }
+
     const localPath = await ensureMessageAttachmentLocalPath(messageId, selected.session.id);
     if (!localPath) {
       showTransportNotice({
@@ -3703,6 +3769,11 @@ export function useChatShell() {
       return;
     }
 
+    if (isLikelyMobileShellEnvironment()) {
+      showUnsupportedAttachmentFileActionNotice("reveal", selected);
+      return;
+    }
+
     const localPath = await ensureMessageAttachmentLocalPath(messageId, selected.session.id);
     if (!localPath) {
       showTransportNotice({
@@ -3741,6 +3812,11 @@ export function useChatShell() {
   async function copyMessageAttachmentPath(messageId: string, sessionId?: string) {
     const selected = sessionMessageById(sessionId ?? selectedSession.value?.id, messageId);
     if (!selected) {
+      return;
+    }
+
+    if (isLikelyMobileShellEnvironment()) {
+      showUnsupportedAttachmentFileActionNotice("copy-path", selected);
       return;
     }
 
@@ -5043,6 +5119,9 @@ export function useChatShell() {
         updateSession(payload.sessionId, { archived: false });
         selectSession(payload.sessionId);
         break;
+      case "clearUnread":
+        clearSessionUnreadLocally(payload.sessionId);
+        break;
       case "delete":
         deleteSession(payload.sessionId);
         break;
@@ -5550,6 +5629,7 @@ export function useChatShell() {
     }
 
     let primarySessionId = "";
+    const clearedUnreadSessionIds: string[] = [];
     sessions.value = sessions.value.map((session) => {
       if (session.circleId !== circleId || session.archived) {
         return session;
@@ -5557,6 +5637,10 @@ export function useChatShell() {
 
       if (!primarySessionId) {
         primarySessionId = session.id;
+      }
+
+      if (session.unreadCount) {
+        clearedUnreadSessionIds.push(session.id);
       }
 
       return {
@@ -5568,6 +5652,10 @@ export function useChatShell() {
 
     if (!primarySessionId) {
       return;
+    }
+
+    for (const sessionId of clearedUnreadSessionIds) {
+      void persistClearedSessionUnread(sessionId, { showFailureNotice: false });
     }
 
     const body = advancedPreferences.value.useTorNetwork

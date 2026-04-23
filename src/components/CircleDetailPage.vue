@@ -136,7 +136,11 @@ function presenceTone(presence: DiscoveredPeer["presence"]) {
 }
 
 function engineLabel(engine: TransportEngineKind | null) {
-  return engine === "nativePreview" ? "nativePreview" : engine === "mock" ? "mock" : "unknown";
+  return engine === "nativePreview"
+    ? "Experimental native preview"
+    : engine === "mock"
+      ? "Mock fallback"
+      : "unknown";
 }
 
 function syncTone(state: SessionSyncItem["state"]) {
@@ -195,7 +199,7 @@ function runtimeAdapterTone(kind: TransportRuntimeSession["adapterKind"]) {
 
 function runtimeLaunchTone(status: TransportRuntimeSession["launchStatus"]) {
   if (status === "ready" || status === "embedded") {
-    return "success";
+    return "info";
   }
 
   if (status === "missing") {
@@ -203,6 +207,74 @@ function runtimeLaunchTone(status: TransportRuntimeSession["launchStatus"]) {
   }
 
   return "warn";
+}
+
+function transportHealthLabel(
+  health: CircleTransportDiagnostic["health"],
+  engine: TransportEngineKind | null,
+) {
+  if (engine !== "nativePreview") {
+    return health;
+  }
+
+  return health === "online"
+    ? "preview online"
+    : health === "degraded"
+      ? "preview warming up"
+      : "preview offline";
+}
+
+function runtimeLaunchLabel(status: TransportRuntimeSession["launchStatus"]) {
+  if (status === "ready") {
+    return "command located";
+  }
+
+  if (status === "embedded") {
+    return "embedded preview";
+  }
+
+  if (status === "missing") {
+    return "command missing";
+  }
+
+  return "not verified";
+}
+
+function honestTransportCopy(value: string) {
+  const replacements = [
+    ["Native runtime active", "Native preview runtime active"],
+    ["Native runtime warmup", "Native preview warmup"],
+    ["Native runtime offline", "Native preview offline"],
+    ["Native runtime booted", "Native preview runtime launched"],
+    ["Native runtime stopped", "Native preview runtime stopped"],
+    ["Native relay checkpoint saved", "Native preview relay checkpoint saved"],
+    ["Native session merge committed", "Native preview session merge committed"],
+    ["Native peer sweep finished", "Native preview peer sweep finished"],
+    ["native runtime active", "native preview runtime active"],
+    ["native runtime booting", "native preview runtime booting"],
+    ["native runtime idle", "native preview runtime idle"],
+    ["native preview engine", "experimental native preview engine"],
+  ] as const;
+
+  return replacements.reduce((nextValue, [search, replacement]) => {
+    return nextValue.split(search).join(replacement);
+  }, value);
+}
+
+function runtimeReadinessCopy(session: TransportRuntimeSession) {
+  if (session.launchStatus === "ready") {
+    return "Command lookup passed, but this relay still runs on an experimental preview transport path.";
+  }
+
+  if (session.launchStatus === "embedded") {
+    return "Embedded fallback is mounted for preview diagnostics only.";
+  }
+
+  if (session.launchStatus === "missing") {
+    return "The experimental runtime command is missing on this host.";
+  }
+
+  return "The local preview runtime has not been verified on this host.";
 }
 
 function runtimeLaunchCopy(session: TransportRuntimeSession) {
@@ -263,8 +335,8 @@ function runTransportAction(action: TransportCircleAction) {
 
 <template>
   <OverlayPageShell
-    title="Circle Settings"
-    subtitle="Relay identity, shell metrics and circle actions."
+    title="Circle Info"
+    subtitle="Relay, activity and circle actions."
     @close="emit('close')"
   >
     <div v-if="circle" class="circle-detail-page">
@@ -330,16 +402,20 @@ function runTransportAction(action: TransportCircleAction) {
       </section>
 
       <section class="section-card">
-        <div class="section-title">Notes</div>
+        <div class="section-title">Transport</div>
         <div class="info-row">
-          <strong>Shell Status</strong>
+          <strong>Circle Note</strong>
           <p>
             {{ circle.type === "paid" ? "Private relay onboarding shell." : circle.description }}
           </p>
         </div>
         <div v-if="transportDiagnostic" class="info-row">
           <strong>Transport Health</strong>
-          <Tag :value="transportDiagnostic.health" :severity="transportTone(transportDiagnostic.health)" rounded />
+          <Tag
+            :value="transportHealthLabel(transportDiagnostic.health, transportEngine)"
+            :severity="transportTone(transportDiagnostic.health)"
+            rounded
+          />
         </div>
         <div v-if="transportEngine" class="info-row">
           <strong>Transport Engine</strong>
@@ -355,8 +431,11 @@ function runTransportAction(action: TransportCircleAction) {
         </div>
         <div v-if="transportDiagnostic" class="info-row">
           <strong>Last Sync</strong>
-          <p>{{ transportDiagnostic.lastSync }}</p>
+          <p>{{ honestTransportCopy(transportDiagnostic.lastSync) }}</p>
         </div>
+        <p class="section-note">
+          Preview diagnostics summarize the current relay shell path. They do not certify end-to-end transport readiness.
+        </p>
       </section>
 
       <section class="section-card">
@@ -380,6 +459,7 @@ function runTransportAction(action: TransportCircleAction) {
               <p>{{ item.sessionLabel }} · {{ item.endpoint }}</p>
               <p v-if="runtimeLaunchCopy(item)">{{ item.adapterKind }} adapter · {{ runtimeLaunchCopy(item) }}</p>
               <p v-else>{{ item.adapterKind }} adapter</p>
+              <p>{{ runtimeReadinessCopy(item) }}</p>
               <p v-if="item.resolvedLaunchCommand">resolved {{ item.resolvedLaunchCommand }}</p>
               <p v-if="item.launchError" class="failure-copy">{{ item.launchError }}</p>
               <p v-if="runtimeLastLaunchCopy(item)">last launch {{ runtimeLastLaunchCopy(item) }}</p>
@@ -389,11 +469,11 @@ function runTransportAction(action: TransportCircleAction) {
                 {{ item.restartAttempts }} recovery attempts{{ item.nextRetryIn ? ` · next ${item.nextRetryIn}` : "" }}
               </p>
               <p v-if="item.lastFailureReason" class="failure-copy">{{ runtimeFailureCopy(item) }}</p>
-              <p>{{ item.lastEvent }} · {{ item.lastEventAt }}</p>
+              <p>{{ honestTransportCopy(item.lastEvent) }} · {{ item.lastEventAt }}</p>
             </div>
             <div class="list-tags">
               <Tag :value="item.adapterKind" :severity="runtimeAdapterTone(item.adapterKind)" rounded />
-              <Tag :value="item.launchStatus" :severity="runtimeLaunchTone(item.launchStatus)" rounded />
+              <Tag :value="runtimeLaunchLabel(item.launchStatus)" :severity="runtimeLaunchTone(item.launchStatus)" rounded />
               <Tag :value="item.desiredState" :severity="item.desiredState === 'running' ? 'success' : 'secondary'" rounded />
               <Tag :value="item.recoveryPolicy" :severity="item.recoveryPolicy === 'auto' ? 'info' : 'secondary'" rounded />
               <Tag :value="item.queueState" :severity="runtimeQueueTone(item.queueState)" rounded />
@@ -414,8 +494,8 @@ function runTransportAction(action: TransportCircleAction) {
         <div v-if="transportActivities.length" class="list-card">
           <div v-for="item in transportActivities" :key="item.id" class="list-row">
             <div class="list-copy">
-              <strong>{{ item.title }}</strong>
-              <p>{{ item.detail }}</p>
+              <strong>{{ honestTransportCopy(item.title) }}</strong>
+              <p>{{ honestTransportCopy(item.detail) }}</p>
             </div>
             <div class="list-tags">
               <Tag :value="item.kind" :severity="activityTone(item.level)" rounded />
@@ -551,34 +631,32 @@ function runTransportAction(action: TransportCircleAction) {
 }
 
 .circle-detail-page {
-  gap: 18px;
+  gap: 12px;
+  padding-top: 8px;
 }
 
 .hero-card {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 16px;
+  gap: 12px;
   align-items: center;
-  padding: 24px;
-  border-radius: 28px;
-  background:
-    radial-gradient(circle at top left, rgba(106, 168, 255, 0.18), transparent 26%),
-    linear-gradient(180deg, #f7fbfe 0%, #f2f7fb 100%);
+  padding: 8px 0 14px;
+  border-bottom: 1px solid #e4e9ef;
 }
 
 .circle-avatar {
-  width: 58px;
-  height: 58px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
+  width: 56px;
+  height: 56px;
+  background: #eef3f8;
+  color: #274c74;
   font-weight: 700;
-  font-size: 1.2rem;
+  font-size: 1.1rem;
 }
 
 .hero-copy,
 .field {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .section-head {
@@ -622,20 +700,20 @@ function runTransportAction(action: TransportCircleAction) {
 }
 
 .list-card {
-  gap: 10px;
+  gap: 0;
 }
 
 .list-row {
   display: flex;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 16px;
-  border-radius: 20px;
-  background: #f7fafc;
+  padding: 14px 0;
+  border-top: 1px solid #e7ebf1;
+  background: transparent;
 }
 
 .list-copy {
-  gap: 6px;
+  gap: 5px;
 }
 
 .list-copy strong,
@@ -650,20 +728,21 @@ function runTransportAction(action: TransportCircleAction) {
 
 .stats-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
 
 .stat-card {
   display: grid;
-  gap: 6px;
-  padding: 16px;
-  border-radius: 20px;
-  background: #f7fafc;
+  gap: 4px;
+  padding: 14px 12px;
+  border-radius: 16px;
+  background: #ffffff;
+  border: 1px solid #e4e9ef;
   text-align: center;
 }
 
 .stat-card strong {
-  font-size: 1.2rem;
+  font-size: 1.05rem;
 }
 
 .stat-card span,
@@ -673,7 +752,11 @@ function runTransportAction(action: TransportCircleAction) {
 }
 
 .section-card {
-  gap: 12px;
+  gap: 10px;
+  padding: 16px;
+  border-radius: 20px;
+  background: #ffffff;
+  border: 1px solid #e4e9ef;
 }
 
 .section-title {
@@ -692,14 +775,36 @@ function runTransportAction(action: TransportCircleAction) {
   align-items: start;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 16px;
-  border-radius: 20px;
-  background: #f7fafc;
+  padding: 14px 0;
+  border-top: 1px solid #e7ebf1;
+  background: transparent;
 }
 
 .info-row p {
   margin: 0;
   text-align: right;
+  line-height: 1.55;
+}
+
+.field + .field,
+.field + .info-row,
+.info-row + .info-row,
+.section-head + .list-card,
+.section-head + .info-row,
+.section-title + .info-row {
+  margin-top: 0;
+}
+
+.field:first-of-type,
+.info-row:first-of-type,
+.list-row:first-of-type {
+  border-top: 0;
+}
+
+.section-note {
+  margin: 0;
+  color: #73849a;
+  font-size: 0.84rem;
   line-height: 1.55;
 }
 

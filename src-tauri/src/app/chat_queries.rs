@@ -1,10 +1,11 @@
 use crate::app::{auth_access, chat_mutations, shell_auth};
 use crate::domain::chat::{
-    default_message_page_size, AddCircleInput, AuthRuntimeClientUriSummary, ChatDomainOverview, ChatDomainSeed,
-    ChatSessionMessageUpdates, ChatSessionMessagesPage, ChatShellSnapshot,
-    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LoginCircleSelectionInput,
-    LoginCircleSelectionMode, LoginCompletionInput, LoginMethod, RestorableCircleEntry,
-    RestoreCircleInput, ShellStateSnapshot, UpdateAuthRuntimeInput,
+    default_message_page_size, AddCircleInput, AuthRuntimeClientUriSummary, ChatDomainOverview,
+    ChatDomainSeed, ChatSessionMessageUpdates, ChatSessionMessagesPage, ChatShellSnapshot,
+    LoadSessionMessageUpdatesInput, LoadSessionMessagesInput, LocalAccountSecretSummary,
+    LoginAccessKind, LoginCircleSelectionInput, LoginCircleSelectionMode, LoginCompletionInput,
+    LoginMethod, RestorableCircleEntry, RestoreCircleInput, ShellStateSnapshot,
+    UpdateAuthRuntimeInput,
 };
 use crate::domain::chat_repository::ChatRepository;
 use crate::infra::shell_state_store;
@@ -39,6 +40,17 @@ pub fn sync_auth_runtime<R: tauri::Runtime>(
     shell_auth::sync_saved_shell_snapshot(app_handle)
 }
 
+pub fn load_local_account_secret_summary<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<Option<LocalAccountSecretSummary>, String> {
+    let shell = load_saved_shell_snapshot(app_handle)?;
+    let Some(auth_session) = shell.auth_session.as_ref() else {
+        return Ok(None);
+    };
+
+    shell_auth::load_local_account_secret_summary(app_handle, auth_session)
+}
+
 pub fn save_chat_shell_snapshot<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     snapshot: ChatShellSnapshot,
@@ -52,14 +64,18 @@ pub fn bootstrap_auth_session<R: tauri::Runtime>(
     input: LoginCompletionInput,
 ) -> Result<ShellStateSnapshot, String> {
     let previous_shell = load_saved_shell_snapshot(app_handle)?;
-    let mut shell = build_authenticated_shell(previous_shell, &input)?;
+    let resolved_input = resolve_login_input(app_handle, &previous_shell, &input)?;
+    let mut shell = build_authenticated_shell(previous_shell, &resolved_input, true)?;
     let auth_session = shell
         .auth_session
         .clone()
         .ok_or_else(|| "authenticated shell is missing auth session summary".to_string())?;
-    shell_auth::persist_auth_runtime_credential(app_handle, &auth_session, &input.access)?;
-    shell.auth_runtime_binding =
-        shell_auth::persist_auth_runtime_binding(app_handle, &auth_session, &input.access)?;
+    shell_auth::persist_auth_runtime_credential(app_handle, &auth_session, &resolved_input.access)?;
+    shell.auth_runtime_binding = shell_auth::persist_auth_runtime_binding(
+        app_handle,
+        &auth_session,
+        &resolved_input.access,
+    )?;
     if let Some(runtime) = shell.auth_runtime.clone() {
         shell.auth_runtime = Some(shell_auth::persist_auth_runtime(
             app_handle,
@@ -69,10 +85,12 @@ pub fn bootstrap_auth_session<R: tauri::Runtime>(
     }
 
     if matches!(
-        input.circle_selection.mode,
+        resolved_input.circle_selection.mode,
         LoginCircleSelectionMode::Existing
     ) {
-        if let Some(circle_id) = normalized_non_empty(input.circle_selection.circle_id.as_deref()) {
+        if let Some(circle_id) =
+            normalized_non_empty(resolved_input.circle_selection.circle_id.as_deref())
+        {
             shell.active_circle_id = circle_id.to_string();
         }
     }
@@ -87,14 +105,18 @@ pub fn complete_login<R: tauri::Runtime>(
     input: LoginCompletionInput,
 ) -> Result<ChatShellSnapshot, String> {
     let previous_shell = load_saved_shell_snapshot(app_handle)?;
-    let mut shell = build_authenticated_shell(previous_shell, &input)?;
+    let resolved_input = resolve_login_input(app_handle, &previous_shell, &input)?;
+    let mut shell = build_authenticated_shell(previous_shell, &resolved_input, false)?;
     let auth_session = shell
         .auth_session
         .clone()
         .ok_or_else(|| "authenticated shell is missing auth session summary".to_string())?;
-    shell_auth::persist_auth_runtime_credential(app_handle, &auth_session, &input.access)?;
-    shell.auth_runtime_binding =
-        shell_auth::persist_auth_runtime_binding(app_handle, &auth_session, &input.access)?;
+    shell_auth::persist_auth_runtime_credential(app_handle, &auth_session, &resolved_input.access)?;
+    shell.auth_runtime_binding = shell_auth::persist_auth_runtime_binding(
+        app_handle,
+        &auth_session,
+        &resolved_input.access,
+    )?;
     if let Some(runtime) = shell.auth_runtime.clone() {
         shell.auth_runtime = Some(shell_auth::persist_auth_runtime(
             app_handle,
@@ -103,7 +125,7 @@ pub fn complete_login<R: tauri::Runtime>(
         )?);
     }
     let (domain_seed, resolved_circle_id, next_restorable_circles) =
-        resolve_login_circle_selection(app_handle, &input, &shell.restorable_circles)?;
+        resolve_login_circle_selection(app_handle, &resolved_input, &shell.restorable_circles)?;
 
     shell.restorable_circles = next_restorable_circles;
     shell.active_circle_id = resolve_active_circle_id(&domain_seed, resolved_circle_id.as_deref());
@@ -229,10 +251,18 @@ fn load_saved_shell_snapshot<R: tauri::Runtime>(
 fn build_authenticated_shell(
     previous_shell: ShellStateSnapshot,
     input: &LoginCompletionInput,
+    allow_incomplete_invite_selection: bool,
 ) -> Result<ShellStateSnapshot, String> {
     let user_profile = normalize_user_profile(&input.user_profile)?;
     validate_access_input(input)?;
-    validate_circle_selection(input, &previous_shell.restorable_circles)?;
+    if !(allow_incomplete_invite_selection
+        && matches!(
+            input.circle_selection.mode,
+            LoginCircleSelectionMode::Invite
+        ))
+    {
+        validate_circle_selection(input, &previous_shell.restorable_circles)?;
+    }
 
     let mut shell = previous_shell;
     shell.is_authenticated = true;
@@ -242,6 +272,42 @@ fn build_authenticated_shell(
     shell.advanced_preferences.experimental_transport = true;
     shell.user_profile = user_profile;
     Ok(shell)
+}
+
+fn resolve_login_input<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    previous_shell: &ShellStateSnapshot,
+    input: &LoginCompletionInput,
+) -> Result<LoginCompletionInput, String> {
+    if !matches!(input.method, LoginMethod::QuickStart) {
+        return Ok(input.clone());
+    }
+
+    if !matches!(input.access.kind, LoginAccessKind::LocalProfile) {
+        return Err("quick start requires `localProfile` access".into());
+    }
+
+    if normalized_non_empty(input.access.value.as_deref()).is_some() {
+        return Ok(input.clone());
+    }
+
+    if let Some(previous_auth_session) = previous_shell.auth_session.as_ref().filter(|session| {
+        matches!(session.login_method, LoginMethod::QuickStart)
+            && matches!(session.access.kind, LoginAccessKind::LocalProfile)
+    }) {
+        if let Some(credential) =
+            shell_auth::load_auth_runtime_credential_for_session(app_handle, previous_auth_session)?
+        {
+            let mut resolved_input = input.clone();
+            resolved_input.access.value = Some(credential.secret_key_hex);
+            resolved_input.logged_in_at = Some(previous_auth_session.logged_in_at.clone());
+            return Ok(resolved_input);
+        }
+    }
+
+    let mut resolved_input = input.clone();
+    resolved_input.access.value = Some(auth_access::generate_secret_key_hex());
+    Ok(resolved_input)
 }
 
 fn build_logged_out_shell(previous_shell: ShellStateSnapshot) -> ShellStateSnapshot {
@@ -351,8 +417,7 @@ fn resolve_selected_restore_entries(
             .find(|entry| same_relay(&entry.relay, relay))
             .cloned()
             .ok_or_else(|| {
-                "restore selection relay is not present in the local restore catalog"
-                    .to_string()
+                "restore selection relay is not present in the local restore catalog".to_string()
             })?;
         selected_entries.push(entry);
     } else if let Some(entry) = restorable_circles.first().cloned() {
@@ -468,8 +533,9 @@ fn resolve_login_circle_selection<R: tauri::Runtime>(
             }
 
             Ok((
-                final_seed
-                    .ok_or_else(|| "restore selection requires a local catalog entry".to_string())?,
+                final_seed.ok_or_else(|| {
+                    "restore selection requires a local catalog entry".to_string()
+                })?,
                 primary_circle_id,
                 next_restorable_circles,
             ))
@@ -1083,10 +1149,7 @@ mod tests {
                                     client_public_key,
                                     NostrConnectMessage::response(
                                         "connect-ack",
-                                        NostrConnectResponse::new(
-                                            Some(ResponseResult::Ack),
-                                            None,
-                                        ),
+                                        NostrConnectResponse::new(Some(ResponseResult::Ack), None),
                                     ),
                                 )
                                 .expect("connect ack event should build")
@@ -1643,6 +1706,181 @@ mod tests {
             .expect("active circle should exist");
         assert_eq!(active_circle.name, "Community Circle");
         assert_eq!(active_circle.relay, "wss://relay.damus.io");
+    }
+
+    #[test]
+    fn complete_login_quick_start_persists_exportable_local_secret() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let snapshot = complete_login(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::QuickStart,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::LocalProfile,
+                    value: None,
+                },
+                user_profile: UserProfile {
+                    name: "Sean Chen".into(),
+                    handle: "@seanchen".into(),
+                    initials: "SC".into(),
+                    status: "Circle owner".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Custom,
+                    circle_id: None,
+                    invite_code: None,
+                    name: Some("Community Circle".into()),
+                    relay: Some("damus".into()),
+                    relays: None,
+                },
+                logged_in_at: Some("2026-04-22T09:00:00Z".into()),
+            },
+        )
+        .expect("quick start should complete login with a generated local secret");
+
+        let auth_session = snapshot
+            .shell
+            .auth_session
+            .as_ref()
+            .expect("quick start auth session should be present");
+        assert!(matches!(auth_session.login_method, LoginMethod::QuickStart));
+        assert!(matches!(
+            auth_session.access.kind,
+            LoginAccessKind::LocalProfile
+        ));
+        assert!(auth_session
+            .access
+            .pubkey
+            .as_deref()
+            .is_some_and(|pubkey| pubkey.starts_with("npub1")));
+
+        let stored_credential = auth_runtime_credential_store::load(app_handle)
+            .expect("failed to load auth runtime credential store")
+            .expect("missing stored quick start auth runtime credential");
+        assert!(matches!(
+            stored_credential.access_kind,
+            LoginAccessKind::LocalProfile
+        ));
+        assert_eq!(stored_credential.stored_at, "2026-04-22T09:00:00Z");
+        assert_eq!(
+            Some(stored_credential.pubkey.as_str()),
+            auth_session.access.pubkey.as_deref()
+        );
+
+        let secret_summary = load_local_account_secret_summary(app_handle)
+            .expect("failed to load local account secret summary")
+            .expect("missing quick start local account secret summary");
+        assert!(matches!(
+            secret_summary.login_method,
+            LoginMethod::QuickStart
+        ));
+        assert!(matches!(
+            secret_summary.access_kind,
+            LoginAccessKind::LocalProfile
+        ));
+        assert_eq!(secret_summary.pubkey, stored_credential.pubkey);
+        assert_eq!(secret_summary.hex_key, stored_credential.secret_key_hex);
+        assert!(secret_summary.nsec.starts_with("nsec1"));
+
+        let reloaded =
+            load_chat_shell_snapshot(app_handle).expect("failed to reload chat shell snapshot");
+        assert!(reloaded
+            .shell
+            .auth_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.credential_persisted_in_native_store));
+    }
+
+    #[test]
+    fn bootstrap_then_complete_login_reuses_quick_start_secret() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let bootstrapped_shell = bootstrap_auth_session(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::QuickStart,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::LocalProfile,
+                    value: None,
+                },
+                user_profile: UserProfile {
+                    name: "Sean Chen".into(),
+                    handle: "@seanchen".into(),
+                    initials: "SC".into(),
+                    status: "Circle owner".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Invite,
+                    circle_id: None,
+                    invite_code: None,
+                    name: None,
+                    relay: None,
+                    relays: None,
+                },
+                logged_in_at: Some("2026-04-22T09:00:00Z".into()),
+            },
+        )
+        .expect("quick start bootstrap should succeed");
+
+        let first_auth_session = bootstrapped_shell
+            .auth_session
+            .as_ref()
+            .expect("bootstrapped auth session should be present");
+        let first_credential = auth_runtime_credential_store::load(app_handle)
+            .expect("failed to load first quick start credential")
+            .expect("missing first quick start credential");
+
+        let snapshot = complete_login(
+            app_handle,
+            LoginCompletionInput {
+                method: LoginMethod::QuickStart,
+                access: LoginAccessInput {
+                    kind: LoginAccessKind::LocalProfile,
+                    value: None,
+                },
+                user_profile: UserProfile {
+                    name: "Sean Chen".into(),
+                    handle: "@seanchen".into(),
+                    initials: "SC".into(),
+                    status: "Circle owner".into(),
+                },
+                circle_selection: LoginCircleSelectionInput {
+                    mode: LoginCircleSelectionMode::Custom,
+                    circle_id: None,
+                    invite_code: None,
+                    name: Some("Community Circle".into()),
+                    relay: Some("damus".into()),
+                    relays: None,
+                },
+                logged_in_at: Some("2026-04-22T09:05:00Z".into()),
+            },
+        )
+        .expect("quick start completion should reuse generated secret");
+
+        let second_credential = auth_runtime_credential_store::load(app_handle)
+            .expect("failed to load second quick start credential")
+            .expect("missing second quick start credential");
+        let second_auth_session = snapshot
+            .shell
+            .auth_session
+            .as_ref()
+            .expect("completed auth session should be present");
+
+        assert_eq!(
+            second_credential.secret_key_hex,
+            first_credential.secret_key_hex
+        );
+        assert_eq!(
+            second_auth_session.logged_in_at,
+            first_auth_session.logged_in_at
+        );
+        assert_eq!(
+            second_auth_session.access.pubkey.as_deref(),
+            Some(second_credential.pubkey.as_str())
+        );
     }
 
     #[test]
@@ -2471,6 +2709,94 @@ mod tests {
     }
 
     #[test]
+    fn load_chat_shell_snapshot_generates_local_secret_for_legacy_quick_start_session() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        shell_state_store::save(
+            app_handle,
+            serde_json::to_value(ShellStateSnapshot {
+                is_authenticated: true,
+                auth_session: Some(AuthSessionSummary {
+                    login_method: LoginMethod::QuickStart,
+                    access: LoginAccessSummary {
+                        kind: LoginAccessKind::LocalProfile,
+                        label: "Quick Start".into(),
+                        pubkey: None,
+                    },
+                    circle_selection_mode: LoginCircleSelectionMode::Invite,
+                    logged_in_at: "2026-04-23T10:00:00Z".into(),
+                }),
+                auth_runtime: Some(AuthRuntimeSummary {
+                    state: AuthRuntimeState::LocalProfile,
+                    login_method: LoginMethod::QuickStart,
+                    access_kind: LoginAccessKind::LocalProfile,
+                    label: "Quick Start".into(),
+                    pubkey: None,
+                    error: None,
+                    can_send_messages: true,
+                    send_blocked_reason: None,
+                    persisted_in_native_store: false,
+                    credential_persisted_in_native_store: false,
+                    updated_at: "2026-04-23T10:00:00Z".into(),
+                }),
+                auth_runtime_binding: None,
+                user_profile: crate::domain::chat::default_user_profile(),
+                restorable_circles: vec![],
+                app_preferences: crate::domain::chat::default_app_preferences(),
+                notification_preferences: crate::domain::chat::default_notification_preferences(),
+                advanced_preferences: crate::domain::chat::default_advanced_preferences(),
+                active_circle_id: "main-circle".into(),
+                selected_session_id: "alice".into(),
+            })
+            .expect("failed to encode shell state"),
+        )
+        .expect("failed to seed legacy quick start shell state");
+
+        let snapshot = load_chat_shell_snapshot(app_handle)
+            .expect("failed to load migrated chat shell snapshot");
+
+        let auth_session = snapshot
+            .shell
+            .auth_session
+            .as_ref()
+            .expect("migrated quick start auth session should be present");
+        assert!(matches!(auth_session.login_method, LoginMethod::QuickStart));
+        assert!(matches!(
+            auth_session.access.kind,
+            LoginAccessKind::LocalProfile
+        ));
+        assert!(auth_session
+            .access
+            .pubkey
+            .as_deref()
+            .is_some_and(|pubkey| pubkey.starts_with("npub1")));
+        assert!(snapshot
+            .shell
+            .auth_runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime.state, AuthRuntimeState::LocalProfile)));
+        assert!(snapshot
+            .shell
+            .auth_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.credential_persisted_in_native_store));
+
+        let stored_credential = auth_runtime_credential_store::load(app_handle)
+            .expect("failed to load migrated quick start credential")
+            .expect("missing migrated quick start credential");
+        assert!(matches!(
+            stored_credential.access_kind,
+            LoginAccessKind::LocalProfile
+        ));
+        assert_eq!(stored_credential.stored_at, "2026-04-23T10:00:00Z");
+        assert_eq!(
+            auth_session.access.pubkey.as_deref(),
+            Some(stored_credential.pubkey.as_str())
+        );
+    }
+
+    #[test]
     fn load_chat_shell_snapshot_marks_local_secret_runtime_failed_when_native_credential_is_missing(
     ) {
         let guard = test_app();
@@ -2919,10 +3245,9 @@ mod tests {
             .join()
             .expect("client pairing relay thread should join");
 
-        assert!(paired_bunker_uri.starts_with(&format!(
-            "bunker://{}",
-            bunker_signer_public_key_hex()
-        )));
+        assert!(
+            paired_bunker_uri.starts_with(&format!("bunker://{}", bunker_signer_public_key_hex()))
+        );
         assert!(paired_bunker_uri.contains(&format!("relay={relay_url}")));
 
         let stored_client = pending_auth_runtime_client_store::load(app_handle)

@@ -71,6 +71,49 @@ pnpm desktop:build
 - 若需要整理发布目录并生成校验和、清单和发布说明，可执行 `pnpm release:linux`。
 - 若需要一键完成版本同步、Linux 发版产物整理和 changelog 模板生成，可执行 `pnpm release:prepare 0.1.1`。
 
+## Android APK
+
+当前 `scripts/install-android-build-deps.sh` / `scripts/build-android-apk.sh` 主要支持 **Debian / Ubuntu**（依赖安装脚本会校验系统类型）。
+
+最小可执行流程（Debian/Ubuntu）：
+
+```bash
+# 1) 安装 Android + Rust + Node/pnpm 构建依赖
+pnpm android:deps
+
+# 2) 安装项目前端依赖
+pnpm install --frozen-lockfile
+
+# 3) 导出环境变量（按本机实际路径调整）
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+source "$HOME/.cargo/env"
+
+# 4) 构建默认 APK（默认 target: aarch64）
+pnpm android:apk
+```
+
+多 target / 产物示例：
+
+```bash
+# 同时构建多个 ABI
+pnpm android:apk -- --target aarch64 armv7 x86_64
+
+# 使用等号形式传 target（脚本支持 --target=...）
+pnpm android:apk -- --target=aarch64,x86_64 --split-per-abi
+
+# 构建 AAB
+pnpm android:apk -- --aab --target aarch64
+```
+
+说明:
+
+- `pnpm android:apk` 会自动检查 `pnpm`、`node`、`cargo`、`rustup`、`java`、`javac`、`sdkmanager`。
+- Android SDK 路径优先读取 `ANDROID_SDK_ROOT` / `ANDROID_HOME`，否则回退到 `$HOME/Android/Sdk`。
+- 首次构建若未初始化 Android 工程，脚本会自动执行 `pnpm tauri android init --ci --skip-targets-install`。
+- 当前仓库已补齐 APK 构建链路脚本，但 Android 端聊天 runtime 仍是桌面预览架构，真实聊天能力还不能视为 Android 已完成适配。
+
 ## 主要文件
 
 - `Project.md`: 项目定位、架构分层、里程碑和开发约束。

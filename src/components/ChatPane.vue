@@ -3,7 +3,6 @@ import { computed, ref, watch } from "vue";
 import Avatar from "primevue/avatar";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
-import Divider from "primevue/divider";
 import Menu from "primevue/menu";
 import ScrollPanel from "primevue/scrollpanel";
 import Textarea from "primevue/textarea";
@@ -47,9 +46,12 @@ const props = defineProps<{
   canSendMessages?: boolean;
   sendBlockedReason?: string;
   runtimeError?: string;
+  presentation?: "panel" | "page";
+  showBackButton?: boolean;
 }>();
 
 const emit = defineEmits<{
+  (event: "back"): void;
   (event: "load-older"): void;
   (event: "update:composerText", value: string): void;
   (event: "mention-navigate", direction: 1 | -1): void;
@@ -102,10 +104,6 @@ const subtitle = computed(() => {
   }
 
   return "Direct message · end-to-end relay";
-});
-
-const showCallActions = computed(() => {
-  return props.session?.kind === "direct";
 });
 
 const normalizedSendBlockedReason = computed(() => {
@@ -397,6 +395,10 @@ function handleAttachmentChange(event: Event) {
   input.value = "";
 }
 
+function chatPaneClasses() {
+  return ["chat-pane", props.presentation === "page" ? "page" : "panel"];
+}
+
 watch(
   () => props.session?.id,
   () => {
@@ -407,7 +409,7 @@ watch(
 </script>
 
 <template>
-  <section class="chat-pane">
+  <section :class="chatPaneClasses()">
     <template v-if="session">
       <Menu
         ref="messageActionMenu"
@@ -417,6 +419,17 @@ watch(
       />
 
       <header class="chat-header">
+        <Button
+          v-if="showBackButton"
+          icon="pi pi-arrow-left"
+          rounded
+          text
+          severity="secondary"
+          aria-label="Back"
+          class="chat-back-button"
+          @click="emit('back')"
+        />
+
         <button type="button" class="chat-title" @click="emit('open-profile')">
           <SelfChatIcon v-if="session.kind === 'self'" size="lg" />
           <Avatar
@@ -434,20 +447,6 @@ watch(
 
         <div class="chat-actions">
           <Button
-            v-if="showCallActions"
-            icon="pi pi-phone"
-            rounded
-            text
-            severity="secondary"
-          />
-          <Button
-            v-if="showCallActions"
-            icon="pi pi-video"
-            rounded
-            text
-            severity="secondary"
-          />
-          <Button
             icon="pi pi-info-circle"
             rounded
             text
@@ -457,19 +456,17 @@ watch(
         </div>
       </header>
 
-      <Divider />
-
       <ScrollPanel class="message-scroll">
         <div class="message-list">
           <div v-if="canLoadOlderMessages" class="message-history-action">
-            <Button
-              label="Load older"
-              size="small"
-              text
-              severity="secondary"
-              :loading="loadingOlderMessages"
+            <button
+              type="button"
+              class="history-link"
+              :disabled="loadingOlderMessages"
               @click="emit('load-older')"
-            />
+            >
+              {{ loadingOlderMessages ? "Loading earlier messages..." : "Earlier messages" }}
+            </button>
           </div>
 
           <template v-for="(message, messageIndex) in messages" :key="message.id">
@@ -591,24 +588,6 @@ watch(
                 <div class="message-meta">
                   <span class="message-time">{{ message.time }}</span>
                   <Button
-                    label="Reply"
-                    size="small"
-                    text
-                    severity="secondary"
-                    class="message-reply-action"
-                    @click="emit('reply-message', message.id)"
-                  />
-                  <Button
-                    v-if="showMessageInfo"
-                    icon="pi pi-info-circle"
-                    text
-                    rounded
-                    severity="secondary"
-                    aria-label="Open message detail"
-                    class="message-detail-action"
-                    @click="emit('open-message-detail', message.id)"
-                  />
-                  <Button
                     icon="pi pi-ellipsis-h"
                     text
                     rounded
@@ -652,13 +631,11 @@ watch(
             icon="pi pi-paperclip"
             rounded
             text
-            severity="secondary"
+            severity="contrast"
             aria-label="Attach file"
             :disabled="!canSendMessages"
             @click="triggerAttachmentPicker"
           />
-          <Button icon="pi pi-face-smile" rounded text severity="secondary" />
-          <Button icon="pi pi-microphone" rounded text severity="secondary" />
         </div>
 
         <div v-if="replyingToMessage" class="composer-reply">
@@ -786,14 +763,26 @@ watch(
 <style scoped>
 .chat-pane {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 0;
   min-height: 0;
-  padding: 20px 22px 18px;
-  border-radius: 28px;
-  background: var(--shell-surface);
-  border: 1px solid var(--shell-border);
-  box-shadow: var(--shell-shadow-soft);
+  padding: 10px 0 0;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.chat-pane.page {
+  min-height: 100vh;
+  padding:
+    max(12px, env(safe-area-inset-top))
+    16px
+    max(18px, env(safe-area-inset-bottom));
+  border: 0;
+  border-radius: 0;
+  background: color-mix(in srgb, var(--shell-surface-strong) 96%, white);
+  box-shadow: none;
 }
 
 .chat-header,
@@ -811,9 +800,9 @@ watch(
 
 .composer-state {
   flex: 1 1 100%;
-  padding: 10px 14px;
-  color: var(--shell-text-default);
-  font-size: 0.85rem;
+  padding: 0 4px;
+  color: var(--shell-text-muted);
+  font-size: 0.74rem;
   line-height: 1.45;
 }
 
@@ -893,25 +882,21 @@ watch(
 }
 
 .composer-state-blocked {
-  border-radius: 16px;
-  background: rgba(255, 194, 102, 0.14);
-  border: 1px solid rgba(219, 153, 43, 0.28);
+  color: #a26918;
 }
 
 .composer-state-warning {
-  border-radius: 16px;
-  background: rgba(201, 90, 72, 0.08);
-  border: 1px solid rgba(201, 90, 72, 0.22);
+  color: #b15e53;
 }
 
 .mention-suggestions {
   display: grid;
   width: 100%;
-  gap: 8px;
-  padding: 10px;
-  border-radius: 18px;
-  background: color-mix(in srgb, var(--shell-surface-soft) 92%, #d7ebff);
-  border: 1px solid var(--shell-border-soft);
+  gap: 4px;
+  padding: 6px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--shell-surface-soft) 82%, white);
+  border: 0;
 }
 
 .mention-suggestion {
@@ -920,16 +905,16 @@ watch(
   justify-content: space-between;
   gap: 12px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 9px 10px;
   border: 0;
-  border-radius: 14px;
+  border-radius: 10px;
   background: transparent;
   text-align: left;
   cursor: pointer;
 }
 
 .mention-suggestion.selected {
-  background: rgba(95, 142, 216, 0.14);
+  background: color-mix(in srgb, var(--shell-selected) 48%, transparent);
 }
 
 .mention-handle {
@@ -945,12 +930,18 @@ watch(
 .chat-header {
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  gap: 12px;
+  padding: 0 16px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--shell-border-soft) 82%, transparent);
+}
+
+.chat-back-button {
+  flex: 0 0 auto;
 }
 
 .chat-title {
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   min-width: 0;
   padding: 0;
   border: 0;
@@ -965,8 +956,9 @@ watch(
 }
 
 .chat-title p {
-  margin-top: 4px;
+  margin-top: 2px;
   color: var(--shell-text-muted);
+  font-size: 0.79rem;
 }
 
 .chat-actions {
@@ -981,14 +973,14 @@ watch(
 }
 
 .contact-avatar {
-  width: 48px;
-  height: 48px;
+  width: 40px;
+  height: 40px;
 }
 
 .bubble-avatar {
   width: 32px;
   height: 32px;
-  margin-bottom: 20px;
+  margin-bottom: 16px;
 }
 
 .bubble-avatar-spacer {
@@ -1001,28 +993,43 @@ watch(
 }
 
 .message-list {
-  padding-right: 10px;
+  padding: 10px 16px 0;
 }
 
 .message-history-action {
   justify-content: center;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
+}
+
+.history-link {
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--shell-text-soft);
+  font: inherit;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.history-link:disabled {
+  opacity: 0.56;
+  cursor: default;
 }
 
 .system-line {
-  margin: 12px auto 18px;
+  margin: 10px auto 16px;
   width: fit-content;
-  padding: 8px 12px;
+  padding: 6px 10px;
   border-radius: 999px;
-  background: var(--shell-surface-soft);
+  background: color-mix(in srgb, var(--shell-surface-soft) 72%, transparent);
   color: var(--shell-text-soft);
-  font-size: 0.82rem;
+  font-size: 0.76rem;
 }
 
 .message-row {
   align-items: flex-end;
   gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 10px;
 }
 
 .message-row.mine {
@@ -1031,8 +1038,8 @@ watch(
 
 .message-cluster {
   display: grid;
-  gap: 6px;
-  max-width: min(78%, 620px);
+  gap: 3px;
+  max-width: min(80%, 620px);
 }
 
 .message-row.mine .message-cluster {
@@ -1040,28 +1047,28 @@ watch(
 }
 
 .message-author {
-  padding: 0 4px;
+  padding: 0 2px;
   color: var(--shell-text-muted);
-  font-size: 0.78rem;
-  font-weight: 700;
+  font-size: 0.74rem;
+  font-weight: 600;
   letter-spacing: 0.01em;
 }
 
 .message-bubble {
-  border-radius: 22px;
-  padding: 14px 16px;
-  background: var(--shell-surface-soft);
-  box-shadow: inset 0 0 0 1px var(--shell-border-soft);
+  border-radius: 18px;
+  padding: 11px 13px;
+  background: color-mix(in srgb, var(--shell-surface-soft) 88%, white);
+  border: 0;
+  box-shadow: none;
 }
 
 .message-bubble.mine {
-  background: var(--shell-selected);
-  box-shadow: inset 0 0 0 1px var(--shell-selected-border);
+  background: color-mix(in srgb, var(--shell-selected) 76%, white);
 }
 
 .message-bubble p {
   margin: 0;
-  line-height: 1.65;
+  line-height: 1.58;
 }
 
 .message-text {
@@ -1079,10 +1086,10 @@ watch(
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  padding: 10px 12px;
-  border-radius: 16px;
-  background: rgba(84, 119, 168, 0.08);
-  border: 1px solid rgba(84, 119, 168, 0.14);
+  padding: 9px 11px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--shell-surface-soft) 78%, white);
+  border: 0;
 }
 
 .reply-preview {
@@ -1093,10 +1100,9 @@ watch(
 
 .reply-author {
   color: var(--shell-text-soft);
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
 }
 
 .reply-preview p,
@@ -1108,30 +1114,31 @@ watch(
 
 .message-time {
   color: var(--shell-text-soft);
-  font-size: 0.82rem;
+  font-size: 0.74rem;
 }
 
 .message-meta {
   align-items: center;
-  gap: 8px;
-}
-
-.message-reply-action {
-  padding: 0;
-}
-
-.message-detail-action {
-  width: 1.8rem;
-  height: 1.8rem;
+  gap: 5px;
+  min-height: 1.5rem;
 }
 
 .message-action-menu-trigger {
-  width: 1.8rem;
-  height: 1.8rem;
+  width: 1.6rem;
+  height: 1.6rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+.message-row:hover .message-action-menu-trigger,
+.message-row:focus-within .message-action-menu-trigger {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .message-status {
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   font-weight: 600;
 }
 
@@ -1149,6 +1156,7 @@ watch(
 
 .message-retry {
   padding: 0;
+  font-size: 0.74rem;
 }
 
 .file-card,
@@ -1156,7 +1164,7 @@ watch(
 .video-card,
 .audio-card {
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .file-card i,
@@ -1168,14 +1176,14 @@ watch(
 .file-card span {
   display: block;
   color: var(--shell-text-muted);
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   margin-top: 4px;
 }
 
 .image-card,
 .video-card {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .image-preview,
@@ -1184,8 +1192,8 @@ watch(
   width: min(100%, 280px);
   max-height: 240px;
   object-fit: cover;
-  border-radius: 16px;
-  border: 1px solid var(--shell-border-soft);
+  border-radius: 14px;
+  border: 0;
   background: color-mix(in srgb, var(--shell-surface-soft) 86%, #d7ebff);
 }
 
@@ -1196,7 +1204,7 @@ watch(
 
 .media-copy span {
   color: var(--shell-text-muted);
-  font-size: 0.82rem;
+  font-size: 0.78rem;
 }
 
 .audio-wave {
@@ -1223,8 +1231,12 @@ watch(
 
 .composer {
   align-items: flex-end;
-  gap: 12px;
-  padding-top: 18px;
+  gap: 10px;
+  margin: 12px 16px 0;
+  padding: 10px 12px 12px;
+  border-top: 0;
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--shell-surface-soft) 84%, white);
   flex-wrap: wrap;
 }
 
@@ -1246,11 +1258,12 @@ watch(
 }
 
 .composer-input :deep(.p-textarea) {
-  min-height: 52px;
-  border-radius: 18px;
-  background: var(--shell-surface-muted);
+  min-height: 44px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.9);
   color: var(--shell-text-default);
-  border-color: var(--shell-border);
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .chat-empty {

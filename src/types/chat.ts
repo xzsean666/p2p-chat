@@ -6,7 +6,7 @@ export type MessageDeliveryStatus = "sending" | "sent" | "failed";
 export type MessageSyncSource = "local" | "relay" | "system";
 export type CircleType = "default" | "paid" | "bitchat" | "custom";
 export type CircleStatus = "open" | "connecting" | "closed";
-export type SessionAction = "pin" | "mute" | "archive" | "delete" | "unarchive";
+export type SessionAction = "pin" | "mute" | "archive" | "delete" | "unarchive" | "clearUnread";
 export type CircleCreateMode = "invite" | "private" | "custom";
 export type LoginMethod = "quickStart" | "existingAccount" | "signer";
 export type LoginCircleSelectionMode = "existing" | "invite" | "custom" | "restore";
@@ -122,6 +122,15 @@ export interface AuthRuntimeClientUriSummary {
   relayCount: number;
   relays: string[];
   clientName: string;
+  storedAt: string;
+}
+
+export interface LocalAccountSecretSummary {
+  loginMethod: LoginMethod;
+  accessKind: LoginAccessKind;
+  pubkey: string;
+  nsec: string;
+  hexKey: string;
   storedAt: string;
 }
 

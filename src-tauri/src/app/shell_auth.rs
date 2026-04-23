@@ -1,8 +1,9 @@
 use crate::app::auth_access;
 use crate::domain::chat::{
-    AuthRuntimeBindingSummary, AuthRuntimeClientUriSummary, AuthRuntimeState, AuthRuntimeSummary, AuthSessionSummary,
-    ChatDomainSeed, LoginAccessInput, LoginAccessKind, LoginMethod, PersistedShellState,
-    ShellStateSnapshot, SignedNostrEvent, UpdateAuthRuntimeInput,
+    AuthRuntimeBindingSummary, AuthRuntimeClientUriSummary, AuthRuntimeState, AuthRuntimeSummary,
+    AuthSessionSummary, ChatDomainSeed, LocalAccountSecretSummary, LoginAccessInput,
+    LoginAccessKind, LoginMethod, PersistedShellState, ShellStateSnapshot, SignedNostrEvent,
+    UpdateAuthRuntimeInput,
 };
 use crate::infra::auth_runtime_binding_store::{self, StoredAuthRuntimeBinding};
 use crate::infra::auth_runtime_client_store::{self, StoredAuthRuntimeClient};
@@ -144,7 +145,9 @@ pub fn await_pending_standard_nostrconnect_client_pairing<R: tauri::Runtime>(
 ) -> Result<String, String> {
     let stored_client = load_or_create_pending_auth_runtime_client(app_handle)?;
 
-    if let Some(existing_bunker_uri) = normalized_non_empty(stored_client.paired_bunker_uri.as_deref()) {
+    if let Some(existing_bunker_uri) =
+        normalized_non_empty(stored_client.paired_bunker_uri.as_deref())
+    {
         let existing_uri = NostrConnectURI::parse(existing_bunker_uri)
             .map_err(|error| format!("Stored paired bunker URI is invalid: {error}"))?;
         if existing_uri.is_bunker() {
@@ -179,10 +182,9 @@ pub fn await_pending_standard_nostrconnect_client_pairing<R: tauri::Runtime>(
             .map_err(|error| format!("Remote signer pairing failed: {error}"));
 
         let bunker_uri = if user_pubkey.is_ok() {
-            connect
-                .bunker_uri()
-                .await
-                .map_err(|error| format!("failed to derive bunker URI after signer pairing: {error}"))
+            connect.bunker_uri().await.map_err(|error| {
+                format!("failed to derive bunker URI after signer pairing: {error}")
+            })
         } else {
             Err("Remote signer pairing did not complete.".into())
         };
@@ -519,6 +521,36 @@ pub fn clear_auth_runtime_credential<R: tauri::Runtime>(
     auth_runtime_credential_store::clear(app_handle)
 }
 
+pub fn load_auth_runtime_credential_for_session<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+) -> Result<Option<StoredAuthRuntimeCredential>, String> {
+    Ok(
+        auth_runtime_credential_store::load(app_handle)?.filter(|credential| {
+            stored_auth_runtime_credential_matches_session(credential, auth_session)
+        }),
+    )
+}
+
+pub fn load_local_account_secret_summary<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &AuthSessionSummary,
+) -> Result<Option<LocalAccountSecretSummary>, String> {
+    let Some(credential) = load_auth_runtime_credential_for_session(app_handle, auth_session)?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(LocalAccountSecretSummary {
+        login_method: credential.login_method,
+        access_kind: credential.access_kind,
+        pubkey: credential.pubkey.clone(),
+        nsec: auth_access::encode_nsec_secret_key(&credential.secret_key_hex)?,
+        hex_key: credential.secret_key_hex,
+        stored_at: credential.stored_at,
+    }))
+}
+
 pub fn persist_auth_runtime_binding<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
     auth_session: &AuthSessionSummary,
@@ -608,6 +640,10 @@ fn hydrate_shell_snapshot_from_native_stores<R: tauri::Runtime>(
         return Ok(shell);
     }
 
+    if let Some(auth_session) = shell.auth_session.as_mut() {
+        ensure_quick_start_local_credential(app_handle, auth_session)?;
+    }
+
     let Some(auth_session) = shell.auth_session.as_ref() else {
         shell.auth_runtime = None;
         shell.auth_runtime_binding = None;
@@ -626,6 +662,47 @@ fn hydrate_shell_snapshot_from_native_stores<R: tauri::Runtime>(
     )?;
 
     Ok(shell)
+}
+
+fn ensure_quick_start_local_credential<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    auth_session: &mut AuthSessionSummary,
+) -> Result<(), String> {
+    if !matches!(auth_session.login_method, LoginMethod::QuickStart)
+        || !matches!(auth_session.access.kind, LoginAccessKind::LocalProfile)
+    {
+        return Ok(());
+    }
+
+    if let Some(credential) = load_auth_runtime_credential_for_session(app_handle, auth_session)? {
+        if auth_session.access.pubkey.as_deref() != Some(credential.pubkey.as_str()) {
+            auth_session.access.pubkey = Some(credential.pubkey);
+        }
+        return Ok(());
+    }
+
+    let generated_secret_key_hex = auth_access::generate_secret_key_hex();
+    let credential = auth_access::resolve_auth_runtime_credential(&LoginAccessInput {
+        kind: LoginAccessKind::LocalProfile,
+        value: Some(generated_secret_key_hex),
+    })?
+    .ok_or_else(|| {
+        "quick start local profile credential generation did not produce a secret".to_string()
+    })?;
+
+    auth_runtime_credential_store::save(
+        app_handle,
+        &StoredAuthRuntimeCredential {
+            login_method: auth_session.login_method.clone(),
+            access_kind: auth_session.access.kind.clone(),
+            secret_key_hex: credential.secret_key_hex,
+            pubkey: credential.pubkey.clone(),
+            stored_at: auth_session.logged_in_at.clone(),
+        },
+    )?;
+    auth_session.access.pubkey = Some(credential.pubkey);
+
+    Ok(())
 }
 
 fn sync_pending_remote_auth_runtime<R: tauri::Runtime>(
@@ -964,7 +1041,10 @@ fn auth_runtime_binding_persisted_in_native_store<R: tauri::Runtime>(
 }
 
 fn requires_local_auth_runtime_credential(access_kind: &LoginAccessKind) -> bool {
-    matches!(access_kind, LoginAccessKind::Nsec | LoginAccessKind::HexKey)
+    matches!(
+        access_kind,
+        LoginAccessKind::LocalProfile | LoginAccessKind::Nsec | LoginAccessKind::HexKey
+    )
 }
 
 fn missing_local_auth_runtime_credential_error() -> String {
@@ -1273,13 +1353,15 @@ fn build_remote_auth_runtime_authorization_header<R: tauri::Runtime>(
             builder,
             auth_label,
         ),
-        LoginAccessKind::NostrConnect => build_remote_nostrconnect_auth_runtime_authorization_header(
-            app_handle,
-            auth_session,
-            binding,
-            builder,
-            auth_label,
-        ),
+        LoginAccessKind::NostrConnect => {
+            build_remote_nostrconnect_auth_runtime_authorization_header(
+                app_handle,
+                auth_session,
+                binding,
+                builder,
+                auth_label,
+            )
+        }
         _ => Err("Stored remote signer binding is not supported.".into()),
     };
 
@@ -1500,7 +1582,11 @@ fn load_or_create_pending_auth_runtime_client<R: tauri::Runtime>(
 ) -> Result<StoredPendingAuthRuntimeClient, String> {
     if let Some(stored_client) = pending_auth_runtime_client_store::load(app_handle)? {
         if pending_auth_runtime_client_keys(&stored_client).is_ok()
-            && parse_nostrconnect_client_relays(&stored_client.relays, "pending remote signer client").is_ok()
+            && parse_nostrconnect_client_relays(
+                &stored_client.relays,
+                "pending remote signer client",
+            )
+            .is_ok()
             && normalized_non_empty(Some(stored_client.client_name.as_str())).is_some()
         {
             return Ok(stored_client);
@@ -1583,7 +1669,9 @@ fn claim_pending_auth_runtime_client<R: tauri::Runtime>(
     let Some(stored_client) = pending_auth_runtime_client_store::load(app_handle)? else {
         return Ok(false);
     };
-    let Some(expected_bunker_uri) = normalized_non_empty(stored_client.paired_bunker_uri.as_deref()) else {
+    let Some(expected_bunker_uri) =
+        normalized_non_empty(stored_client.paired_bunker_uri.as_deref())
+    else {
         return Ok(false);
     };
     let Some(provided_bunker_uri) = normalized_non_empty(access.value.as_deref()) else {
@@ -1626,8 +1714,10 @@ fn legacy_nostrconnect_binding_as_bunker_uri(
     let remote_signer_public_key = source
         .host_str()
         .ok_or_else(|| "Stored nostrConnect URI is missing a remote signer pubkey.".to_string())?;
-    let mut bunker_url = Url::parse(&format!("bunker://{remote_signer_public_key}"))
-        .map_err(|error| format!("failed to derive bunker URI from nostrConnect binding: {error}"))?;
+    let mut bunker_url =
+        Url::parse(&format!("bunker://{remote_signer_public_key}")).map_err(|error| {
+            format!("failed to derive bunker URI from nostrConnect binding: {error}")
+        })?;
     let mut relay_count = 0usize;
     let mut secret = None::<String>;
 
@@ -1650,8 +1740,8 @@ fn legacy_nostrconnect_binding_as_bunker_uri(
         return Err("Stored nostrConnect URI is missing relay parameters.".into());
     }
 
-    let secret =
-        secret.ok_or_else(|| "Stored nostrConnect URI is missing the shared secret.".to_string())?;
+    let secret = secret
+        .ok_or_else(|| "Stored nostrConnect URI is missing the shared secret.".to_string())?;
     bunker_url.query_pairs_mut().append_pair("secret", &secret);
 
     NostrConnectURI::parse(bunker_url.as_str()).map_err(|error| {

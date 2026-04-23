@@ -7,13 +7,8 @@ import onboardingWelcomeImage from "../../tmp/xchat-app-main/packages/business_m
 import onboardingNostrImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-nostr.png";
 import onboardingCircleImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-circle.png";
 import onboardingRelaysImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-relays.png";
-import {
-  awaitPendingAuthRuntimeClientPairing,
-  bootstrapAuthSession,
-  loadPendingAuthRuntimeClientUri,
-} from "../services/chatShell";
+import { bootstrapAuthSession } from "../services/chatShell";
 import type {
-  AuthRuntimeClientUriSummary,
   CircleItem,
   LoginAccessInput,
   LoginCircleSelectionMode,
@@ -72,8 +67,7 @@ const slides = [
 
 const NOSTR_BECH32_DATA_CHARS = "[023456789acdefghjklmnpqrstuvwxyz]+";
 const NSEC_PATTERN = new RegExp(`^nsec1${NOSTR_BECH32_DATA_CHARS}$`, "i");
-const HEX_KEY_PATTERN = /^[a-f0-9]{64}$/i;
-const HEX_PUBKEY_PATTERN = /^[a-f0-9]{64}$/i;
+const HEX_KEY_PATTERN = /^(?:0x)?[a-f0-9]{64}$/i;
 const PUBLIC_RELAY_SHORTCUTS = {
   "0xchat": "wss://relay.0xchat.com",
   damus: "wss://relay.damus.io",
@@ -133,16 +127,11 @@ const customRelay = ref("");
 const activeCircleSheet = ref<CircleSheetMode | null>(null);
 const activeCirclePage = ref<CirclePageKind | null>(null);
 const activeInfoSheet = ref<InfoSheetKind | null>(null);
-const showSignerPairingPage = ref(false);
 const avatarInput = ref<HTMLInputElement | null>(null);
 const avatarPreviewUrl = ref("");
 const privateCircleName = ref("My Private Circle");
 const selectedPrivatePlanId = ref<PrivatePlanId>("family");
 const selectedPrivateBilling = ref<PrivateBillingPeriod>("yearly");
-const pendingSignerClientUri = ref<AuthRuntimeClientUriSummary | null>(null);
-const pendingSignerClientUriLoading = ref(false);
-const pendingSignerPairingWaiting = ref(false);
-const pendingSignerPairingError = ref("");
 const loginPreparationBusy = ref(false);
 const loginPreparationError = ref("");
 
@@ -151,7 +140,6 @@ const firstName = ref(seededName.first);
 const lastName = ref(seededName.last);
 
 let timer: number | undefined;
-let pendingSignerClientUriRequestSerial = 0;
 
 const selectedRestorableCircles = computed(() => {
   return props.restorableCircles.filter((circle) =>
@@ -479,15 +467,6 @@ function relayLooksValid(value: string) {
   }
 }
 
-function relayQueryLooksValid(value: string) {
-  try {
-    const relay = new URL(value);
-    return (relay.protocol === "ws:" || relay.protocol === "wss:") && !!relay.hostname;
-  } catch {
-    return false;
-  }
-}
-
 function splitName(value: string) {
   const tokens = value.trim().split(/\s+/).filter(Boolean);
   return {
@@ -557,14 +536,9 @@ function resetLoginFlow() {
   activeCircleSheet.value = null;
   activeCirclePage.value = null;
   activeInfoSheet.value = null;
-  showSignerPairingPage.value = false;
   privateCircleName.value = "My Private Circle";
   selectedPrivatePlanId.value = "family";
   selectedPrivateBilling.value = "yearly";
-  pendingSignerClientUri.value = null;
-  pendingSignerClientUriLoading.value = false;
-  pendingSignerPairingWaiting.value = false;
-  pendingSignerPairingError.value = "";
   firstName.value = nextName.first;
   lastName.value = nextName.last;
 }
@@ -580,37 +554,7 @@ function deriveAccountKeyAccessKind(value: string): LoginAccessInput["kind"] | n
     return NSEC_PATTERN.test(trimmed) ? "nsec" : null;
   }
 
-  if (lowered.startsWith("bunker://")) {
-    return remoteSignerUriLooksValid(trimmed, "bunker", false) ? "bunker" : null;
-  }
-
   return HEX_KEY_PATTERN.test(trimmed) ? "hexKey" : null;
-}
-
-function remoteSignerUriLooksValid(value: string, scheme: "bunker" | "nostrconnect", requireSecret: boolean) {
-  try {
-    const uri = new URL(value);
-    if (uri.protocol.toLowerCase() !== `${scheme}:`) {
-      return false;
-    }
-
-    if (!HEX_PUBKEY_PATTERN.test(uri.hostname)) {
-      return false;
-    }
-
-    const relays = uri.searchParams.getAll("relay").filter(relayQueryLooksValid);
-    if (!relays.length) {
-      return false;
-    }
-
-    if (requireSecret && !uri.searchParams.get("secret")?.trim()) {
-      return false;
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function openQuickStart() {
@@ -620,7 +564,6 @@ function openQuickStart() {
   activeCircleSheet.value = null;
   activeCirclePage.value = null;
   activeInfoSheet.value = null;
-  showSignerPairingPage.value = false;
 }
 
 function openExistingAccount() {
@@ -630,15 +573,9 @@ function openExistingAccount() {
   activeCircleSheet.value = null;
   activeCirclePage.value = null;
   activeInfoSheet.value = null;
-  showSignerPairingPage.value = false;
 }
 
 function goBack() {
-  if (showSignerPairingPage.value) {
-    closeSignerPairingPage();
-    return;
-  }
-
   if (activeInfoSheet.value) {
     activeInfoSheet.value = null;
     return;
@@ -751,13 +688,12 @@ function buildCustomCircleName() {
     return trimmed;
   }
 
-  const relayLabel = customRelay.value
-    .trim()
-    .replace(/^wss?:\/\//i, "")
-    .split(/[/?#]/)[0]
-    ?.trim();
+  const normalizedRelay = normalizeRelayLikeValue(customRelay.value);
+  if (normalizedRelay) {
+    return normalizedRelay;
+  }
 
-  return relayLabel || "Custom Relay";
+  return "Custom Relay";
 }
 
 function buildSubmittedUserProfile() {
@@ -844,7 +780,7 @@ function selectCircleMode(mode: CircleSelectionMode) {
 
 function openCircleSheet(mode: CircleSheetMode) {
   if (mode === "custom" && !customRelay.value.trim()) {
-    customRelay.value = "damus";
+    customRelay.value = normalizeRelayLikeValue("damus");
   }
 
   circleMode.value = mode;
@@ -953,110 +889,6 @@ function closeInfoSheet() {
   activeInfoSheet.value = null;
 }
 
-async function loadSignerPairingClientUri(force = false) {
-  if (pendingSignerClientUriLoading.value) {
-    return;
-  }
-  if (pendingSignerClientUri.value && !force) {
-    pendingSignerPairingError.value = "";
-    return;
-  }
-
-  pendingSignerClientUriRequestSerial += 1;
-  const requestSerial = pendingSignerClientUriRequestSerial;
-  pendingSignerClientUriLoading.value = true;
-  pendingSignerPairingError.value = "";
-
-  try {
-    const summary = await loadPendingAuthRuntimeClientUri();
-    if (requestSerial !== pendingSignerClientUriRequestSerial) {
-      return;
-    }
-
-    pendingSignerClientUri.value = summary;
-    if (!summary) {
-      pendingSignerPairingError.value =
-        "Desktop signer pairing is unavailable in browser preview.";
-    }
-  } catch (error) {
-    if (requestSerial !== pendingSignerClientUriRequestSerial) {
-      return;
-    }
-
-    pendingSignerClientUri.value = null;
-    pendingSignerPairingError.value = describePairingError(
-      error,
-      "Desktop signer pairing could not generate a client URI.",
-    );
-  } finally {
-    if (requestSerial === pendingSignerClientUriRequestSerial) {
-      pendingSignerClientUriLoading.value = false;
-    }
-  }
-}
-
-function openSignerPairingPage() {
-  showSignerPairingPage.value = true;
-  void loadSignerPairingClientUri();
-}
-
-function closeSignerPairingPage() {
-  showSignerPairingPage.value = false;
-  pendingSignerPairingWaiting.value = false;
-  pendingSignerPairingError.value = "";
-}
-
-async function copySignerPairingUri() {
-  if (!pendingSignerClientUri.value?.uri) {
-    return;
-  }
-
-  try {
-    await navigator.clipboard.writeText(pendingSignerClientUri.value.uri);
-    pendingSignerPairingError.value = "";
-  } catch (error) {
-    pendingSignerPairingError.value = describePairingError(
-      error,
-      "Clipboard is unavailable for signer pairing on this device.",
-    );
-  }
-}
-
-async function confirmSignerPairingApproval() {
-  if (pendingSignerPairingWaiting.value) {
-    return;
-  }
-
-  if (!pendingSignerClientUri.value) {
-    await loadSignerPairingClientUri();
-    if (!pendingSignerClientUri.value) {
-      return;
-    }
-  }
-
-  pendingSignerPairingWaiting.value = true;
-  pendingSignerPairingError.value = "";
-
-  try {
-    const pairedBunkerUri = await awaitPendingAuthRuntimeClientPairing();
-    if (!pairedBunkerUri) {
-      pendingSignerPairingError.value =
-        "Desktop signer pairing is unavailable in browser preview.";
-      return;
-    }
-
-    accountKey.value = pairedBunkerUri;
-    closeSignerPairingPage();
-  } catch (error) {
-    pendingSignerPairingError.value = describePairingError(
-      error,
-      "Desktop signer pairing did not complete.",
-    );
-  } finally {
-    pendingSignerPairingWaiting.value = false;
-  }
-}
-
 function describePairingError(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim()) {
     return error.message.trim();
@@ -1111,7 +943,7 @@ function handleAvatarSelected(event: Event) {
 }
 
 function applyRelaySuggestion(value: string) {
-  customRelay.value = value;
+  customRelay.value = normalizeRelayLikeValue(value);
 }
 
 function handleCircleConnect() {
@@ -1199,7 +1031,7 @@ function submit() {
               : {
                   mode: "custom",
                   name: buildCustomCircleName(),
-                  relay: customRelay.value.trim(),
+                  relay: normalizeRelayLikeValue(customRelay.value),
                 },
   };
 
@@ -1263,7 +1095,7 @@ function submit() {
       <div class="mobile-body">
         <template v-if="currentStep === 1">
           <section class="page-section auth-section">
-            <h2 class="page-title page-title-left">Use your Nostr key or bunker URI to log in:</h2>
+            <h2 class="page-title page-title-left">Use your Nostr private key to log in:</h2>
 
             <Textarea
               id="account-key"
@@ -1271,11 +1103,11 @@ function submit() {
               rows="4"
               auto-resize
               class="wide-input"
-              placeholder="Enter nsec, hex key, or bunker:// URI"
+              placeholder="Enter nsec or 64-character hex private key (0x optional)"
             />
 
             <p class="section-footnote">
-              Enter your Nostr private key, hex key, or bunker URI.
+              Enter your Nostr private key in `nsec` or 64-character hex format. `0x` is optional for hex keys.
               <button type="button" class="inline-link-button" @click="openInfoSheet('nostr')">Learn more</button>
             </p>
 
@@ -1290,7 +1122,8 @@ function submit() {
             <div class="page-copy centered-copy">
               <h2 class="page-title">Create Your Profile</h2>
               <p class="page-subtitle">
-                Enter your name to get started. Your nostr account is being created automatically.
+                Enter your name to get started. Your Nostr account is created automatically and its private key can be
+                exported later from Settings.
               </p>
             </div>
 
@@ -1432,9 +1265,9 @@ function submit() {
 
               <p class="section-footnote sheet-footnote">
                 You can enter a full URL (e.g., <code>wss://relay.example.com</code>) or use a shortcut like
-                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('0xchat')">0xchat</button>
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('0xchat')">{{ PUBLIC_RELAY_SHORTCUTS["0xchat"] }}</button>
                 or
-                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('damus')">damus</button>.
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('damus')">{{ PUBLIC_RELAY_SHORTCUTS.damus }}</button>.
               </p>
             </template>
           </div>
@@ -1864,74 +1697,6 @@ function submit() {
     </Transition>
 
     <Transition name="sheet-fade">
-      <div v-if="showSignerPairingPage" class="info-page-layer">
-        <div class="info-page-shell pairing-page-shell" role="dialog" aria-modal="true">
-          <header class="info-page-header">
-            <button type="button" class="topbar-back" aria-label="Go back" @click="closeSignerPairingPage">
-              <span class="topbar-chevron">‹</span>
-            </button>
-            <h2 class="info-page-title">Pair with Signer</h2>
-            <span class="topbar-side" aria-hidden="true"></span>
-          </header>
-
-          <div class="info-page-body pairing-page-body">
-            <section class="info-page-section info-page-hero">
-              <p class="info-page-subtitle">Connect a desktop client to your signer app</p>
-              <span class="info-page-accent"></span>
-              <p class="info-page-description">
-                Copy the client URI below into your signer app, approve the connection, then return here.
-              </p>
-            </section>
-
-            <section class="info-page-section">
-              <h3 class="info-page-section-title">Client URI</h3>
-              <p v-if="pendingSignerClientUriLoading" class="section-footnote">Generating desktop client URI...</p>
-              <template v-else-if="pendingSignerClientUri">
-                <Textarea
-                  :model-value="pendingSignerClientUri.uri"
-                  rows="6"
-                  auto-resize
-                  readonly
-                  class="wide-input pairing-uri-input"
-                />
-                <p class="section-footnote">
-                  {{ pendingSignerClientUri.clientName }} · {{ pendingSignerClientUri.relayCount }} relays
-                </p>
-                <p v-if="pendingSignerClientUri.relays.length" class="section-footnote pairing-relay-list">
-                  {{ pendingSignerClientUri.relays.join(", ") }}
-                </p>
-              </template>
-
-              <p v-if="pendingSignerPairingWaiting" class="inline-hint tone-info">Waiting for signer approval...</p>
-              <p v-else-if="pendingSignerPairingError" class="inline-hint tone-error">
-                {{ pendingSignerPairingError }}
-              </p>
-            </section>
-          </div>
-
-          <footer class="pairing-page-footer">
-            <button
-              type="button"
-              class="pairing-button pairing-button-secondary"
-              :disabled="!pendingSignerClientUri?.uri || pendingSignerClientUriLoading || pendingSignerPairingWaiting"
-              @click="copySignerPairingUri"
-            >
-              Copy URI
-            </button>
-            <button
-              type="button"
-              class="pairing-button pairing-button-primary"
-              :disabled="pendingSignerClientUriLoading || pendingSignerPairingWaiting"
-              @click="confirmSignerPairingApproval"
-            >
-              {{ pendingSignerPairingWaiting ? "Waiting..." : "I approved in signer app" }}
-            </button>
-          </footer>
-        </div>
-      </div>
-    </Transition>
-
-    <Transition name="sheet-fade">
       <div v-if="activeInfoSheet" class="info-page-layer">
         <div class="info-page-shell" role="dialog" aria-modal="true">
           <header class="info-page-header">
@@ -1980,43 +1745,19 @@ function submit() {
               </section>
 
               <section class="info-page-section">
-                <h3 class="info-page-section-title">Remote Signer</h3>
-                <article class="info-content-card">
-                  <span class="info-content-icon"><i class="pi pi-cloud" /></span>
-                  <p>
-                    A remote signer is a service that holds your private key securely and signs messages on your
-                    behalf. This allows you to use Nostr without storing sensitive keys on your device.
-                  </p>
-                </article>
-                <article class="info-content-card">
-                  <span class="info-content-icon"><i class="pi pi-shield" /></span>
-                  <p>
-                    The Bunker protocol (NIP-46) enables secure communication between your device and remote signers,
-                    ensuring your private key never leaves the secure environment.
-                  </p>
-                </article>
-                <p class="section-footnote">
-                  Need a bunker URI for desktop login?
-                  <button type="button" class="inline-link-button info-section-link" @click="openSignerPairingPage">
-                    Pair with signer app
-                  </button>
-                </p>
-              </section>
-
-              <section class="info-page-section">
                 <h3 class="info-page-section-title">How to Use</h3>
                 <div class="info-step-card">
                   <div class="info-step-row">
                     <span class="info-content-icon"><i class="pi pi-key" /></span>
-                    <p>1. Enter your nsec private key for direct login</p>
+                    <p>1. Enter your `nsec` private key or 64-character hex private key (`0x` optional)</p>
                   </div>
                   <div class="info-step-row">
-                    <span class="info-content-icon"><i class="pi pi-cloud" /></span>
-                    <p>2. Or use a bunker:// URI for remote signer login</p>
+                    <span class="info-content-icon"><i class="pi pi-server" /></span>
+                    <p>2. Choose a relay or add a custom relay</p>
                   </div>
                   <div class="info-step-row">
                     <span class="info-content-icon"><i class="pi pi-sign-in" /></span>
-                    <p>3. The app will securely connect and authenticate you</p>
+                    <p>3. Connect and continue into chat</p>
                   </div>
                 </div>
               </section>

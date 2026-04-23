@@ -36,79 +36,83 @@ const displayedMembers = computed(() => {
 const hasMoreMembers = computed(() => props.memberContacts.length > 5);
 
 function memberRole(contactId: string) {
-  return props.group?.members.find((member) => member.contactId === contactId)?.role === "admin"
-    ? "Admin"
-    : "Member";
+  return props.group?.members.find((member) => member.contactId === contactId)?.role === "admin" ? "Admin" : "Member";
 }
 </script>
 
 <template>
-  <OverlayPageShell
-    title="Group Info"
-    subtitle="Members, mute state and group controls."
-    @close="emit('close')"
-  >
-    <div v-if="session && group" class="group-body">
-      <section class="hero-card">
-        <Avatar :label="session.initials" shape="circle" class="hero-avatar" />
+  <OverlayPageShell title="Group Info" subtitle="Members" @close="emit('close')">
+    <div v-if="session && group" class="group-page">
+      <section class="group-header">
+        <Avatar :label="session.initials" shape="circle" class="group-avatar" />
         <h2>{{ group.name }}</h2>
-        <p>{{ group.description }}</p>
-        <Tag :value="`${memberContacts.length} Members`" severity="secondary" rounded />
+        <p>{{ group.description || "No group description available." }}</p>
+        <div class="group-tags">
+          <Tag :value="`${memberContacts.length} Members`" severity="secondary" rounded />
+          <Tag :value="group.muted ? 'Muted' : 'Active'" :severity="group.muted ? 'secondary' : 'success'" rounded />
+        </div>
       </section>
 
-      <section class="section-card">
+      <section class="info-section">
         <div class="section-head">
-          <div class="section-title">Group Name</div>
+          <div class="section-title">Group</div>
           <Button
-            v-if="session"
-            label="Edit"
+            label="Edit Name"
             text
             severity="contrast"
             @click="emit('edit-name', session.id)"
           />
         </div>
-        <div class="info-row">
-          <strong>{{ group.name }}</strong>
-          <span>{{ group.muted ? "Muted" : "Active" }}</span>
+        <div class="section-list">
+          <div class="info-row">
+            <strong>Group Name</strong>
+            <span>{{ group.name }}</span>
+          </div>
+          <div class="info-row">
+            <strong>Status</strong>
+            <span>{{ group.muted ? "Muted" : "Active" }}</span>
+          </div>
         </div>
       </section>
 
-      <section class="section-card">
+      <section class="info-section">
         <div class="section-head">
           <div class="section-title">Members</div>
-          <div class="section-actions">
-            <Button
-              v-if="session"
-              label="See All"
-              text
-              severity="contrast"
-              @click="emit('open-members', session.id)"
-            />
-            <Button
-              v-if="session"
-              label="Add"
-              text
-              severity="contrast"
-              @click="emit('add-members', session.id)"
-            />
-            <Button
-              v-if="session && memberContacts.length > 1"
-              label="Remove"
-              text
-              severity="contrast"
-              @click="emit('remove-members', session.id)"
-            />
-            <Button
-              v-if="hasMoreMembers"
-              :label="showAllMembers ? 'Show Less' : 'Preview More'"
-              text
-              severity="contrast"
-              @click="showAllMembers = !showAllMembers"
-            />
-          </div>
+          <Button
+            label="See All"
+            text
+            severity="contrast"
+            @click="emit('open-members', session.id)"
+          />
         </div>
 
-        <div class="member-list">
+        <div class="section-list action-list">
+          <Button
+            label="Add Members"
+            text
+            severity="contrast"
+            class="action-button"
+            @click="emit('add-members', session.id)"
+          />
+          <Button
+            v-if="memberContacts.length > 1"
+            label="Remove Members"
+            text
+            severity="contrast"
+            class="action-button"
+            @click="emit('remove-members', session.id)"
+          />
+          <Button
+            v-if="hasMoreMembers"
+            :label="showAllMembers ? 'Show Less' : 'Preview More'"
+            text
+            severity="secondary"
+            class="action-button"
+            @click="showAllMembers = !showAllMembers"
+          />
+        </div>
+
+        <div class="section-list member-list">
           <button
             v-for="member in displayedMembers"
             :key="member.id"
@@ -125,104 +129,108 @@ function memberRole(contactId: string) {
           </button>
         </div>
       </section>
+
+      <section class="info-section">
+        <div class="section-title">Actions</div>
+        <div class="section-list action-list">
+          <Button
+            :icon="group.muted ? 'pi pi-volume-up' : 'pi pi-volume-off'"
+            :label="group.muted ? 'Unmute Group' : 'Mute Group'"
+            text
+            severity="contrast"
+            class="action-button"
+            @click="emit('toggle-mute', session.id)"
+          />
+          <Button
+            icon="pi pi-sign-out"
+            label="Leave Group"
+            severity="danger"
+            text
+            class="action-button"
+            @click="emit('leave-group', session.id)"
+          />
+        </div>
+      </section>
     </div>
 
     <div v-else class="missing-state">
       <i class="pi pi-users"></i>
       <p>This group is no longer available.</p>
     </div>
-
-    <template v-if="session && group" #footer>
-      <div class="group-actions">
-        <Button
-          :icon="group.muted ? 'pi pi-volume-up' : 'pi pi-volume-off'"
-          :label="group.muted ? 'Unmute Group' : 'Mute Group'"
-          text
-          severity="contrast"
-          @click="emit('toggle-mute', session.id)"
-        />
-        <Button
-          icon="pi pi-sign-out"
-          label="Leave Group"
-          severity="danger"
-          text
-          @click="emit('leave-group', session.id)"
-        />
-      </div>
-    </template>
   </OverlayPageShell>
 </template>
 
 <style scoped>
-.group-body,
-.section-card,
-.member-list {
+.group-page,
+.group-header,
+.info-section,
+.section-list,
+.member-copy {
   display: grid;
 }
 
-.group-body {
-  gap: 18px;
+.group-page {
+  gap: 22px;
+  padding-top: 2px;
 }
 
-.hero-card {
-  display: grid;
+.group-header {
   justify-items: center;
-  gap: 10px;
-  padding: 28px 24px;
-  border-radius: 28px;
-  background:
-    radial-gradient(circle at top left, rgba(106, 168, 255, 0.18), transparent 26%),
-    linear-gradient(180deg, #f7fbfe 0%, #f2f7fb 100%);
+  gap: 8px;
+  padding: 8px 0 2px;
   text-align: center;
 }
 
-.hero-avatar,
+.group-avatar,
 .member-avatar {
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
+  background: #edf2f7;
+  color: #2b4968;
   font-weight: 700;
 }
 
-.hero-avatar {
-  width: 92px;
-  height: 92px;
-  font-size: 1.45rem;
+.group-avatar {
+  width: 76px;
+  height: 76px;
+  font-size: 1.2rem;
 }
 
-.hero-card h2,
-.hero-card p,
+.group-header h2,
+.group-header p,
 .missing-state p {
   margin: 0;
 }
 
-.hero-card p {
-  max-width: 44ch;
+.group-header h2 {
+  font-size: 1.28rem;
+  font-weight: 600;
+  color: #23364a;
+}
+
+.group-header p {
+  max-width: 34rem;
   color: #6d809a;
-  line-height: 1.65;
+  line-height: 1.6;
 }
 
-.section-card {
-  gap: 12px;
-}
-
-.section-head,
-.section-actions,
-.group-actions,
-.info-row,
-.member-row {
+.group-tags,
+.section-head {
   display: flex;
   align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.group-tags {
+  justify-content: center;
+  margin-top: 4px;
 }
 
 .section-head {
   justify-content: space-between;
-  gap: 12px;
 }
 
-.section-actions {
-  gap: 6px;
-  flex-wrap: wrap;
-  justify-content: end;
+.info-section {
+  gap: 10px;
 }
 
 .section-title {
@@ -232,35 +240,51 @@ function memberRole(contactId: string) {
   font-size: 0.72rem;
 }
 
+.section-list {
+  gap: 0;
+  border: 1px solid #e7ebf1;
+  border-radius: 18px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.info-row,
+.member-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 16px;
+  border-bottom: 1px solid #e7ebf1;
+}
+
 .info-row {
   justify-content: space-between;
-  gap: 12px;
-  padding: 16px 18px;
-  border-radius: 20px;
-  background: #f7fafc;
+}
+
+.info-row:last-child,
+.member-row:last-child,
+.action-list :deep(.p-button:last-child) {
+  border-bottom: 0;
 }
 
 .info-row span {
   color: #6d809a;
 }
 
-.member-list {
-  gap: 10px;
+.action-list :deep(.p-button) {
+  justify-content: flex-start;
+  width: 100%;
+  padding: 15px 16px;
+  border-bottom: 1px solid #e7ebf1;
+  border-radius: 0;
 }
 
 .member-row {
-  gap: 12px;
   width: 100%;
-  padding: 14px 12px;
-  border: 0;
-  border-radius: 20px;
-  background: #f7fafc;
+  border-inline: 0;
+  background: transparent;
   text-align: left;
   cursor: pointer;
-}
-
-.member-row:hover {
-  background: #f2f7fb;
 }
 
 .member-avatar {
@@ -269,7 +293,6 @@ function memberRole(contactId: string) {
 }
 
 .member-copy {
-  display: grid;
   gap: 4px;
   min-width: 0;
   flex: 1;
@@ -286,11 +309,6 @@ function memberRole(contactId: string) {
   color: #71839d;
 }
 
-.group-actions {
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
 .missing-state {
   display: grid;
   justify-items: center;
@@ -302,5 +320,11 @@ function memberRole(contactId: string) {
 
 .missing-state i {
   font-size: 2rem;
+}
+
+@media (max-width: 720px) {
+  .section-head {
+    align-items: flex-start;
+  }
 }
 </style>

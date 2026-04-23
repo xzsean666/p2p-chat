@@ -28,7 +28,7 @@ export const defaultNotificationPreferences: NotificationPreferences = {
 };
 
 export const defaultAdvancedPreferences: AdvancedPreferences = {
-  showMessageInfo: false,
+  showMessageInfo: true,
   useTorNetwork: false,
   relayDiagnostics: true,
   experimentalTransport: true,

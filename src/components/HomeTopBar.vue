@@ -30,10 +30,6 @@ const titleText = computed(() => {
   }
 });
 
-const statusClass = computed(() => {
-  return `status-${props.circle?.status ?? "closed"}`;
-});
-
 const addButtonLabel = computed(() => {
   return props.circle ? "New message" : "Add or restore circle";
 });
@@ -48,7 +44,6 @@ const addButtonLabel = computed(() => {
     <button type="button" class="title-button" @click="emit('title-click')">
       <div class="title-copy">
         <div class="title-line">
-          <span class="status-dot" :class="statusClass"></span>
           <strong>{{ titleText }}</strong>
           <i class="pi pi-chevron-down"></i>
         </div>
@@ -72,11 +67,9 @@ const addButtonLabel = computed(() => {
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
-  padding: 16px 18px;
-  border-radius: 24px;
-  background: var(--shell-surface);
-  border: 1px solid var(--shell-border);
-  box-shadow: var(--shell-shadow-soft);
+  padding: 8px 4px 10px;
+  border-bottom: 1px solid var(--shell-border-soft);
+  background: transparent;
 }
 
 .avatar-button,
@@ -95,8 +88,8 @@ const addButtonLabel = computed(() => {
 }
 
 .user-avatar {
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   background: var(--shell-avatar-bg);
   color: var(--shell-avatar-text);
   font-weight: 700;
@@ -105,41 +98,26 @@ const addButtonLabel = computed(() => {
 .title-copy {
   display: grid;
   gap: 2px;
-  justify-items: center;
+  justify-items: start;
+  min-width: 0;
 }
 
 .title-line {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   color: var(--shell-text-strong);
 }
 
 .title-line strong {
-  font-size: 1.05rem;
+  font-size: 1rem;
+  font-weight: 600;
 }
 
 .subtitle {
   color: var(--shell-text-muted);
-  font-size: 0.88rem;
-}
-
-.status-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: var(--shell-border);
-}
-
-.status-open {
-  background: #3bc18a;
-}
-
-.status-connecting {
-  background: #f0b34d;
-}
-
-.status-closed {
-  background: #d57373;
+  font-family: "Lato", "OX Font", "Segoe UI", sans-serif;
+  font-size: 0.8rem;
+  letter-spacing: 0.01em;
 }
 </style>

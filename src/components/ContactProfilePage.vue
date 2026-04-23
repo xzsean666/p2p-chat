@@ -31,9 +31,7 @@ watch(
 );
 
 const trimmedRemarkDraft = computed(() => remarkDraft.value.trim());
-const remarkChanged = computed(() => {
-  return trimmedRemarkDraft.value !== (props.contact?.subtitle ?? "");
-});
+const remarkChanged = computed(() => trimmedRemarkDraft.value !== (props.contact?.subtitle ?? ""));
 
 function saveRemark() {
   if (!props.contact || !remarkChanged.value) {
@@ -48,43 +46,83 @@ function saveRemark() {
 </script>
 
 <template>
-  <OverlayPageShell
-    title="User Detail"
-    subtitle="Profile, public key and quick actions."
-    @close="emit('close')"
-  >
-    <div v-if="contact" class="profile-body">
-      <section class="hero-card">
-        <Avatar :label="contact.initials" shape="circle" class="hero-avatar" />
+  <OverlayPageShell title="Contact Info" subtitle="Profile" @close="emit('close')">
+    <div v-if="contact" class="profile-page">
+      <section class="profile-header">
+        <Avatar :label="contact.initials" shape="circle" class="profile-avatar" />
         <h2>{{ contact.name }}</h2>
         <p>{{ contact.handle }}</p>
-        <Tag
-          :value="contact.online ? 'Online' : 'Offline'"
-          :severity="contact.online ? 'success' : 'secondary'"
-          rounded
-        />
+        <div class="profile-tags">
+          <Tag :value="contact.online ? 'Online' : 'Offline'" :severity="contact.online ? 'success' : 'secondary'" rounded />
+          <Tag v-if="contact.blocked" value="Blocked" severity="danger" rounded />
+        </div>
       </section>
 
-      <section class="section-card">
-        <div class="section-title">Profile</div>
-        <div class="info-list">
-          <div class="info-row block">
-            <span class="label">Remark</span>
-            <InputText
-              v-model="remarkDraft"
-              placeholder="Add a local remark for this contact"
-              @keydown.enter.prevent="saveRemark"
-            />
-            <p v-if="!trimmedRemarkDraft">No local remark saved yet.</p>
+      <section class="info-section">
+        <div class="section-title">Contact</div>
+        <div class="section-list">
+          <div class="field-row">
+            <span class="label">Name</span>
+            <strong>{{ contact.name }}</strong>
           </div>
-          <div class="info-row block">
+          <div class="field-row">
+            <span class="label">Status</span>
+            <span>{{ contact.online ? "Online" : "Offline" }}</span>
+          </div>
+          <div class="field-row field-stack">
             <span class="label">Public Key</span>
             <code>{{ contact.pubkey }}</code>
           </div>
-          <div class="info-row block">
+          <div class="field-row field-stack">
             <span class="label">Bio</span>
-            <p>{{ contact.bio }}</p>
+            <p>{{ contact.bio || "No bio available." }}</p>
           </div>
+        </div>
+      </section>
+
+      <section class="info-section">
+        <div class="section-title">Local Note</div>
+        <div class="section-list">
+          <div class="field-row field-stack">
+            <span class="label">Remark</span>
+            <div class="remark-editor">
+              <InputText
+                v-model="remarkDraft"
+                placeholder="Add a local remark for this contact"
+                @keydown.enter.prevent="saveRemark"
+              />
+              <Button
+                label="Save"
+                :disabled="!remarkChanged"
+                severity="secondary"
+                text
+                @click="saveRemark"
+              />
+            </div>
+            <p v-if="!trimmedRemarkDraft">No local remark saved yet.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="info-section">
+        <div class="section-title">Actions</div>
+        <div class="section-list action-list">
+          <Button
+            :icon="activeCircle ? 'pi pi-send' : 'pi pi-compass'"
+            :label="activeCircle ? 'Send Message' : 'Join Circle'"
+            severity="contrast"
+            text
+            class="action-button"
+            @click="activeCircle ? emit('send-message', contact.id) : emit('open-join-circle')"
+          />
+          <Button
+            :icon="contact.blocked ? 'pi pi-lock-open' : 'pi pi-ban'"
+            :label="contact.blocked ? 'Unblock User' : 'Block User'"
+            severity="danger"
+            text
+            class="action-button"
+            @click="emit('toggle-block', contact.id)"
+          />
         </div>
       </section>
     </div>
@@ -93,80 +131,68 @@ function saveRemark() {
       <i class="pi pi-user"></i>
       <p>This contact is no longer available.</p>
     </div>
-
-    <template v-if="contact" #footer>
-      <div class="profile-actions">
-        <Button
-          :icon="activeCircle ? 'pi pi-send' : 'pi pi-compass'"
-          :label="activeCircle ? 'Send Message' : 'Join Circle'"
-          severity="contrast"
-          @click="activeCircle ? emit('send-message', contact.id) : emit('open-join-circle')"
-        />
-        <Button
-          icon="pi pi-check"
-          label="Save Remark"
-          :disabled="!remarkChanged"
-          severity="secondary"
-          @click="saveRemark"
-        />
-        <Button
-          :icon="contact.blocked ? 'pi pi-lock-open' : 'pi pi-ban'"
-          :label="contact.blocked ? 'Unblock User' : 'Block User'"
-          severity="danger"
-          text
-          @click="emit('toggle-block', contact.id)"
-        />
-      </div>
-    </template>
   </OverlayPageShell>
 </template>
 
 <style scoped>
-.profile-body,
-.section-card,
-.info-list {
+.profile-page,
+.profile-header,
+.info-section,
+.section-list {
   display: grid;
 }
 
-.profile-body {
-  gap: 18px;
+.profile-page {
+  gap: 22px;
+  padding-top: 2px;
 }
 
-.hero-card {
-  display: grid;
+.profile-header {
   justify-items: center;
-  gap: 10px;
-  padding: 28px 24px;
-  border-radius: 28px;
-  background:
-    radial-gradient(circle at top left, rgba(106, 168, 255, 0.18), transparent 26%),
-    linear-gradient(180deg, #f7fbfe 0%, #f2f7fb 100%);
+  gap: 8px;
+  padding: 8px 0 2px;
   text-align: center;
 }
 
-.hero-avatar {
-  width: 92px;
-  height: 92px;
-  background: linear-gradient(135deg, #dce9ff 0%, #d9f9ef 100%);
-  color: #16355c;
+.profile-avatar {
+  width: 76px;
+  height: 76px;
+  background: #edf2f7;
+  color: #2b4968;
+  font-size: 1.2rem;
   font-weight: 700;
-  font-size: 1.45rem;
 }
 
-.hero-card h2,
-.hero-card p,
+.profile-header h2,
+.profile-header p,
 .missing-state p,
-.info-row p,
+.field-row p,
 code {
   margin: 0;
 }
 
-.hero-card p {
-  color: #6d809a;
+.profile-header h2 {
+  font-size: 1.28rem;
+  font-weight: 600;
+  color: #23364a;
 }
 
-.section-card {
-  gap: 12px;
+.profile-header p {
+  max-width: 32rem;
+  color: #6d809a;
+  line-height: 1.6;
+}
+
+.profile-tags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.info-section {
+  gap: 10px;
 }
 
 .section-title {
@@ -176,23 +202,39 @@ code {
   font-size: 0.72rem;
 }
 
-.info-list {
-  gap: 10px;
+.section-list {
+  gap: 0;
+  border: 1px solid #e7ebf1;
+  border-radius: 18px;
+  background: #ffffff;
+  overflow: hidden;
 }
 
-.info-row {
+.field-row,
+.action-button {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 16px 18px;
-  border-radius: 20px;
-  background: #f7fafc;
+  padding: 15px 16px;
+  border-bottom: 1px solid #e7ebf1;
 }
 
-.info-row.block {
+.field-row:last-child,
+.action-list :deep(.p-button:last-child) {
+  border-bottom: 0;
+}
+
+.field-stack {
   display: grid;
   justify-content: stretch;
+}
+
+.remark-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
 }
 
 .label {
@@ -202,26 +244,29 @@ code {
   letter-spacing: 0.12em;
 }
 
-.info-row strong,
-.info-row p,
+.field-row strong,
+.field-row span,
+.field-row p,
 code {
   color: #415772;
   line-height: 1.65;
 }
 
-.info-row :deep(.p-inputtext) {
+.field-row :deep(.p-inputtext) {
   width: 100%;
+}
+
+.action-list :deep(.p-button) {
+  justify-content: flex-start;
+  width: 100%;
+  padding: 15px 16px;
+  border-bottom: 1px solid #e7ebf1;
+  border-radius: 0;
 }
 
 code {
   font-family: "IBM Plex Mono", monospace;
   word-break: break-all;
-}
-
-.profile-actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
 }
 
 .missing-state {
@@ -235,5 +280,11 @@ code {
 
 .missing-state i {
   font-size: 2rem;
+}
+
+@media (max-width: 720px) {
+  .remark-editor {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

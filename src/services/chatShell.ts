@@ -10,6 +10,7 @@ import type {
   ChatSessionMessageUpdates,
   ChatSessionMessagesPage,
   ChatShellSnapshot,
+  LocalAccountSecretSummary,
   LoginCompletionInput,
   LoadSessionMessageUpdatesInput,
   LoadSessionMessagesInput,
@@ -114,6 +115,10 @@ export async function updateAuthRuntime(
 
 export async function loadAuthRuntimeClientUri(): Promise<AuthRuntimeClientUriSummary | null> {
   return invokeDesktopShellCommand<AuthRuntimeClientUriSummary>("load_auth_runtime_client_uri");
+}
+
+export async function loadLocalAccountSecretSummary(): Promise<LocalAccountSecretSummary | null> {
+  return invokeDesktopShellCommand<LocalAccountSecretSummary>("load_local_account_secret_summary");
 }
 
 export async function loadPendingAuthRuntimeClientUri(): Promise<AuthRuntimeClientUriSummary | null> {

@@ -676,6 +676,16 @@ pub fn apply_session_action(
                 move_to_top: true,
             });
         }
+        ChatSessionAction::ClearUnread => {
+            if target_session.unread_count.is_some() {
+                let mut session = target_session.clone();
+                session.unread_count = None;
+                change_set.sessions_upsert.push(ChatUpsert {
+                    item: session,
+                    move_to_top: false,
+                });
+            }
+        }
         ChatSessionAction::Delete => {
             change_set
                 .session_ids_to_delete
@@ -1833,13 +1843,15 @@ impl TextNoteSigner {
                 created_at,
                 tags.to_vec(),
             ),
-            Self::RemoteAuthRuntime(auth_session) => shell_auth::sign_remote_auth_runtime_text_note(
-                app_handle,
-                auth_session,
-                content,
-                created_at,
-                tags,
-            ),
+            Self::RemoteAuthRuntime(auth_session) => {
+                shell_auth::sign_remote_auth_runtime_text_note(
+                    app_handle,
+                    auth_session,
+                    content,
+                    created_at,
+                    tags,
+                )
+            }
         }
     }
 }
@@ -1876,10 +1888,11 @@ fn resolve_text_note_signer<R: tauri::Runtime>(
     if matches!(
         auth_session.access.kind,
         LoginAccessKind::Bunker | LoginAccessKind::NostrConnect
-    )
-        && matches!(auth_runtime.state, AuthRuntimeState::Connected)
+    ) && matches!(auth_runtime.state, AuthRuntimeState::Connected)
     {
-        return Ok(Some(TextNoteSigner::RemoteAuthRuntime(auth_session.clone())));
+        return Ok(Some(TextNoteSigner::RemoteAuthRuntime(
+            auth_session.clone(),
+        )));
     }
 
     Ok(None)
@@ -1895,7 +1908,7 @@ fn resolve_local_signing_credential<R: tauri::Runtime>(
 
     if !matches!(
         auth_session.access.kind,
-        LoginAccessKind::Nsec | LoginAccessKind::HexKey
+        LoginAccessKind::LocalProfile | LoginAccessKind::Nsec | LoginAccessKind::HexKey
     ) {
         return Ok(None);
     }
@@ -1945,7 +1958,7 @@ mod tests {
     use secp256k1::{Secp256k1, SecretKey};
     use serde_json::json;
     use std::io::{Read, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use std::sync::MutexGuard;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1990,6 +2003,41 @@ mod tests {
             app,
             config_root,
             previous_xdg_config_home,
+        }
+    }
+
+    struct DetachedTestApp {
+        app: tauri::App<tauri::test::MockRuntime>,
+        config_root: PathBuf,
+    }
+
+    impl Drop for DetachedTestApp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.config_root);
+        }
+    }
+
+    fn unique_test_config_root(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("failed to create detached test config root");
+        config_root
+    }
+
+    fn activate_test_config_root(config_root: &Path) {
+        std::env::set_var("XDG_CONFIG_HOME", config_root);
+    }
+
+    fn detached_test_app(prefix: &str) -> DetachedTestApp {
+        let config_root = unique_test_config_root(prefix);
+        activate_test_config_root(&config_root);
+
+        DetachedTestApp {
+            app: tauri::test::mock_app(),
+            config_root,
         }
     }
 
@@ -2090,23 +2138,33 @@ mod tests {
         session_id: &str,
         runtime: AuthRuntimeSummary,
     ) {
-        fn valid_local_secret_key_hex() -> &'static str {
-            "1111111111111111111111111111111111111111111111111111111111111111"
-        }
+        seed_authenticated_shell_runtime_with_secret(
+            app_handle,
+            session_id,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            runtime,
+        );
+    }
 
-        fn valid_local_npub() -> String {
+    fn seed_authenticated_shell_runtime_with_secret(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        session_id: &str,
+        secret_key_hex: &str,
+        runtime: AuthRuntimeSummary,
+    ) {
+        fn resolved_local_pubkey(secret_key_hex: &str) -> String {
             auth_access::resolve_auth_runtime_credential(&crate::domain::chat::LoginAccessInput {
                 kind: LoginAccessKind::HexKey,
-                value: Some(valid_local_secret_key_hex().into()),
+                value: Some(secret_key_hex.into()),
             })
             .expect("valid test secret should resolve")
             .expect("credential should be present")
             .pubkey
         }
 
-        fn valid_binding_pubkey_hex() -> String {
-            let secret_key = SecretKey::from_str(valid_local_secret_key_hex())
-                .expect("valid test secret key should parse");
+        fn valid_binding_pubkey_hex(secret_key_hex: &str) -> String {
+            let secret_key =
+                SecretKey::from_str(secret_key_hex).expect("valid test secret key should parse");
             let secp = Secp256k1::new();
             let (pubkey, _) = secret_key.x_only_public_key(&secp);
             pubkey
@@ -2122,7 +2180,8 @@ mod tests {
         let credential_login_method = runtime.login_method.clone();
         let credential_access_kind = runtime.access_kind.clone();
         let credential_stored_at = runtime.updated_at.clone();
-        let binding_pubkey = valid_binding_pubkey_hex();
+        let resolved_pubkey = resolved_local_pubkey(secret_key_hex);
+        let binding_pubkey = valid_binding_pubkey_hex(secret_key_hex);
         let binding_value = match binding_access_kind {
             LoginAccessKind::Bunker => Some(format!(
                 "bunker://{binding_pubkey}?relay=wss://relay.example.com"
@@ -2151,7 +2210,9 @@ mod tests {
                     .pubkey
                     .clone()
                     .or_else(|| match runtime.access_kind {
-                        LoginAccessKind::Nsec | LoginAccessKind::HexKey => Some(valid_local_npub()),
+                        LoginAccessKind::LocalProfile
+                        | LoginAccessKind::Nsec
+                        | LoginAccessKind::HexKey => Some(resolved_pubkey.clone()),
                         _ => None,
                     }),
             },
@@ -2170,15 +2231,15 @@ mod tests {
 
         if matches!(
             credential_access_kind,
-            LoginAccessKind::Nsec | LoginAccessKind::HexKey
+            LoginAccessKind::LocalProfile | LoginAccessKind::Nsec | LoginAccessKind::HexKey
         ) {
             auth_runtime_credential_store::save(
                 app_handle,
                 &auth_runtime_credential_store::StoredAuthRuntimeCredential {
                     login_method: credential_login_method,
                     access_kind: credential_access_kind,
-                    secret_key_hex: valid_local_secret_key_hex().into(),
-                    pubkey: valid_local_npub(),
+                    secret_key_hex: secret_key_hex.into(),
+                    pubkey: resolved_pubkey,
                     stored_at: credential_stored_at,
                 },
             )
@@ -2196,6 +2257,22 @@ mod tests {
                 },
             )
             .expect("failed to seed auth runtime binding store");
+        }
+    }
+
+    fn connected_local_auth_runtime(updated_at: &str) -> AuthRuntimeSummary {
+        AuthRuntimeSummary {
+            state: AuthRuntimeState::Connected,
+            login_method: LoginMethod::ExistingAccount,
+            access_kind: LoginAccessKind::HexKey,
+            label: "npub1local".into(),
+            pubkey: None,
+            error: None,
+            can_send_messages: true,
+            send_blocked_reason: None,
+            persisted_in_native_store: false,
+            credential_persisted_in_native_store: true,
+            updated_at: updated_at.into(),
         }
     }
 
@@ -2542,6 +2619,63 @@ mod tests {
         assert_signed_nostr_event(
             last_message,
             "Circle still connecting, but the note is already signed.",
+        );
+        assert_eq!(last_message.acked_at, None);
+    }
+
+    #[test]
+    fn send_message_in_connecting_circle_with_quick_start_local_profile_sets_signed_remote_id() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        seed_authenticated_shell_runtime(
+            app_handle,
+            "nora",
+            AuthRuntimeSummary {
+                state: AuthRuntimeState::LocalProfile,
+                login_method: LoginMethod::QuickStart,
+                access_kind: LoginAccessKind::LocalProfile,
+                label: "Quick Start".into(),
+                pubkey: None,
+                error: None,
+                can_send_messages: true,
+                send_blocked_reason: None,
+                persisted_in_native_store: false,
+                credential_persisted_in_native_store: true,
+                updated_at: "2026-04-19T09:00:00Z".into(),
+            },
+        );
+
+        let seed = send_message(
+            app_handle,
+            SendMessageInput {
+                session_id: "nora".into(),
+                body: "Quick Start accounts should also sign messages.".into(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to send quick start message");
+
+        let last_message = seed
+            .message_store
+            .get("nora")
+            .and_then(|messages| messages.last())
+            .expect("missing appended quick start message");
+
+        assert!(matches!(
+            last_message.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+        assert!(matches!(
+            last_message.sync_source,
+            Some(MessageSyncSource::Local)
+        ));
+        assert!(last_message
+            .remote_id
+            .as_deref()
+            .is_some_and(is_lower_hex_64));
+        assert_signed_nostr_event(
+            last_message,
+            "Quick Start accounts should also sign messages.",
         );
         assert_eq!(last_message.acked_at, None);
     }
@@ -3944,6 +4078,65 @@ mod tests {
     }
 
     #[test]
+    fn clear_unread_session_action_persists_session_state() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let merged_seed = merge_remote_messages(
+            app_handle,
+            MergeRemoteMessagesInput {
+                session_id: "mika".into(),
+                messages: vec![MessageItem {
+                    id: "remote-mika-clear-unread".into(),
+                    kind: MessageKind::Text,
+                    author: MessageAuthor::Peer,
+                    body: "Unread should persist as cleared.".into(),
+                    time: "now".into(),
+                    meta: None,
+                    delivery_status: None,
+                    remote_id: Some("relay:mika:clear-unread".into()),
+                    sync_source: Some(MessageSyncSource::Relay),
+                    acked_at: None,
+                    signed_nostr_event: None,
+                    reply_to: None,
+                }],
+            },
+        )
+        .expect("failed to seed unread state");
+        let unread_session = merged_seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "mika")
+            .expect("missing mika session after unread seed");
+        assert_eq!(unread_session.unread_count, Some(1));
+
+        let cleared_seed = apply_session_action(
+            app_handle,
+            SessionActionInput {
+                session_id: "mika".into(),
+                action: ChatSessionAction::ClearUnread,
+            },
+        )
+        .expect("failed to clear unread state");
+        let cleared_session = cleared_seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "mika")
+            .expect("missing cleared session");
+        assert_eq!(cleared_session.unread_count, None);
+
+        let repository = SqliteChatRepository::new(app_handle);
+        let persisted_session = repository
+            .load_domain_seed()
+            .expect("failed to load persisted seed")
+            .sessions
+            .into_iter()
+            .find(|session| session.id == "mika")
+            .expect("missing persisted mika session");
+        assert_eq!(persisted_session.unread_count, None);
+    }
+
+    #[test]
     fn update_message_delivery_status_updates_existing_message() {
         let guard = test_app();
         let app_handle = guard.app.handle();
@@ -4335,6 +4528,28 @@ mod tests {
                 content: body.into(),
                 signature: "2".repeat(128),
             }),
+            reply_to: None,
+        }
+    }
+
+    fn relay_peer_copy_from_local_message(message: &MessageItem, time: &str) -> MessageItem {
+        let remote_id = message
+            .remote_id
+            .clone()
+            .expect("local signed message should include remote id");
+
+        MessageItem {
+            id: remote_id.clone(),
+            kind: message.kind.clone(),
+            author: MessageAuthor::Peer,
+            body: message.body.clone(),
+            time: time.into(),
+            meta: message.meta.clone(),
+            delivery_status: None,
+            remote_id: Some(remote_id),
+            sync_source: Some(MessageSyncSource::Relay),
+            acked_at: None,
+            signed_nostr_event: message.signed_nostr_event.clone(),
             reply_to: None,
         }
     }
@@ -4872,6 +5087,381 @@ mod tests {
             merged_message.sync_source,
             Some(MessageSyncSource::Local)
         ));
+    }
+
+    #[test]
+    fn merge_remote_delivery_receipts_is_idempotent_for_duplicate_receipts() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let sent_seed = send_message(
+            app_handle,
+            SendMessageInput {
+                session_id: "mika".into(),
+                body: "Duplicate receipts should be idempotent.".into(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("failed to send local message");
+        let local_message = sent_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("missing local sent message");
+        let remote_id = local_message
+            .remote_id
+            .clone()
+            .expect("missing remote id for local message");
+
+        let duplicate_receipt = crate::domain::chat::RemoteDeliveryReceipt {
+            remote_id: remote_id.clone(),
+            message_id: None,
+            delivery_status: MessageDeliveryStatus::Sent,
+            acked_at: Some("relay-ok".into()),
+        };
+
+        let merged_once_seed = merge_remote_delivery_receipts(
+            app_handle,
+            MergeRemoteDeliveryReceiptsInput {
+                session_id: "mika".into(),
+                receipts: vec![duplicate_receipt.clone(), duplicate_receipt.clone()],
+            },
+        )
+        .expect("failed to merge duplicated receipt batch");
+        let merged_once_bucket = merged_once_seed
+            .message_store
+            .get("mika")
+            .expect("missing merged message bucket after first merge");
+        let merged_once_message = merged_once_bucket
+            .iter()
+            .find(|message| message.id == local_message.id)
+            .expect("missing merged message after first merge");
+
+        assert!(matches!(
+            merged_once_message.delivery_status,
+            Some(MessageDeliveryStatus::Sent)
+        ));
+        assert_eq!(merged_once_message.acked_at.as_deref(), Some("relay-ok"));
+
+        let merged_twice_seed = merge_remote_delivery_receipts(
+            app_handle,
+            MergeRemoteDeliveryReceiptsInput {
+                session_id: "mika".into(),
+                receipts: vec![duplicate_receipt],
+            },
+        )
+        .expect("failed to merge duplicated receipt again");
+        let merged_twice_bucket = merged_twice_seed
+            .message_store
+            .get("mika")
+            .expect("missing merged message bucket after second merge");
+        let merged_twice_message = merged_twice_bucket
+            .iter()
+            .find(|message| message.id == local_message.id)
+            .expect("missing merged message after second merge");
+
+        assert_eq!(merged_twice_bucket.len(), merged_once_bucket.len());
+        assert!(matches!(
+            merged_twice_message.delivery_status,
+            Some(MessageDeliveryStatus::Sent)
+        ));
+        assert_eq!(merged_twice_message.acked_at.as_deref(), Some("relay-ok"));
+        assert_eq!(
+            merged_twice_message.remote_id.as_deref(),
+            Some(remote_id.as_str())
+        );
+        assert!(matches!(
+            merged_twice_message.sync_source,
+            Some(MessageSyncSource::Local)
+        ));
+    }
+
+    #[test]
+    fn two_local_accounts_can_exchange_direct_messages_and_reconcile_receipts() {
+        const SENDER_SECRET_KEY_HEX: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        const RECEIVER_SECRET_KEY_HEX: &str =
+            "6666666666666666666666666666666666666666666666666666666666666666";
+
+        let sender_guard = test_app();
+        let sender_app_handle = sender_guard.app.handle();
+        let sender_config_root = sender_guard.config_root.clone();
+        let receiver_guard = detached_test_app("p2p-chat-mutations-receiver-test");
+        let receiver_app_handle = receiver_guard.app.handle();
+        let receiver_config_root = receiver_guard.config_root.clone();
+        let sender_pubkey = valid_test_pubkey_hex(SENDER_SECRET_KEY_HEX);
+        let receiver_pubkey = valid_test_pubkey_hex(RECEIVER_SECRET_KEY_HEX);
+
+        activate_test_config_root(&sender_config_root);
+        set_contact_pubkey(sender_app_handle, "mika-contact", &receiver_pubkey);
+        seed_authenticated_shell_runtime_with_secret(
+            sender_app_handle,
+            "mika",
+            SENDER_SECRET_KEY_HEX,
+            connected_local_auth_runtime("2026-04-23T10:00:00Z"),
+        );
+
+        let sent_seed = send_message(
+            sender_app_handle,
+            SendMessageInput {
+                session_id: "mika".into(),
+                body: "Hello from sender account.".into(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("sender should create an outbound direct message");
+        let sent_message = sent_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("missing sender outbound message");
+        let sent_remote_id = sent_message
+            .remote_id
+            .clone()
+            .expect("sender outbound message should include remote id");
+        let sent_signed_event = sent_message
+            .signed_nostr_event
+            .as_ref()
+            .expect("sender outbound message should include signed event");
+
+        assert!(matches!(
+            sent_message.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+        assert_eq!(sent_signed_event.pubkey, sender_pubkey);
+        assert_eq!(
+            sent_signed_event.tags,
+            vec![vec!["p".into(), receiver_pubkey.clone()]]
+        );
+
+        activate_test_config_root(&receiver_config_root);
+        set_contact_pubkey(receiver_app_handle, "alice-contact", &sender_pubkey);
+        seed_authenticated_shell_runtime_with_secret(
+            receiver_app_handle,
+            "alice",
+            RECEIVER_SECRET_KEY_HEX,
+            connected_local_auth_runtime("2026-04-23T10:01:00Z"),
+        );
+        let receiver_initial_unread_count = load_domain_seed(receiver_app_handle)
+            .expect("failed to load receiver domain seed")
+            .sessions
+            .iter()
+            .find(|session| session.id == "alice")
+            .and_then(|session| session.unread_count)
+            .unwrap_or_default();
+
+        let received_seed = merge_remote_messages(
+            receiver_app_handle,
+            MergeRemoteMessagesInput {
+                session_id: "alice".into(),
+                messages: vec![relay_peer_copy_from_local_message(&sent_message, "10:01")],
+            },
+        )
+        .expect("receiver should merge the sender relay message");
+        let receiver_session = received_seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "alice")
+            .expect("missing receiver session");
+        let received_message = received_seed
+            .message_store
+            .get("alice")
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.remote_id == Some(sent_remote_id.clone()))
+            })
+            .cloned()
+            .expect("missing receiver inbound message");
+
+        assert_eq!(receiver_session.subtitle, "Hello from sender account.");
+        assert_eq!(
+            receiver_session.unread_count.unwrap_or_default(),
+            receiver_initial_unread_count + 1
+        );
+        assert!(matches!(received_message.author, MessageAuthor::Peer));
+        assert!(matches!(
+            received_message.sync_source,
+            Some(MessageSyncSource::Relay)
+        ));
+        assert_eq!(
+            received_message.remote_id.as_deref(),
+            Some(sent_remote_id.as_str())
+        );
+
+        activate_test_config_root(&sender_config_root);
+        let sender_receipt_seed = merge_remote_delivery_receipts(
+            sender_app_handle,
+            MergeRemoteDeliveryReceiptsInput {
+                session_id: "mika".into(),
+                receipts: vec![crate::domain::chat::RemoteDeliveryReceipt {
+                    remote_id: sent_remote_id.clone(),
+                    message_id: None,
+                    delivery_status: MessageDeliveryStatus::Sent,
+                    acked_at: Some("relay-ok".into()),
+                }],
+            },
+        )
+        .expect("sender should merge a delivery receipt for the outbound message");
+        let acked_sender_message = sender_receipt_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.id == sent_message.id)
+            })
+            .expect("missing sender message after receipt merge");
+
+        assert!(matches!(
+            acked_sender_message.delivery_status,
+            Some(MessageDeliveryStatus::Sent)
+        ));
+        assert_eq!(acked_sender_message.acked_at.as_deref(), Some("relay-ok"));
+
+        activate_test_config_root(&receiver_config_root);
+        let reply_seed = send_message(
+            receiver_app_handle,
+            SendMessageInput {
+                session_id: "alice".into(),
+                body: "Reply from receiver account.".into(),
+                reply_to_message_id: Some(received_message.id.clone()),
+            },
+        )
+        .expect("receiver should send a reply back to the sender");
+        let receiver_reply = reply_seed
+            .message_store
+            .get("alice")
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("missing receiver reply message");
+        let receiver_reply_remote_id = receiver_reply
+            .remote_id
+            .clone()
+            .expect("receiver reply should include remote id");
+        let receiver_reply_preview = receiver_reply
+            .reply_to
+            .as_ref()
+            .expect("receiver reply should carry a reply preview");
+        let receiver_reply_signed_event = receiver_reply
+            .signed_nostr_event
+            .as_ref()
+            .expect("receiver reply should be signed");
+
+        assert!(matches!(
+            receiver_reply.delivery_status,
+            Some(MessageDeliveryStatus::Sending)
+        ));
+        assert_eq!(
+            receiver_reply_preview.remote_id.as_deref(),
+            Some(sent_remote_id.as_str())
+        );
+        assert!(matches!(receiver_reply_preview.author, MessageAuthor::Peer));
+        assert_eq!(receiver_reply_preview.snippet, "Hello from sender account.");
+        assert_eq!(
+            receiver_reply_signed_event.tags,
+            vec![
+                vec!["p".into(), sender_pubkey.clone()],
+                vec!["e".into(), sent_remote_id.clone()],
+            ]
+        );
+
+        activate_test_config_root(&sender_config_root);
+        let sender_initial_unread_count = load_domain_seed(sender_app_handle)
+            .expect("failed to load sender domain seed")
+            .sessions
+            .iter()
+            .find(|session| session.id == "mika")
+            .and_then(|session| session.unread_count)
+            .unwrap_or_default();
+        let sender_received_reply_seed = merge_remote_messages(
+            sender_app_handle,
+            MergeRemoteMessagesInput {
+                session_id: "mika".into(),
+                messages: vec![relay_peer_copy_from_local_message(&receiver_reply, "10:02")],
+            },
+        )
+        .expect("sender should merge the receiver reply from relay");
+        let sender_session_after_reply = sender_received_reply_seed
+            .sessions
+            .iter()
+            .find(|session| session.id == "mika")
+            .expect("missing sender session after reply merge");
+        let sender_received_reply = sender_received_reply_seed
+            .message_store
+            .get("mika")
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.remote_id == Some(receiver_reply_remote_id.clone()))
+            })
+            .expect("missing sender inbound reply");
+        let sender_received_reply_preview = sender_received_reply
+            .reply_to
+            .as_ref()
+            .expect("sender inbound reply should hydrate the reply preview");
+
+        assert_eq!(
+            sender_session_after_reply.subtitle,
+            "Reply from receiver account."
+        );
+        assert_eq!(
+            sender_session_after_reply.unread_count.unwrap_or_default(),
+            sender_initial_unread_count + 1
+        );
+        assert!(matches!(sender_received_reply.author, MessageAuthor::Peer));
+        assert_eq!(
+            sender_received_reply.remote_id.as_deref(),
+            Some(receiver_reply_remote_id.as_str())
+        );
+        assert_eq!(
+            sender_received_reply_preview.remote_id.as_deref(),
+            Some(sent_remote_id.as_str())
+        );
+        assert!(matches!(
+            sender_received_reply_preview.author,
+            MessageAuthor::Me
+        ));
+        assert_eq!(sender_received_reply_preview.author_label, "You");
+        assert_eq!(
+            sender_received_reply_preview.snippet,
+            "Hello from sender account."
+        );
+
+        activate_test_config_root(&receiver_config_root);
+        let receiver_receipt_seed = merge_remote_delivery_receipts(
+            receiver_app_handle,
+            MergeRemoteDeliveryReceiptsInput {
+                session_id: "alice".into(),
+                receipts: vec![crate::domain::chat::RemoteDeliveryReceipt {
+                    remote_id: receiver_reply_remote_id,
+                    message_id: None,
+                    delivery_status: MessageDeliveryStatus::Sent,
+                    acked_at: Some("relay-ok-reply".into()),
+                }],
+            },
+        )
+        .expect("receiver should merge the delivery receipt for the reply");
+        let acked_receiver_reply = receiver_receipt_seed
+            .message_store
+            .get("alice")
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.id == receiver_reply.id)
+            })
+            .expect("missing receiver reply after receipt merge");
+
+        assert!(matches!(
+            acked_receiver_reply.delivery_status,
+            Some(MessageDeliveryStatus::Sent)
+        ));
+        assert_eq!(
+            acked_receiver_reply.acked_at.as_deref(),
+            Some("relay-ok-reply")
+        );
     }
 
     #[test]

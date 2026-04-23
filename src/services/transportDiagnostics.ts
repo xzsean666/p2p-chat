@@ -76,27 +76,27 @@ function labelWithNativeSuffix(value: string) {
   return value.includes("native") ? value : `${value} · native`;
 }
 
+function previewQualifier(protocol: CircleTransportDiagnostic["protocol"]) {
+  return protocol === "mesh"
+    ? "experimental mesh preview path"
+    : protocol === "invite"
+      ? "experimental invite preview path"
+      : "experimental relay preview path";
+}
+
 function previewLastSync(
   protocol: CircleTransportDiagnostic["protocol"],
   health: CircleTransportDiagnostic["health"],
 ) {
   if (health === "offline") {
-    return "offline";
+    return "no preview activity reported";
   }
 
   if (health === "degraded") {
-    return protocol === "mesh"
-      ? "native mesh runtime warmup"
-      : protocol === "invite"
-        ? "native invite warmup"
-        : "native relay warmup";
+    return `${previewQualifier(protocol)} starting`;
   }
 
-  return protocol === "mesh"
-    ? "native mesh runtime active"
-    : protocol === "invite"
-      ? "native invite preview active"
-      : "native relay runtime active";
+  return `${previewQualifier(protocol)} reported activity`;
 }
 
 function transportEngineFromAdvanced(advanced: AdvancedPreferences): TransportEngineKind {
@@ -122,10 +122,10 @@ function buildRuntimeActivity(
   const title =
     engine === "nativePreview"
       ? diagnostic.health === "online"
-        ? "Native runtime active"
+        ? "Experimental preview path reported activity"
         : diagnostic.health === "degraded"
-          ? "Native runtime warmup"
-          : "Native runtime offline"
+          ? "Experimental preview path starting"
+          : "Experimental preview path offline"
       : diagnostic.health === "online"
         ? "Relay online"
         : diagnostic.health === "degraded"
@@ -136,10 +136,15 @@ function buildRuntimeActivity(
     id: `runtime-${diagnostic.circleId}`,
     circleId: diagnostic.circleId,
     kind: "runtime",
-    level: activityLevelFromHealth(diagnostic.health),
+    level:
+      engine === "nativePreview"
+        ? diagnostic.health === "offline"
+          ? "warn"
+          : "info"
+        : activityLevelFromHealth(diagnostic.health),
     title,
     detail: `${protocolLabel(diagnostic.protocol)} via ${
-      engine === "nativePreview" ? "native preview engine" : "mock engine"
+      engine === "nativePreview" ? "experimental preview runtime" : "mock engine"
     } · ${diagnostic.peerCount} peers · ${diagnostic.queuedMessages} queued`,
     time: diagnostic.lastSync,
   };
@@ -153,25 +158,29 @@ function buildActionActivity(
   const title =
     action === "connect"
       ? engine === "nativePreview"
-        ? "Native runtime booted"
+        ? "Preview runtime launch requested"
         : "Relay handshake started"
       : action === "disconnect"
         ? engine === "nativePreview"
-          ? "Native runtime stopped"
+          ? "Preview runtime stop requested"
           : "Relay disconnected"
         : action === "discoverPeers"
           ? engine === "nativePreview"
-            ? "Native peer sweep finished"
+            ? "Preview peer sweep requested"
             : "Peer discovery sweep finished"
           : action === "sync"
             ? engine === "nativePreview"
-              ? "Native relay checkpoint saved"
+              ? "Preview relay checkpoint requested"
               : "Relay sync finished"
             : engine === "nativePreview"
-              ? "Native session merge committed"
+              ? "Preview session merge requested"
               : "Session merge committed";
   const level =
-    action === "disconnect"
+    engine === "nativePreview"
+      ? action === "disconnect"
+        ? "warn"
+        : "info"
+      : action === "disconnect"
       ? "warn"
       : action === "syncSessions"
         ? "success"
@@ -236,7 +245,10 @@ function runtimeSessionActivityLevel(session: TransportRuntimeSession): Transpor
   if (
     session.lastLaunchResult === "reused" ||
     session.lastEvent.includes("reused") ||
-    session.lastEvent.includes("booting")
+    session.lastEvent.includes("booting") ||
+    session.lastEvent.includes("starting") ||
+    session.lastEvent.includes("requested") ||
+    session.lastEvent.includes("preview path reporting activity")
   ) {
     return "info";
   }
@@ -444,14 +456,14 @@ function runtimeActionEvent(
 ) {
   if (engine === "nativePreview") {
     return action === "connect"
-      ? "native runtime booted"
+      ? "native preview launch requested"
       : action === "disconnect"
-        ? "native runtime released"
+        ? "native preview stop requested"
         : action === "discoverPeers"
-          ? "native discovery sweep committed"
+          ? "native preview peer sweep requested"
           : action === "sync"
-            ? "native relay checkpoint committed"
-            : "native session merge committed";
+            ? "native preview checkpoint requested"
+            : "native preview session merge requested";
   }
 
   return action === "connect"
@@ -471,10 +483,10 @@ function runtimeStatusEvent(
 ) {
   if (engine === "nativePreview") {
     return status === "open"
-      ? "native runtime active"
+      ? "native preview path reporting activity"
       : status === "connecting"
-        ? "native runtime booting"
-        : "native runtime idle";
+        ? "native preview path starting"
+        : "native preview path idle";
   }
 
   return status === "open"
@@ -589,7 +601,7 @@ function runtimeRecoveryQueue(args: {
     restartAttempts,
     nextRetryIn:
       queueState === "queued"
-        ? "when local runtime worker is ready"
+        ? "when preview runtime worker is ready"
         : runtimeRetryCountdownLabel(nextRetryAtMs - args.nowMs),
     nextRetryAtMs,
   };
@@ -734,7 +746,7 @@ function buildFallbackRuntimeSessions(args: {
       resolvedLaunchCommand: launchCommand,
       launchError:
         launchStatus === "unknown"
-          ? "Browser preview cannot verify whether the local runtime command is installed."
+          ? "Browser fallback cannot verify whether the experimental preview runtime command is installed."
           : undefined,
       desiredState,
       recoveryPolicy,
@@ -910,8 +922,8 @@ function deriveFallbackSnapshot(args: {
           ? "blocked"
           : args.advanced.experimentalTransport
             ? contact.online
-              ? "native session active"
-              : "native standby"
+              ? "preview activity reported"
+              : "preview standby"
             : contact.online
               ? "now"
               : "recently",
@@ -957,7 +969,7 @@ function deriveFallbackSnapshot(args: {
           : pendingMessages > 0
             ? "pending merge"
             : args.advanced.experimentalTransport
-              ? "native checkpoint"
+              ? "preview checkpoint only"
               : session.time,
     } satisfies SessionSyncItem;
   });

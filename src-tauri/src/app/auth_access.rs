@@ -3,6 +3,7 @@ use crate::domain::chat::{
     SignedNostrEvent,
 };
 use bech32::{Bech32, Hrp};
+use nostr_connect::prelude::Keys as NostrKeys;
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 use std::convert::TryInto;
@@ -72,9 +73,21 @@ pub fn resolve_auth_runtime_credential(
             let value = normalized_non_empty(access.value.as_deref()).ok_or_else(|| {
                 "existing account hex key must be a valid 32-byte secp256k1 secret key".to_string()
             })?;
-            SecretKey::from_str(value).map_err(|_| {
-                "existing account hex key must be a valid 32-byte secp256k1 secret key".to_string()
-            })?
+            parse_secret_key_hex_input(
+                value,
+                "existing account hex key must be a valid 32-byte secp256k1 secret key".to_string(),
+            )?
+        }
+        LoginAccessKind::LocalProfile => {
+            let value = normalized_non_empty(access.value.as_deref()).ok_or_else(|| {
+                "quick start local profile key must be a valid 32-byte secp256k1 secret key"
+                    .to_string()
+            })?;
+            parse_secret_key_hex_input(
+                value,
+                "quick start local profile key must be a valid 32-byte secp256k1 secret key"
+                    .to_string(),
+            )?
         }
         _ => return Ok(None),
     };
@@ -84,6 +97,18 @@ pub fn resolve_auth_runtime_credential(
         secret_key_hex: encode_secret_key_hex(&secret_key),
         pubkey: canonical_npub_from_secret_key(&secret_key)?,
     }))
+}
+
+pub fn generate_secret_key_hex() -> String {
+    NostrKeys::generate().secret_key().to_secret_hex()
+}
+
+pub fn encode_nsec_secret_key(secret_key_hex: &str) -> Result<String, String> {
+    let secret_key = parse_secret_key_hex_input(
+        secret_key_hex,
+        "auth runtime secret key in native credential store is invalid".to_string(),
+    )?;
+    encode_nsec(&secret_key)
 }
 
 pub fn resolve_auth_runtime_binding(
@@ -132,8 +157,10 @@ pub fn sign_auth_runtime_text_note(
     created_at: u64,
     tags: Vec<Vec<String>>,
 ) -> Result<SignedNostrEvent, String> {
-    let secret_key = SecretKey::from_str(secret_key_hex)
-        .map_err(|_| "auth runtime secret key in native credential store is invalid".to_string())?;
+    let secret_key = parse_secret_key_hex_input(
+        secret_key_hex,
+        "auth runtime secret key in native credential store is invalid".to_string(),
+    )?;
     let secp = Secp256k1::new();
     let keypair = Keypair::from_secret_key(&secp, &secret_key);
     let (public_key, _) = secret_key.x_only_public_key(&secp);
@@ -175,10 +202,22 @@ fn resolve_quick_start_access(access: &LoginAccessInput) -> Result<LoginAccessSu
         return Err("quick start requires `localProfile` access".into());
     }
 
+    let pubkey = match normalized_non_empty(access.value.as_deref()) {
+        Some(value) => {
+            let secret_key = parse_secret_key_hex_input(
+                value,
+                "quick start local profile key must be a valid 32-byte secp256k1 secret key"
+                    .to_string(),
+            )?;
+            Some(canonical_npub_from_secret_key(&secret_key)?)
+        }
+        None => None,
+    };
+
     Ok(LoginAccessSummary {
         kind: access.kind.clone(),
         label: "Quick Start".into(),
-        pubkey: None,
+        pubkey,
     })
 }
 
@@ -216,9 +255,10 @@ fn resolve_existing_account_access(
             let value = normalized_non_empty(access.value.as_deref()).ok_or_else(|| {
                 "existing account hex key must be a valid 32-byte secp256k1 secret key".to_string()
             })?;
-            let secret_key = SecretKey::from_str(value).map_err(|_| {
-                "existing account hex key must be a valid 32-byte secp256k1 secret key".to_string()
-            })?;
+            let secret_key = parse_secret_key_hex_input(
+                value,
+                "existing account hex key must be a valid 32-byte secp256k1 secret key".to_string(),
+            )?;
             let pubkey = canonical_npub_from_secret_key(&secret_key)?;
             Ok(build_public_key_access_summary(access.kind.clone(), pubkey))
         }
@@ -317,8 +357,22 @@ fn encode_npub(public_key: &XOnlyPublicKey) -> Result<String, String> {
         .map_err(|_| "failed to encode canonical npub summary".to_string())
 }
 
+fn encode_nsec(secret_key: &SecretKey) -> Result<String, String> {
+    let hrp = Hrp::parse(NSEC_HRP).expect("valid nsec hrp");
+    bech32::encode::<Bech32>(hrp, &secret_key.secret_bytes())
+        .map_err(|_| "failed to encode canonical nsec summary".to_string())
+}
+
 fn encode_secret_key_hex(secret_key: &SecretKey) -> String {
     encode_lower_hex(&secret_key.secret_bytes())
+}
+
+fn parse_secret_key_hex_input(value: &str, error_message: String) -> Result<SecretKey, String> {
+    let normalized = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    SecretKey::from_str(normalized).map_err(|_| error_message)
 }
 
 fn parse_auth_runtime_binding_uri(
@@ -514,6 +568,25 @@ mod tests {
     }
 
     #[test]
+    fn resolves_canonical_npub_from_0x_prefixed_hex_secret_key() {
+        let summary = resolve_login_access_summary(&make_input(
+            LoginMethod::ExistingAccount,
+            LoginAccessInput {
+                kind: LoginAccessKind::HexKey,
+                value: Some(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+                ),
+            },
+        ))
+        .expect("0x-prefixed hex key should resolve");
+
+        let pubkey = summary
+            .pubkey
+            .expect("0x-prefixed hex key should derive canonical npub");
+        assert!(pubkey.starts_with("npub1"));
+    }
+
+    #[test]
     fn resolves_runtime_credential_from_hex_secret_key() {
         let credential = resolve_auth_runtime_credential(&LoginAccessInput {
             kind: LoginAccessKind::HexKey,
@@ -528,6 +601,55 @@ mod tests {
             "1111111111111111111111111111111111111111111111111111111111111111"
         );
         assert!(credential.pubkey.starts_with("npub1"));
+    }
+
+    #[test]
+    fn resolves_runtime_credential_from_0x_prefixed_hex_secret_key() {
+        let credential = resolve_auth_runtime_credential(&LoginAccessInput {
+            kind: LoginAccessKind::HexKey,
+            value: Some(
+                "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+            ),
+        })
+        .expect("0x-prefixed hex key should resolve credential")
+        .expect("credential should be present");
+
+        assert!(matches!(credential.access_kind, LoginAccessKind::HexKey));
+        assert_eq!(
+            credential.secret_key_hex,
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert!(credential.pubkey.starts_with("npub1"));
+    }
+
+    #[test]
+    fn resolves_quick_start_pubkey_from_local_profile_secret() {
+        let summary = resolve_login_access_summary(&make_input(
+            LoginMethod::QuickStart,
+            LoginAccessInput {
+                kind: LoginAccessKind::LocalProfile,
+                value: Some(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+                ),
+            },
+        ))
+        .expect("quick start key should resolve");
+
+        assert_eq!(summary.label, "Quick Start");
+        assert!(summary
+            .pubkey
+            .as_deref()
+            .is_some_and(|pubkey| pubkey.starts_with("npub1")));
+    }
+
+    #[test]
+    fn encodes_nsec_from_valid_secret_key() {
+        let nsec = encode_nsec_secret_key(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .expect("valid secret should encode as nsec");
+
+        assert!(nsec.starts_with("nsec1"));
     }
 
     #[test]

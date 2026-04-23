@@ -1,14 +1,17 @@
 <script setup lang="ts">
+import { computed, ref } from "vue";
 import Avatar from "primevue/avatar";
 import Badge from "primevue/badge";
 import Button from "primevue/button";
 import InputText from "primevue/inputtext";
+import Menu from "primevue/menu";
 import ScrollPanel from "primevue/scrollpanel";
-import Tag from "primevue/tag";
+import type { MenuItem } from "primevue/menuitem";
 import SelfChatIcon from "./SelfChatIcon.vue";
+import emptyStateImage from "../../tmp/xchat-app-main/packages/business_modules/ox_home/assets/images/empty.png";
 import type { CircleItem, SessionAction, SessionItem } from "../types/chat";
 
-defineProps<{
+const props = defineProps<{
   searchText: string;
   sessions: SessionItem[];
   activeSessionId: string;
@@ -23,6 +26,50 @@ const emit = defineEmits<{
   (event: "session-action", payload: { sessionId: string; action: SessionAction }): void;
   (event: "open-archived"): void;
 }>();
+
+const sessionActionMenu = ref<{
+  show: (event: Event) => void;
+  hide: () => void;
+} | null>(null);
+const activeActionSessionId = ref<string | null>(null);
+
+const activeActionSession = computed(() => {
+  if (!activeActionSessionId.value) {
+    return null;
+  }
+
+  return props.sessions.find((session) => session.id === activeActionSessionId.value) ?? null;
+});
+
+const sessionActionItems = computed<MenuItem[]>(() => {
+  const session = activeActionSession.value;
+  if (!session) {
+    return [];
+  }
+
+  return [
+    {
+      label: session.pinned ? "Unpin chat" : "Pin chat",
+      icon: session.pinned ? "pi pi-thumbtack" : "pi pi-thumbtack",
+      command: () => emit("session-action", { sessionId: session.id, action: "pin" }),
+    },
+    {
+      label: session.muted ? "Unmute chat" : "Mute chat",
+      icon: session.muted ? "pi pi-volume-up" : "pi pi-volume-off",
+      command: () => emit("session-action", { sessionId: session.id, action: "mute" }),
+    },
+    {
+      label: "Archive chat",
+      icon: "pi pi-box",
+      command: () => emit("session-action", { sessionId: session.id, action: "archive" }),
+    },
+    {
+      label: "Delete chat",
+      icon: "pi pi-trash",
+      command: () => emit("session-action", { sessionId: session.id, action: "delete" }),
+    },
+  ];
+});
 
 function preview(session: SessionItem) {
   return session.draft ? `Draft: ${session.draft}` : session.subtitle;
@@ -39,10 +86,22 @@ function emptyCta(circle: CircleItem | null) {
 function emptyDescription(circle: CircleItem | null) {
   return circle?.description ?? "No circle selected yet. Add or restore a circle before starting chats.";
 }
+
+function openSessionActionMenu(event: Event, sessionId: string) {
+  activeActionSessionId.value = sessionId;
+  sessionActionMenu.value?.show(event);
+}
 </script>
 
 <template>
   <section class="session-pane">
+    <Menu
+      ref="sessionActionMenu"
+      :model="sessionActionItems"
+      popup
+      @hide="activeActionSessionId = null"
+    />
+
     <div class="search-row">
       <div class="search-field">
         <i class="pi pi-search"></i>
@@ -77,51 +136,25 @@ function emptyDescription(circle: CircleItem | null) {
             <div class="session-headline">
               <div class="session-name-row">
                 <strong>{{ session.name }}</strong>
-                <Tag
-                  v-if="session.kind === 'group'"
-                  value="Group"
-                  severity="secondary"
-                  rounded
-                />
               </div>
-              <span class="session-time">{{ session.time }}</span>
             </div>
 
             <div class="session-subline">
               <p :class="{ draft: !!session.draft }">{{ preview(session) }}</p>
-              <Badge v-if="session.unreadCount" :value="session.unreadCount" severity="danger" />
-              <span v-else-if="session.muted" class="mute-dot"></span>
             </div>
           </div>
 
-          <div class="session-actions">
+          <div class="session-meta">
+            <span class="session-time">{{ session.time }}</span>
+            <Badge v-if="session.unreadCount" :value="session.unreadCount" severity="danger" />
             <Button
-              :icon="session.pinned ? 'pi pi-thumbtack-fill' : 'pi pi-thumbtack'"
+              icon="pi pi-ellipsis-h"
               rounded
               text
               severity="secondary"
-              @click.stop="emit('session-action', { sessionId: session.id, action: 'pin' })"
-            />
-            <Button
-              :icon="session.muted ? 'pi pi-volume-up' : 'pi pi-volume-off'"
-              rounded
-              text
-              severity="secondary"
-              @click.stop="emit('session-action', { sessionId: session.id, action: 'mute' })"
-            />
-            <Button
-              icon="pi pi-box"
-              rounded
-              text
-              severity="secondary"
-              @click.stop="emit('session-action', { sessionId: session.id, action: 'archive' })"
-            />
-            <Button
-              icon="pi pi-trash"
-              rounded
-              text
-              severity="secondary"
-              @click.stop="emit('session-action', { sessionId: session.id, action: 'delete' })"
+              :class="['session-more', { visible: session.id === activeSessionId }]"
+              aria-label="Open chat actions"
+              @click.stop="openSessionActionMenu($event, session.id)"
             />
           </div>
         </button>
@@ -139,7 +172,7 @@ function emptyDescription(circle: CircleItem | null) {
       </div>
 
       <div v-else class="empty-state">
-        <div class="empty-graphic"></div>
+        <img :src="emptyStateImage" alt="" class="empty-graphic" />
         <h3>Welcome to XChat</h3>
         <p>
           {{ emptyDescription(activeCircle) }}
@@ -159,27 +192,29 @@ function emptyDescription(circle: CircleItem | null) {
 .session-pane {
   display: grid;
   min-height: 0;
-  padding: 18px;
-  border-radius: 28px;
-  background: var(--shell-surface);
-  border: 1px solid var(--shell-border);
-  box-shadow: var(--shell-shadow-soft);
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  overflow: hidden;
 }
 
 .search-row {
-  margin-bottom: 16px;
+  padding: 2px 14px 10px;
 }
 
 .search-field {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 10px;
+  gap: 8px;
   align-items: center;
   width: 100%;
-  padding: 0 14px;
-  border: 1px solid var(--shell-border);
-  border-radius: 16px;
-  background: var(--shell-surface-muted);
+  min-height: 40px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--shell-surface-soft) 82%, white);
 }
 
 .search-field i {
@@ -198,61 +233,53 @@ function emptyDescription(circle: CircleItem | null) {
 }
 
 .session-list {
-  padding-right: 10px;
+  padding: 0 0 6px;
 }
 
 .session-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 14px;
+  gap: 10px;
   width: 100%;
-  padding: 14px 12px;
+  padding: 11px 14px;
   border: 0;
-  border-radius: 20px;
   background: transparent;
+  border-bottom: 1px solid color-mix(in srgb, var(--shell-border-soft) 78%, transparent);
   text-align: left;
   cursor: pointer;
   transition:
     background-color 0.2s ease,
-    box-shadow 0.2s ease;
-}
-
-.session-row + .session-row {
-  margin-top: 8px;
+    opacity 0.2s ease,
+    border-color 0.2s ease;
 }
 
 .session-row:hover {
-  background: var(--shell-hover);
+  background: color-mix(in srgb, var(--shell-hover) 56%, transparent);
 }
 
 .session-row.active {
-  background: var(--shell-selected);
-  box-shadow: inset 0 0 0 1px var(--shell-selected-border);
+  background: color-mix(in srgb, var(--shell-selected) 52%, transparent);
+  border-bottom-color: transparent;
 }
 
-.session-row.pinned {
-  background-color: color-mix(in srgb, var(--shell-surface) 92%, var(--shell-hover));
+.session-row.pinned:not(.active) {
+  background: color-mix(in srgb, var(--shell-surface-soft) 54%, transparent);
 }
 
 .session-content {
   display: grid;
-  gap: 8px;
+  gap: 3px;
   min-width: 0;
 }
 
 .session-headline,
 .session-subline,
 .session-name-row,
-.session-actions,
+.session-meta,
 .archived-footer {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.session-headline,
-.session-subline {
-  justify-content: space-between;
 }
 
 .session-name-row {
@@ -263,12 +290,20 @@ function emptyDescription(circle: CircleItem | null) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 0.97rem;
+  font-weight: 600;
 }
 
 .session-time {
   color: var(--shell-text-soft);
-  font-size: 0.82rem;
+  font-size: 0.74rem;
   white-space: nowrap;
+}
+
+.session-meta {
+  align-self: start;
+  padding-top: 1px;
+  color: var(--shell-text-soft);
 }
 
 .session-subline p {
@@ -277,6 +312,8 @@ function emptyDescription(circle: CircleItem | null) {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--shell-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.35;
 }
 
 .session-subline p.draft {
@@ -284,44 +321,44 @@ function emptyDescription(circle: CircleItem | null) {
 }
 
 .contact-avatar {
-  width: 44px;
-  height: 44px;
+  width: 38px;
+  height: 38px;
   background: var(--shell-avatar-bg);
   color: var(--shell-avatar-text);
   font-weight: 700;
 }
 
-.mute-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: var(--shell-border);
-}
-
-.session-actions {
+.session-more {
+  width: 1.75rem;
+  height: 1.75rem;
+  color: var(--shell-text-soft);
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.18s ease;
 }
 
-.session-row:hover .session-actions,
-.session-row.active .session-actions {
+.session-row:hover .session-more,
+.session-row.active .session-more,
+.session-more.visible {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .archived-footer {
-  justify-content: center;
+  justify-content: space-between;
   width: 100%;
-  margin-top: 8px;
-  padding: 12px;
+  padding: 13px 14px 10px;
   border: 0;
-  border-radius: 16px;
+  border-radius: 0;
+  border-top: 0;
   background: transparent;
   color: var(--shell-text-default);
   cursor: pointer;
+  font-size: 0.92rem;
 }
 
 .archived-footer:hover {
-  background: var(--shell-hover);
+  background: color-mix(in srgb, var(--shell-hover) 48%, transparent);
 }
 
 .empty-state {
@@ -335,13 +372,9 @@ function emptyDescription(circle: CircleItem | null) {
 }
 
 .empty-graphic {
-  width: 88px;
-  height: 88px;
-  border-radius: 999px;
-  background:
-    radial-gradient(circle at 30% 30%, rgba(111, 154, 220, 0.34) 0%, rgba(111, 154, 220, 0.34) 28%, transparent 29%),
-    radial-gradient(circle at 70% 62%, rgba(97, 198, 157, 0.3) 0%, rgba(97, 198, 157, 0.3) 30%, transparent 31%),
-    var(--shell-surface-soft);
+  width: 104px;
+  height: 104px;
+  object-fit: contain;
 }
 
 .empty-state h3,
@@ -358,10 +391,6 @@ function emptyDescription(circle: CircleItem | null) {
 @media (max-width: 720px) {
   .session-row {
     grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  .session-actions {
-    display: none;
   }
 }
 </style>

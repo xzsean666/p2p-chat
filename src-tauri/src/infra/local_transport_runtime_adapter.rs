@@ -46,7 +46,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
             embedded_adapter("local-mock-invite-daemon", "mock", "invite", "loopback")
         }
         (TransportRuntimeFlavor::Preview, RelayProtocol::Websocket) if options.use_tor_network => {
-            local_command_adapter(
+            preview_adapter(
                 "native-preview-tor-runtime",
                 "native",
                 "tor-ws",
@@ -61,7 +61,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
                 ),
             )
         }
-        (TransportRuntimeFlavor::Preview, RelayProtocol::Websocket) => local_command_adapter(
+        (TransportRuntimeFlavor::Preview, RelayProtocol::Websocket) => preview_adapter(
             "native-preview-relay-runtime",
             "native",
             "ws",
@@ -75,7 +75,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
                 preferred_session_id,
             ),
         ),
-        (TransportRuntimeFlavor::Preview, RelayProtocol::Mesh) => local_command_adapter(
+        (TransportRuntimeFlavor::Preview, RelayProtocol::Mesh) => preview_adapter(
             "native-preview-mesh-runtime",
             "native",
             "mesh",
@@ -83,7 +83,7 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
             "p2p-chat-runtime",
             preview_runtime_arguments("preview-mesh", circle_id, None, None, preferred_session_id),
         ),
-        (TransportRuntimeFlavor::Preview, RelayProtocol::Invite) => local_command_adapter(
+        (TransportRuntimeFlavor::Preview, RelayProtocol::Invite) => preview_adapter(
             "native-preview-invite-runtime",
             "native",
             "invite",
@@ -98,6 +98,32 @@ pub(crate) fn resolve_local_transport_runtime_adapter(
             ),
         ),
     }
+}
+
+fn preview_adapter(
+    driver: &'static str,
+    session_prefix: &'static str,
+    protocol_token: &'static str,
+    endpoint_scheme: &'static str,
+    launch_command: &'static str,
+    launch_arguments: Vec<String>,
+) -> ResolvedLocalTransportRuntimeAdapter {
+    if preview_transport_uses_embedded_adapter() {
+        return embedded_adapter(driver, session_prefix, protocol_token, endpoint_scheme);
+    }
+
+    local_command_adapter(
+        driver,
+        session_prefix,
+        protocol_token,
+        endpoint_scheme,
+        launch_command,
+        launch_arguments,
+    )
+}
+
+fn preview_transport_uses_embedded_adapter() -> bool {
+    cfg!(any(target_os = "android", target_os = "ios"))
 }
 
 fn preview_runtime_arguments(
@@ -380,6 +406,41 @@ mod tests {
                 "alice".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn preview_transport_adapter_uses_platform_safe_launch_strategy() {
+        let adapter = resolve_local_transport_runtime_adapter(
+            TransportRuntimeFlavor::Preview,
+            &RelayProtocol::Websocket,
+            TransportRuntimeOptions {
+                use_tor_network: false,
+                experimental_transport: true,
+            },
+            "main-circle",
+            Some("wss://relay.example.com"),
+            Some("alice"),
+        );
+
+        if preview_transport_uses_embedded_adapter() {
+            assert!(matches!(
+                adapter.adapter_kind,
+                TransportRuntimeAdapterKind::Embedded
+            ));
+            assert!(matches!(
+                adapter.launch_status,
+                TransportRuntimeLaunchStatus::Embedded
+            ));
+            assert_eq!(adapter.launch_command, None);
+            assert_eq!(adapter.resolved_launch_command, None);
+            assert_eq!(adapter.launch_error, None);
+        } else {
+            assert!(matches!(
+                adapter.adapter_kind,
+                TransportRuntimeAdapterKind::LocalCommand
+            ));
+            assert_eq!(adapter.launch_command.as_deref(), Some("p2p-chat-runtime"));
+        }
     }
 
     #[test]

@@ -3,7 +3,6 @@ import { computed } from "vue";
 import Avatar from "primevue/avatar";
 import Button from "primevue/button";
 import Drawer from "primevue/drawer";
-import Tag from "primevue/tag";
 import type {
   CircleItem,
   SettingPageId,
@@ -37,6 +36,14 @@ const drawerVisible = computed({
   set: (value: boolean) => emit("update:visible", value),
 });
 
+const currentCircle = computed(() => {
+  return props.circles.find((circle) => circle.id === props.activeCircleId) ?? null;
+});
+
+const inactiveCircles = computed(() => {
+  return props.circles.filter((circle) => circle.id !== props.activeCircleId);
+});
+
 const circleEmptyTitle = computed(() => {
   return props.restorableCount > 0 ? "Add or Restore Circle" : "Join a Circle";
 });
@@ -58,79 +65,96 @@ const circleEmptyCopy = computed(() => {
   >
     <template #header>
       <div class="drawer-header">
-        <span>Settings</span>
+        <span>Me</span>
       </div>
     </template>
 
     <div class="drawer-body">
-      <section class="profile-card">
+      <section class="profile-hero">
         <Avatar :label="user.initials" shape="circle" class="profile-avatar" />
-        <div>
+        <div class="profile-copy">
           <strong>{{ user.name }}</strong>
           <p>{{ user.handle }}</p>
+          <span>{{ phase || "Foundation" }}</span>
         </div>
-        <Tag :value="phase || 'Foundation'" severity="info" rounded />
       </section>
 
-      <section class="drawer-section">
-        <p class="section-title">Circles</p>
-        <template v-if="circles.length">
-          <div
-            v-for="circle in circles"
-            :key="circle.id"
-            :class="['circle-row-shell', { active: circle.id === activeCircleId }]"
+      <section class="drawer-section circle-section">
+        <div class="section-heading">
+          <p class="section-title">Current circle</p>
+          <button type="button" class="text-action" @click="emit('join-circle')">
+            Add
+          </button>
+        </div>
+
+        <template v-if="currentCircle">
+          <button
+            type="button"
+            class="circle-focus-card"
+            @click="emit('open-circle-detail', currentCircle.id)"
           >
-            <button type="button" class="drawer-row circle-row-main" @click="emit('select-circle', circle.id)">
-              <Avatar :label="circle.name.slice(0, 1)" shape="circle" class="circle-avatar" />
+            <Avatar
+              :label="currentCircle.name.slice(0, 1)"
+              shape="circle"
+              class="circle-avatar"
+            />
+            <div class="row-copy">
+              <strong>{{ currentCircle.name }}</strong>
+              <span>{{ currentCircle.relay }}</span>
+            </div>
+            <span class="circle-badge">Active</span>
+            <i class="pi pi-chevron-right row-chevron"></i>
+          </button>
+
+          <div v-if="inactiveCircles.length" class="circle-list">
+            <p class="section-caption">Switch circle</p>
+            <button
+              v-for="circle in inactiveCircles"
+              :key="circle.id"
+              type="button"
+              class="drawer-row"
+              @click="emit('select-circle', circle.id)"
+            >
+              <Avatar
+                :label="circle.name.slice(0, 1)"
+                shape="circle"
+                class="circle-avatar"
+              />
               <div class="row-copy">
                 <strong>{{ circle.name }}</strong>
                 <span>{{ circle.relay }}</span>
               </div>
-              <i
-                v-if="circle.id === activeCircleId"
-                class="pi pi-check-circle active-check"
-              ></i>
+              <i class="pi pi-chevron-right row-chevron"></i>
             </button>
+          </div>
 
-            <Button
-              icon="pi pi-info-circle"
-              text
-              rounded
-              severity="secondary"
-              class="detail-button"
-              @click="emit('open-circle-detail', circle.id)"
-            />
+          <div v-if="restorableCount > 0" class="inline-actions">
+            <button
+              type="button"
+              class="text-action"
+              @click="emit('open-restore')"
+            >
+              Restore access
+            </button>
           </div>
         </template>
+
         <div v-else class="circle-empty-state">
           <strong>{{ circleEmptyTitle }}</strong>
           <p>{{ circleEmptyCopy }}</p>
-          <Tag
-            v-if="restorableCount > 0"
-            :value="`${restorableCount} restore entries`"
-            severity="warn"
-            rounded
-          />
-        </div>
-
-        <div class="circle-actions">
-          <Button
-            :icon="circles.length ? 'pi pi-plus' : 'pi pi-compass'"
-            :label="circles.length ? 'Add a Circle' : 'Join Circle'"
-            text
-            severity="contrast"
-            class="join-button"
-            @click="emit('join-circle')"
-          />
-          <Button
-            v-if="restorableCount > 0"
-            icon="pi pi-refresh"
-            label="Restore Access"
-            text
-            severity="secondary"
-            class="join-button"
-            @click="emit('open-restore')"
-          />
+          <div class="inline-actions">
+            <button type="button" class="text-action" @click="emit('join-circle')">
+              Join circle
+            </button>
+            <button
+              v-if="restorableCount > 0"
+              type="button"
+              class="text-action"
+              @click="emit('open-restore')"
+            >
+              Restore access
+            </button>
+          </div>
         </div>
       </section>
 
@@ -170,32 +194,24 @@ const circleEmptyCopy = computed(() => {
 <style scoped>
 .drawer-header {
   font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 .drawer-body {
   display: grid;
-  gap: 20px;
+  gap: 22px;
 }
 
-.profile-card,
+.profile-hero,
+.circle-focus-card,
 .drawer-row {
   display: flex;
   align-items: center;
   gap: 12px;
 }
 
-.circle-row-shell {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-  border-radius: 16px;
-}
-
-.profile-card {
-  padding: 14px;
-  border-radius: 20px;
-  background: var(--shell-surface-soft);
+.profile-hero {
+  padding: 4px 2px 0;
 }
 
 .profile-avatar,
@@ -206,8 +222,8 @@ const circleEmptyCopy = computed(() => {
 }
 
 .profile-avatar {
-  width: 42px;
-  height: 42px;
+  width: 48px;
+  height: 48px;
 }
 
 .circle-avatar {
@@ -215,28 +231,54 @@ const circleEmptyCopy = computed(() => {
   height: 34px;
 }
 
-.profile-card strong,
-.profile-card p,
+.profile-copy,
+.row-copy,
+.circle-empty-state,
+.drawer-section {
+  min-width: 0;
+}
+
+.profile-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.profile-hero strong,
+.profile-hero p,
+.profile-hero span,
 .section-title {
   margin: 0;
 }
 
-.profile-card p {
+.profile-hero p,
+.profile-hero span {
   color: var(--shell-text-muted);
   font-size: 0.88rem;
 }
 
+.profile-hero span {
+  font-size: 0.8rem;
+}
+
 .drawer-section {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .circle-empty-state {
   display: grid;
   gap: 8px;
-  padding: 14px;
-  border-radius: 18px;
+  padding: 16px;
+  border-radius: 20px;
   background: var(--shell-surface-soft);
+  border: 1px solid var(--shell-border);
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .section-title {
@@ -246,39 +288,49 @@ const circleEmptyCopy = computed(() => {
   font-size: 0.72rem;
 }
 
+.section-caption {
+  margin: 0 0 2px;
+  color: var(--shell-text-muted);
+  font-size: 0.8rem;
+}
+
+.circle-section {
+  gap: 12px;
+}
+
+.circle-focus-card {
+  width: 100%;
+  padding: 14px 12px;
+  border: 1px solid var(--shell-border);
+  border-radius: 20px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--shell-surface-soft) 88%, white 12%),
+    var(--shell-surface-soft)
+  );
+  cursor: pointer;
+  text-align: left;
+}
+
+.circle-focus-card:hover,
 .drawer-row {
   width: 100%;
-  padding: 12px 10px;
+  padding: 12px 4px;
   border: 0;
-  border-radius: 16px;
+  border-radius: 14px;
   background: transparent;
   cursor: pointer;
   text-align: left;
 }
 
 .drawer-row:hover,
-.circle-row-shell:hover {
+.circle-focus-card:hover {
   background: var(--shell-hover);
-}
-
-.drawer-row.active,
-.circle-row-shell.active {
-  background: var(--shell-selected);
-}
-
-.circle-row-main {
-  min-width: 0;
-}
-
-.circle-row-shell .circle-row-main:hover,
-.circle-row-shell.active .circle-row-main:hover {
-  background: transparent;
 }
 
 .row-copy {
   display: grid;
   gap: 4px;
-  min-width: 0;
   flex: 1;
 }
 
@@ -294,22 +346,43 @@ const circleEmptyCopy = computed(() => {
   font-size: 0.84rem;
 }
 
-.active-check {
-  color: #2f8c6a;
-}
-
-.detail-button {
-  align-self: stretch;
-}
-
-.circle-actions {
+.circle-list {
   display: grid;
   gap: 4px;
+}
+
+.circle-badge {
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--shell-accent, #2f8c6a) 14%, white 86%);
+  color: var(--shell-accent, #2f8c6a);
+  font-size: 0.74rem;
+  font-weight: 600;
 }
 
 .row-chevron {
   margin-left: auto;
   color: #8a9ab0;
+}
+
+.inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.text-action {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--shell-accent, #2f8c6a);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.text-action:hover {
+  color: color-mix(in srgb, var(--shell-accent, #2f8c6a) 82%, black 18%);
 }
 
 .circle-empty-state strong,
@@ -323,14 +396,9 @@ const circleEmptyCopy = computed(() => {
   line-height: 1.5;
 }
 
-.join-button {
-  justify-content: flex-start;
-  padding-left: 8px;
-}
-
 .logout-button {
   justify-content: flex-start;
-  padding-left: 8px;
+  padding-left: 0;
 }
 
 :deep(.settings-drawer) {

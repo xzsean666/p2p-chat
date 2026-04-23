@@ -80,6 +80,8 @@ pub enum ChatSessionAction {
     Archive,
     Delete,
     Unarchive,
+    #[serde(rename = "clearUnread")]
+    ClearUnread,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +275,17 @@ pub struct AuthRuntimeClientUriSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
     pub client_name: String,
+    pub stored_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAccountSecretSummary {
+    pub login_method: LoginMethod,
+    pub access_kind: LoginAccessKind,
+    pub pubkey: String,
+    pub nsec: String,
+    pub hex_key: String,
     pub stored_at: String,
 }
 

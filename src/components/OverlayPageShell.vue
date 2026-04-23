@@ -13,8 +13,6 @@ const emit = defineEmits<{
 
 <template>
   <div class="page-shell-layer">
-    <div class="page-shell-mask" @click="emit('close')"></div>
-
     <section class="page-shell-panel">
       <header class="page-shell-header">
         <div class="page-shell-leading">
@@ -54,29 +52,21 @@ const emit = defineEmits<{
   position: fixed;
   inset: 0;
   z-index: 34;
-  display: flex;
-  justify-content: flex-end;
-  padding: 18px;
-}
-
-.page-shell-mask {
-  position: absolute;
-  inset: 0;
-  background: rgba(15, 23, 42, 0.28);
-  backdrop-filter: blur(6px);
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  background: var(--shell-page-bg);
 }
 
 .page-shell-panel {
-  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  width: min(760px, calc(100vw - 36px));
-  height: calc(100vh - 36px);
-  border-radius: 30px;
+  width: 100vw;
+  height: 100vh;
   background: var(--shell-surface-strong);
-  border: 1px solid var(--shell-border);
-  box-shadow: var(--shell-shadow-strong);
+  border: 0;
+  box-shadow: none;
   overflow: hidden;
+  isolation: isolate;
 }
 
 .page-shell-header,
@@ -89,9 +79,13 @@ const emit = defineEmits<{
 .page-shell-header {
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px 14px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: max(12px, env(safe-area-inset-top)) 16px 10px;
   border-bottom: 1px solid var(--shell-border-soft);
-  background: color-mix(in srgb, var(--shell-surface-strong) 92%, var(--shell-surface-soft));
+  background: color-mix(in srgb, var(--shell-surface-strong) 94%, transparent);
+  backdrop-filter: blur(18px);
 }
 
 .page-shell-leading {
@@ -113,56 +107,43 @@ const emit = defineEmits<{
 }
 
 .page-shell-copy h2 {
-  font-size: 1.05rem;
+  font-size: 1rem;
 }
 
 .page-shell-copy p {
-  margin-top: 4px;
+  margin-top: 2px;
   color: var(--shell-text-muted);
-  font-size: 0.9rem;
+  font-size: 0.84rem;
 }
 
 .page-shell-body {
   min-height: 0;
-  padding: 22px 22px 18px;
+  padding: 0 16px max(18px, env(safe-area-inset-bottom));
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .page-shell-footer {
-  padding: 16px 22px 22px;
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  padding: 12px 16px max(18px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--shell-border-soft);
-  background: color-mix(in srgb, var(--shell-surface-strong) 94%, var(--shell-surface-soft));
-}
-
-@media (max-width: 920px) {
-  .page-shell-layer {
-    padding: 12px;
-  }
-
-  .page-shell-panel {
-    width: calc(100vw - 24px);
-    height: calc(100vh - 24px);
-  }
+  background: color-mix(in srgb, var(--shell-surface-strong) 96%, transparent);
+  backdrop-filter: blur(18px);
 }
 
 @media (max-width: 720px) {
-  .page-shell-layer {
-    padding: 0;
-  }
-
-  .page-shell-panel {
-    width: 100vw;
-    height: 100vh;
-    border-radius: 0;
-    border: 0;
-  }
-
   .page-shell-header {
-    padding-top: max(18px, env(safe-area-inset-top));
+    padding: max(10px, env(safe-area-inset-top)) 12px 8px;
+  }
+
+  .page-shell-body {
+    padding: 0 12px max(14px, env(safe-area-inset-bottom));
   }
 
   .page-shell-footer {
-    padding-bottom: max(18px, env(safe-area-inset-bottom));
+    padding: 10px 12px max(14px, env(safe-area-inset-bottom));
   }
 }
 </style>

@@ -5,7 +5,7 @@ import InputText from "primevue/inputtext";
 import Tag from "primevue/tag";
 import ToggleSwitch from "primevue/toggleswitch";
 import OverlayPageShell from "./OverlayPageShell.vue";
-import { loadAuthRuntimeClientUri } from "../services/chatShell";
+import { loadAuthRuntimeClientUri, loadLocalAccountSecretSummary } from "../services/chatShell";
 import type {
   AdvancedPreferences,
   AuthRuntimeBindingSummary,
@@ -15,10 +15,12 @@ import type {
   AppPreferences,
   CircleTransportDiagnostic,
   CircleItem,
+  LocalAccountSecretSummary,
   NotificationPreferences,
   RestorableCircleEntry,
   SettingPageId,
   TransportActivityItem,
+  TransportHealth,
   TransportRuntimeSession,
   TransportSnapshot,
   UpdateAuthRuntimeInput,
@@ -60,7 +62,11 @@ const authRuntimeErrorDraft = ref("");
 const authRuntimeClientUri = ref<AuthRuntimeClientUriSummary | null>(null);
 const authRuntimeClientUriError = ref("");
 const authRuntimeClientUriLoading = ref(false);
+const localAccountSecretSummary = ref<LocalAccountSecretSummary | null>(null);
+const localAccountSecretError = ref("");
+const localAccountSecretLoading = ref(false);
 let authRuntimeClientUriRequestSerial = 0;
+let localAccountSecretRequestSerial = 0;
 
 const transportMetrics = computed(() => {
   if (!props.transportSnapshot) {
@@ -180,6 +186,14 @@ const supportsAuthRuntimeClientUri = computed(() => {
   );
 });
 
+const supportsLocalAccountSecretExport = computed(() => {
+  return props.settingId === "about" && (
+    props.authSession?.access.kind === "localProfile" ||
+    props.authSession?.access.kind === "nsec" ||
+    props.authSession?.access.kind === "hexKey"
+  );
+});
+
 const authRuntimeSyncLabel = computed(() => {
   const accessKind = props.authRuntime?.accessKind ?? props.authSession?.access.kind;
   if (accessKind === "bunker" || accessKind === "nostrConnect") {
@@ -211,8 +225,8 @@ const metadata = computed(() => {
       };
     case "advanced":
       return {
-        title: "Advanced Settings",
-        subtitle: "Transport, diagnostics and extra chat inspection options.",
+        title: "Transport Preview",
+        subtitle: "Preview toggles, media upload choices, and lightweight diagnostics.",
       };
     case "restore":
       return {
@@ -222,10 +236,12 @@ const metadata = computed(() => {
     default:
       return {
         title: "About XChat",
-        subtitle: "Build information, relay context and desktop shell status.",
+        subtitle: "Build information, account state, and shell preview summary.",
       };
   }
 });
+
+const phaseLabel = computed(() => props.phase || "Experimental Preview");
 
 async function copyValue(label: string, value: string) {
   try {
@@ -241,6 +257,10 @@ async function copyValue(label: string, value: string) {
 }
 
 function healthTone(health: CircleTransportDiagnostic["health"]) {
+  if (props.transportSnapshot?.engine === "nativePreview") {
+    return health === "offline" ? "warn" : "info";
+  }
+
   if (health === "online") {
     return "success";
   }
@@ -252,7 +272,11 @@ function healthTone(health: CircleTransportDiagnostic["health"]) {
   return "secondary";
 }
 
-function activityTone(level: TransportActivityItem["level"]) {
+function activityTone(level: TransportActivityItem["level"], copy = "") {
+  if (copy.includes("preview")) {
+    return level === "warn" ? "warn" : "info";
+  }
+
   if (level === "success") {
     return "success";
   }
@@ -265,6 +289,10 @@ function activityTone(level: TransportActivityItem["level"]) {
 }
 
 function runtimeTone(state: TransportRuntimeSession["state"]) {
+  if (props.transportSnapshot?.engine === "nativePreview") {
+    return state === "inactive" ? "secondary" : "info";
+  }
+
   if (state === "active") {
     return "success";
   }
@@ -299,12 +327,12 @@ function runtimeFailureCopy(session: TransportRuntimeSession) {
 }
 
 function runtimeAdapterTone(kind: TransportRuntimeSession["adapterKind"]) {
-  return kind === "localCommand" ? "info" : "secondary";
+  return kind === "localCommand" ? "warn" : "secondary";
 }
 
 function runtimeLaunchTone(status: TransportRuntimeSession["launchStatus"]) {
   if (status === "ready" || status === "embedded") {
-    return "success";
+    return "info";
   }
 
   if (status === "missing") {
@@ -312,6 +340,82 @@ function runtimeLaunchTone(status: TransportRuntimeSession["launchStatus"]) {
   }
 
   return "warn";
+}
+
+function engineLabel(engine: TransportSnapshot["engine"]) {
+  return engine === "nativePreview" ? "Experimental preview runtime" : "Local mock diagnostics";
+}
+
+function transportStatusLabel(status: TransportHealth, engine: TransportSnapshot["engine"]) {
+  if (engine !== "nativePreview") {
+    return status;
+  }
+
+  return status === "online"
+    ? "preview path reporting activity"
+    : status === "degraded"
+      ? "preview path starting"
+      : "preview path offline";
+}
+
+function capabilityLabel(kind: "mesh" | "tor" | "experimental", enabled: boolean) {
+  if (kind === "mesh") {
+    return enabled ? "Mesh Preview Path" : "Mesh Unavailable";
+  }
+
+  if (kind === "tor") {
+    return enabled ? "Tor Requested" : "Tor Disabled";
+  }
+
+  return enabled ? "Experimental Path Enabled" : "Experimental Path Disabled";
+}
+
+function runtimeLaunchLabel(status: TransportRuntimeSession["launchStatus"]) {
+  if (status === "ready") {
+    return "command found only";
+  }
+
+  if (status === "embedded") {
+    return "embedded diagnostics";
+  }
+
+  if (status === "missing") {
+    return "command missing";
+  }
+
+  return "not verified";
+}
+
+function honestTransportCopy(value: string) {
+  const replacements = [
+    ["Native runtime active", "Experimental preview path reported activity"],
+    ["Native runtime warmup", "Experimental preview path starting"],
+    ["Native runtime offline", "Experimental preview path offline"],
+    ["Native runtime booted", "Preview runtime launch requested"],
+    ["Native runtime stopped", "Preview runtime stop requested"],
+    ["Native relay checkpoint saved", "Preview relay checkpoint requested"],
+    ["Native session merge committed", "Preview session merge requested"],
+    ["Native peer sweep finished", "Preview peer sweep requested"],
+    ["native invite preview active", "experimental invite preview path reported activity"],
+    ["native mesh preview active", "experimental mesh preview path reported activity"],
+    ["native relay preview active", "experimental relay preview path reported activity"],
+    ["native invite preview warming up", "experimental invite preview path starting"],
+    ["native mesh preview warming up", "experimental mesh preview path starting"],
+    ["native relay preview warming up", "experimental relay preview path starting"],
+    ["native runtime active", "experimental preview path reported activity"],
+    ["native runtime booting", "experimental preview path starting"],
+    ["native runtime idle", "experimental preview path idle"],
+    ["native runtime booted", "preview runtime launch requested"],
+    ["native runtime released", "preview runtime stop requested"],
+    ["native discovery sweep committed", "preview peer sweep requested"],
+    ["native relay checkpoint committed", "preview relay checkpoint requested"],
+    ["native session merge committed", "preview session merge requested"],
+    ["native preview engine", "experimental preview runtime"],
+  ] as const;
+
+  return replacements.reduce((nextValue, [search, replacement]) => {
+    return nextValue.split(search).join(replacement);
+  }, value);
 }
 
 function runtimeLaunchCopy(session: TransportRuntimeSession) {
@@ -330,6 +434,21 @@ function runtimeLastLaunchCopy(session: TransportRuntimeSession) {
   const pidCopy = session.lastLaunchPid ? ` pid ${session.lastLaunchPid}` : "";
   const timeCopy = session.lastLaunchAt ? ` · ${session.lastLaunchAt}` : "";
   return `${session.lastLaunchResult}${pidCopy}${timeCopy}`;
+}
+
+function runtimeReadinessCopy(session: TransportRuntimeSession) {
+  const verification =
+    session.launchStatus === "ready"
+      ? "Command lookup passed, but relay transport is still on an experimental preview path."
+      : session.launchStatus === "embedded"
+        ? "Embedded fallback is mounted for diagnostics only and does not represent verified relay readiness."
+        : session.launchStatus === "missing"
+          ? "The experimental preview runtime command could not be found on this host."
+          : "This preview path has not been verified on the current host.";
+
+  return session.resolvedLaunchCommand
+    ? `${verification} Resolved ${session.resolvedLaunchCommand}.`
+    : verification;
 }
 
 function typeLabel(type: CircleItem["type"]) {
@@ -432,6 +551,55 @@ watch(
     } finally {
       if (requestSerial === authRuntimeClientUriRequestSerial) {
         authRuntimeClientUriLoading.value = false;
+      }
+    }
+  },
+  { immediate: true },
+);
+
+watch(
+  () => [
+    supportsLocalAccountSecretExport.value,
+    props.authSession?.loggedInAt ?? "",
+    props.authRuntime?.updatedAt ?? "",
+  ],
+  async ([enabled]) => {
+    localAccountSecretRequestSerial += 1;
+    const requestSerial = localAccountSecretRequestSerial;
+
+    if (!enabled) {
+      localAccountSecretSummary.value = null;
+      localAccountSecretError.value = "";
+      localAccountSecretLoading.value = false;
+      return;
+    }
+
+    localAccountSecretLoading.value = true;
+    localAccountSecretError.value = "";
+
+    try {
+      const summary = await loadLocalAccountSecretSummary();
+      if (requestSerial !== localAccountSecretRequestSerial) {
+        return;
+      }
+
+      localAccountSecretSummary.value = summary;
+      if (!summary) {
+        localAccountSecretError.value = "Local private key export is unavailable for this session.";
+      }
+    } catch (error) {
+      if (requestSerial !== localAccountSecretRequestSerial) {
+        return;
+      }
+
+      localAccountSecretSummary.value = null;
+      localAccountSecretError.value =
+        error instanceof Error && error.message.trim()
+          ? error.message.trim()
+          : "Local private key export could not be loaded.";
+    } finally {
+      if (requestSerial === localAccountSecretRequestSerial) {
+        localAccountSecretLoading.value = false;
       }
     }
   },
@@ -592,6 +760,7 @@ watch(
 
       <template v-else-if="settingId === 'advanced'">
         <section class="section-card">
+          <div class="section-title">Preview Controls</div>
           <div class="toggle-list">
             <div class="toggle-row">
               <div>
@@ -629,7 +798,7 @@ watch(
             <div class="toggle-row">
               <div>
                 <strong>Experimental Transport</strong>
-                <p>Prepare the UI for upcoming P2P transport experiments and debug hooks.</p>
+                <p>Enable the experimental native preview path. This exposes diagnostics and launch attempts, not a fully ready transport stack.</p>
               </div>
               <ToggleSwitch
                 :model-value="advanced.experimentalTransport"
@@ -723,14 +892,18 @@ watch(
         </section>
 
         <section v-if="transportSnapshot" class="section-card">
-          <div class="section-title">Transport Snapshot</div>
+          <div class="section-title">Preview Snapshot</div>
           <div class="info-row">
             <strong>Overall Status</strong>
-            <Tag :value="transportSnapshot.status" :severity="healthTone(transportSnapshot.status)" rounded />
+            <Tag
+              :value="transportStatusLabel(transportSnapshot.status, transportSnapshot.engine)"
+              :severity="healthTone(transportSnapshot.status)"
+              rounded
+            />
           </div>
           <div class="info-row">
             <strong>Transport Engine</strong>
-            <p>{{ transportSnapshot.engine }}</p>
+            <p>{{ engineLabel(transportSnapshot.engine) }}</p>
           </div>
           <div class="info-row">
             <strong>Connected Relays</strong>
@@ -763,7 +936,7 @@ watch(
           <div class="tag-row">
             <Tag
               v-if="transportSnapshot.capabilities.supportsMesh"
-              value="Mesh Ready"
+              :value="capabilityLabel('mesh', true)"
               severity="secondary"
               rounded
             />
@@ -774,28 +947,31 @@ watch(
               rounded
             />
             <Tag
-              :value="transportSnapshot.capabilities.supportsTor ? 'Tor Enabled' : 'Tor Off'"
+              :value="capabilityLabel('tor', transportSnapshot.capabilities.supportsTor)"
               :severity="transportSnapshot.capabilities.supportsTor ? 'contrast' : 'secondary'"
               rounded
             />
             <Tag
-              :value="transportSnapshot.capabilities.experimentalEnabled ? 'Experimental On' : 'Experimental Off'"
+              :value="capabilityLabel('experimental', transportSnapshot.capabilities.experimentalEnabled)"
               :severity="transportSnapshot.capabilities.experimentalEnabled ? 'info' : 'secondary'"
               rounded
             />
           </div>
+          <p class="section-note">
+            Preview diagnostics summarize an experimental runtime path. They do not certify that relay transport is fully verified end to end.
+          </p>
         </section>
 
         <section v-if="recentTransportActivities.length" class="section-card">
-          <div class="section-title">Recent Runtime Activity</div>
+          <div class="section-title">Recent Preview Activity</div>
           <div class="list-card">
             <div v-for="item in recentTransportActivities" :key="item.id" class="list-row">
               <div class="list-copy">
-                <strong>{{ item.title }}</strong>
-                <p>{{ item.detail }}</p>
+                <strong>{{ honestTransportCopy(item.title) }}</strong>
+                <p>{{ honestTransportCopy(item.detail) }}</p>
               </div>
               <div class="list-tags">
-                <Tag :value="item.kind" :severity="activityTone(item.level)" rounded />
+                <Tag :value="item.kind" :severity="activityTone(item.level, honestTransportCopy(item.title))" rounded />
                 <Tag :value="item.time" severity="secondary" rounded />
               </div>
             </div>
@@ -803,7 +979,7 @@ watch(
         </section>
 
         <section v-if="transportSnapshot" class="section-card">
-          <div class="section-title">Local Runtime</div>
+          <div class="section-title">Preview Runtime</div>
           <template v-if="runtimeSummary">
             <div class="info-row">
               <strong>Driver Mix</strong>
@@ -812,7 +988,7 @@ watch(
             <div class="info-row">
               <strong>Session States</strong>
               <p>
-                {{ runtimeSummary.activeCount }} active ·
+                {{ runtimeSummary.activeCount }} reporting activity ·
                 {{ runtimeSummary.startingCount }} starting ·
                 {{ runtimeSummary.inactiveCount }} inactive
               </p>
@@ -845,16 +1021,17 @@ watch(
                   <p v-if="item.resolvedLaunchCommand">resolved {{ item.resolvedLaunchCommand }}</p>
                   <p v-if="item.launchError" class="failure-copy">{{ item.launchError }}</p>
                   <p v-if="runtimeLastLaunchCopy(item)">last launch {{ runtimeLastLaunchCopy(item) }}</p>
+                  <p>{{ runtimeReadinessCopy(item) }}</p>
                   <p>
                     {{ item.queueState }} queue ·
                     {{ item.restartAttempts }} recovery attempts{{ item.nextRetryIn ? ` · next ${item.nextRetryIn}` : "" }}
                   </p>
                   <p v-if="item.lastFailureReason" class="failure-copy">{{ runtimeFailureCopy(item) }}</p>
-                  <p>{{ item.lastEvent }} · {{ item.lastEventAt }}</p>
+                  <p>{{ honestTransportCopy(item.lastEvent) }} · {{ item.lastEventAt }}</p>
                 </div>
                 <div class="list-tags">
                   <Tag :value="item.adapterKind" :severity="runtimeAdapterTone(item.adapterKind)" rounded />
-                  <Tag :value="item.launchStatus" :severity="runtimeLaunchTone(item.launchStatus)" rounded />
+                  <Tag :value="runtimeLaunchLabel(item.launchStatus)" :severity="runtimeLaunchTone(item.launchStatus)" rounded />
                   <Tag :value="item.driver" severity="secondary" rounded />
                   <Tag :value="item.desiredState" :severity="item.desiredState === 'running' ? 'success' : 'secondary'" rounded />
                   <Tag :value="item.recoveryPolicy" :severity="item.recoveryPolicy === 'auto' ? 'info' : 'secondary'" rounded />
@@ -871,12 +1048,12 @@ watch(
       </template>
 
       <template v-else-if="settingId === 'restore'">
-        <section class="hero-card">
-          <div class="hero-copy">
+        <section class="page-intro">
+          <div class="page-intro-copy">
             <h3>Restore Circle Access</h3>
-            <p>Removed circles are archived into a local restore catalog. You can bring them back with the original relay, type and description intact.</p>
+            <p>Removed circles stay in a local restore catalog so you can reconnect them later with the original relay and entry details intact.</p>
           </div>
-          <div class="hero-tags">
+          <div class="page-intro-tags">
             <Tag value="Circle Restore" severity="warn" rounded />
             <Tag :value="`${restorableCircleCount} saved`" severity="contrast" rounded />
           </div>
@@ -936,18 +1113,19 @@ watch(
       </template>
 
       <template v-else>
-        <section class="hero-card">
-          <div class="hero-copy">
+        <section class="page-intro">
+          <div class="page-intro-copy">
             <h3>P2P Chat Desktop</h3>
-            <p>Rust + Tauri + Vue shell rebuilding the original mobile interaction model for desktop.</p>
+            <p>Desktop shell status, account state, and preview transport details. Text chat works; the transport layer is still presented honestly as a preview path.</p>
           </div>
-          <div class="hero-tags">
+          <div class="page-intro-tags">
             <Tag :value="`v${version}`" severity="contrast" rounded />
-            <Tag :value="phase || 'Foundation'" severity="info" rounded />
+            <Tag :value="phaseLabel" severity="warn" rounded />
           </div>
         </section>
 
         <section class="section-card">
+          <div class="section-title">Account</div>
           <div class="info-row">
             <strong>Account Session</strong>
             <p v-if="authSession">
@@ -1000,7 +1178,7 @@ watch(
           </div>
           <div v-if="authRuntime" class="info-row">
             <strong>Send Status</strong>
-            <p>{{ authRuntime.canSendMessages ? "ready" : "blocked" }}</p>
+            <p>{{ authRuntime.canSendMessages ? "available in current session" : "blocked" }}</p>
           </div>
           <div v-if="authRuntime?.sendBlockedReason" class="info-row">
             <strong>Send Gate Reason</strong>
@@ -1083,11 +1261,49 @@ watch(
               </p>
             </div>
           </div>
+          <div v-if="supportsLocalAccountSecretExport" class="info-row auth-runtime-controls">
+            <strong>Private Key Export</strong>
+            <div class="auth-runtime-panel">
+              <p class="runtime-note">
+                {{
+                  authSession?.loginMethod === "quickStart"
+                    ? "Get Started created a local Nostr account on this device. Back up the private key before changing devices."
+                    : "This session has a locally stored private key. Export it only if you intend to back it up."
+                }}
+              </p>
+              <p v-if="localAccountSecretLoading" class="runtime-note">Loading local private key...</p>
+              <template v-else-if="localAccountSecretSummary">
+                <p class="runtime-note">
+                  {{ localAccountSecretSummary.pubkey }} · saved {{ localAccountSecretSummary.storedAt }}
+                </p>
+                <div class="auth-runtime-actions">
+                  <Button
+                    label="Copy NSEC"
+                    icon="pi pi-copy"
+                    text
+                    severity="info"
+                    @click="copyValue('NSEC', localAccountSecretSummary.nsec)"
+                  />
+                  <Button
+                    label="Copy Hex Key"
+                    icon="pi pi-key"
+                    text
+                    severity="secondary"
+                    @click="copyValue('Hex Key', localAccountSecretSummary.hexKey)"
+                  />
+                </div>
+              </template>
+              <p v-else-if="localAccountSecretError" class="runtime-note failure-copy">
+                {{ localAccountSecretError }}
+              </p>
+            </div>
+          </div>
           <div v-if="authSession" class="info-row auth-runtime-controls">
             <strong>Auth Runtime Controls</strong>
             <div class="auth-runtime-panel">
               <p v-if="!canUpdateAuthRuntime" class="runtime-note">
-                Quick Start stays on `localProfile` and does not require a remote signer handshake.
+                Quick Start stays on `localProfile`, does not require a remote signer handshake, and can export its
+                generated private key above.
               </p>
               <template v-else>
                 <p class="runtime-note">
@@ -1128,6 +1344,14 @@ watch(
               </template>
             </div>
           </div>
+        </section>
+
+        <section class="section-card">
+          <div class="section-title">Shell Summary</div>
+          <div class="info-row">
+            <strong>Bootstrap Phase</strong>
+            <p>{{ phaseLabel }} · shell bootstrap only, not end-to-end transport readiness.</p>
+          </div>
           <div class="info-row">
             <strong>Current Circle</strong>
             <p>{{ activeCircle?.name ?? "No active circle" }}</p>
@@ -1149,7 +1373,7 @@ watch(
             <p>
               {{ activeTransportDiagnostic.protocol }} ·
               {{ activeTransportDiagnostic.peerCount }} peers ·
-              {{ activeTransportDiagnostic.lastSync }}
+              {{ honestTransportCopy(activeTransportDiagnostic.lastSync) }}
             </p>
           </div>
           <div v-if="transportMetrics" class="info-row">
@@ -1159,7 +1383,7 @@ watch(
           <div v-if="runtimeSummary" class="info-row">
             <strong>Runtime Sessions</strong>
             <p>
-              {{ runtimeSummary.activeCount }} active ·
+              {{ runtimeSummary.activeCount }} reporting activity ·
               {{ runtimeSummary.startingCount }} starting ·
               {{ runtimeSummary.inactiveCount }} inactive
             </p>
@@ -1178,7 +1402,7 @@ watch(
           <div v-if="activeRuntimeSession" class="info-row">
             <strong>Runtime Launch</strong>
             <p>
-              {{ activeRuntimeSession.launchStatus }}
+              {{ runtimeLaunchLabel(activeRuntimeSession.launchStatus) }}
               {{ activeRuntimeSession.resolvedLaunchCommand ? ` · ${activeRuntimeSession.resolvedLaunchCommand}` : "" }}
               {{ activeRuntimeSession.launchError ? ` · ${activeRuntimeSession.launchError}` : "" }}
             </p>
@@ -1208,11 +1432,11 @@ watch(
           </div>
           <div v-if="activeRuntimeSession" class="info-row">
             <strong>Runtime Event</strong>
-            <p>{{ activeRuntimeSession.lastEvent }} · {{ activeRuntimeSession.lastEventAt }}</p>
+            <p>{{ honestTransportCopy(activeRuntimeSession.lastEvent) }} · {{ activeRuntimeSession.lastEventAt }}</p>
           </div>
           <div v-if="latestTransportActivity" class="info-row">
             <strong>Latest Activity</strong>
-            <p>{{ latestTransportActivity.title }} · {{ latestTransportActivity.time }}</p>
+            <p>{{ honestTransportCopy(latestTransportActivity.title) }} · {{ latestTransportActivity.time }}</p>
           </div>
         </section>
 
@@ -1267,22 +1491,28 @@ watch(
 .settings-page,
 .section-card,
 .toggle-list,
-.hero-card,
+.page-intro,
 .list-card,
-.list-copy {
+.list-copy,
+.page-intro-copy {
   display: grid;
 }
 
 .settings-page {
   gap: 18px;
+  padding-top: 4px;
 }
 
 .section-card {
-  gap: 12px;
+  gap: 10px;
+  padding: 14px 16px 16px;
+  border-radius: 20px;
+  background: #ffffff;
+  border: 1px solid #e4e9ef;
 }
 
 .list-card {
-  gap: 10px;
+  gap: 0;
 }
 
 .section-title {
@@ -1294,7 +1524,7 @@ watch(
 
 .option-row,
 .footer-actions,
-.hero-tags,
+.page-intro-tags,
 .tag-row,
 .list-tags,
 .restore-actions {
@@ -1321,10 +1551,10 @@ watch(
 }
 
 .option-chip {
-  padding: 10px 14px;
+  padding: 9px 14px;
   border: 1px solid var(--shell-border);
   border-radius: 999px;
-  background: var(--shell-surface-strong);
+  background: #f8fafc;
   color: var(--shell-text-default);
   cursor: pointer;
 }
@@ -1345,44 +1575,44 @@ watch(
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 16px;
-  border-radius: 20px;
-  background: var(--shell-surface-soft);
+  padding: 14px 0;
+  border-top: 1px solid #e7ebf1;
+  background: transparent;
 }
 
 .list-row {
   display: flex;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 16px;
-  border-radius: 20px;
-  background: var(--shell-surface-soft);
+  padding: 14px 0;
+  border-top: 1px solid #e7ebf1;
+  background: transparent;
 }
 
 .toggle-row strong,
 .toggle-row p,
 .info-row strong,
 .info-row p,
-.hero-copy h3,
-.hero-copy p,
 .list-copy strong,
 .list-copy p,
+.page-intro-copy h3,
+.page-intro-copy p,
 .copy-feedback,
 .empty-state {
   margin: 0;
 }
 
 .toggle-row div,
-.hero-copy,
-.list-copy {
+.list-copy,
+.page-intro-copy {
   display: grid;
   gap: 6px;
 }
 
 .toggle-row p,
 .info-row p,
-.hero-copy p,
 .list-copy p,
+.page-intro-copy p,
 .empty-state {
   color: var(--shell-text-muted);
   line-height: 1.6;
@@ -1392,19 +1622,18 @@ watch(
   color: #ad5c2d;
 }
 
-.hero-card {
+.page-intro {
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
+  gap: 14px;
   align-items: start;
-  padding: 24px;
-  border-radius: 28px;
-  background:
-    radial-gradient(circle at top left, rgba(106, 168, 255, 0.18), transparent 26%),
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--shell-surface-strong) 94%, rgba(106, 168, 255, 0.08)) 0%,
-      color-mix(in srgb, var(--shell-surface-soft) 96%, rgba(111, 214, 176, 0.06)) 100%
-    );
+  padding: 6px 2px 0;
+  background: transparent;
+}
+
+.page-intro-copy h3 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: #24384d;
 }
 
 .copy-feedback {
@@ -1449,11 +1678,17 @@ watch(
   align-items: center;
 }
 
+.toggle-row:first-child,
+.info-row:first-child,
+.list-row:first-child {
+  border-top: 0;
+}
+
 @media (max-width: 720px) {
   .toggle-row,
   .info-row,
   .list-row,
-  .hero-card {
+  .page-intro {
     grid-template-columns: 1fr;
     align-items: start;
   }
