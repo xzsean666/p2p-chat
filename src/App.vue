@@ -122,7 +122,6 @@ const {
   revealMessageAttachment,
   reportMessage,
   loadOlderMessages,
-  sendAttachmentMessage,
   sendPreviewMessage,
   retryMessageDelivery,
   startConversation,
@@ -627,7 +626,6 @@ async function shareCircleInvite() {
           @reply-message="startReplyToMessage"
           @cancel-reply="cancelReplyToMessage"
           @open-message-detail="openMessageDetailPage"
-          @attach-file="sendAttachmentMessage"
           @copy-message="copyMessageContent"
           @copy-attachment-path="copyMessageAttachmentPath"
           @open-attachment="openMessageAttachment"

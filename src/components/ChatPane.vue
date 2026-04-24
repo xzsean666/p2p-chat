@@ -59,7 +59,6 @@ const emit = defineEmits<{
   (event: "reply-message", messageId: string): void;
   (event: "cancel-reply"): void;
   (event: "open-message-detail", messageId: string): void;
-  (event: "attach-file", file: File): void;
   (event: "copy-message", messageId: string): void;
   (event: "copy-attachment-path", messageId: string): void;
   (event: "open-attachment", messageId: string): void;
@@ -71,7 +70,6 @@ const emit = defineEmits<{
   (event: "open-details"): void;
 }>();
 
-const attachmentInput = ref<HTMLInputElement | null>(null);
 const messageActionMenu = ref<{
   show: (event: Event) => void;
   hide: () => void;
@@ -376,25 +374,6 @@ function submitMessageReport() {
   closeReportDialog();
 }
 
-function triggerAttachmentPicker() {
-  if (!props.canSendMessages) {
-    return;
-  }
-
-  attachmentInput.value?.click();
-}
-
-function handleAttachmentChange(event: Event) {
-  const input = event.target as HTMLInputElement | null;
-  const file = input?.files?.[0];
-  if (!file) {
-    return;
-  }
-
-  emit("attach-file", file);
-  input.value = "";
-}
-
 function chatPaneClasses() {
   return ["chat-pane", props.presentation === "page" ? "page" : "panel"];
 }
@@ -620,24 +599,6 @@ watch(
       </ScrollPanel>
 
       <div class="composer">
-        <div class="composer-actions">
-          <input
-            ref="attachmentInput"
-            type="file"
-            class="composer-file-input"
-            @change="handleAttachmentChange"
-          />
-          <Button
-            icon="pi pi-paperclip"
-            rounded
-            text
-            severity="contrast"
-            aria-label="Attach file"
-            :disabled="!canSendMessages"
-            @click="triggerAttachmentPicker"
-          />
-        </div>
-
         <div v-if="replyingToMessage" class="composer-reply">
           <div class="composer-reply-copy">
             <span class="reply-author">{{ composerReplyAuthorLabel(replyingToMessage) }}</span>
