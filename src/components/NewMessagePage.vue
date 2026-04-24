@@ -217,7 +217,7 @@ function openInvitePage() {
           <i class="pi pi-search"></i>
           <InputText
             v-model="keyword"
-            placeholder="Search npub or username"
+            placeholder="Search npub, 0x pubkey or username"
             @focus="searchFocused = true"
             @blur="searchFocused = false"
           />

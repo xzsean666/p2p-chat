@@ -1330,7 +1330,12 @@ fn hydrate_local_signed_remote_id(
 }
 
 fn normalize_nostr_pubkey(value: &str) -> Option<String> {
-    NostrPublicKey::parse(value.trim())
+    let trimmed = value.trim();
+    let normalized = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    NostrPublicKey::parse(normalized)
         .ok()
         .map(|pubkey| pubkey.to_hex())
 }
@@ -1523,13 +1528,19 @@ fn default_group_description(group_name: &str) -> String {
 }
 
 fn find_contact_for_lookup(seed: &ChatDomainSeed, query: &str) -> Option<ContactItem> {
-    let normalized = query.trim().to_lowercase();
+    let trimmed = query.trim();
+    let normalized = trimmed.to_lowercase();
+    let query_pubkey = normalize_nostr_pubkey(trimmed);
 
     seed.contacts.iter().find_map(|contact| {
         let name_matches = contact.name.trim().to_lowercase() == normalized;
-        let id_matches = contact.id.trim().eq_ignore_ascii_case(query.trim());
-        let handle_matches = contact.handle.trim().eq_ignore_ascii_case(query.trim());
-        let pubkey_matches = contact.pubkey.trim().eq_ignore_ascii_case(query.trim());
+        let id_matches = contact.id.trim().eq_ignore_ascii_case(trimmed);
+        let handle_matches = contact.handle.trim().eq_ignore_ascii_case(trimmed);
+        let pubkey_matches = contact.pubkey.trim().eq_ignore_ascii_case(trimmed)
+            || query_pubkey
+                .as_ref()
+                .zip(normalize_nostr_pubkey(&contact.pubkey))
+                .is_some_and(|(query_pubkey, contact_pubkey)| query_pubkey == &contact_pubkey);
 
         if name_matches || id_matches || handle_matches || pubkey_matches {
             Some(contact.clone())
@@ -1542,6 +1553,7 @@ fn find_contact_for_lookup(seed: &ChatDomainSeed, query: &str) -> Option<Contact
 fn build_lookup_contact(seed: &ChatDomainSeed, query: &str) -> ContactItem {
     let trimmed = query.trim();
     let lowered = trimmed.to_lowercase();
+    let normalized_pubkey = normalize_nostr_pubkey(trimmed);
     let slug = build_circle_slug(trimmed);
     let handle = if trimmed.starts_with('@') {
         trimmed.to_lowercase()
@@ -1550,10 +1562,10 @@ fn build_lookup_contact(seed: &ChatDomainSeed, query: &str) -> ContactItem {
     };
     let name = if trimmed.starts_with('@') {
         humanize_identifier(trimmed.trim_start_matches('@'))
-    } else if lowered.starts_with("npub") || trimmed.len() >= 32 {
+    } else if let Some(pubkey) = normalized_pubkey.as_ref() {
         format!(
             "Remote {}",
-            trimmed.chars().take(6).collect::<String>().to_uppercase()
+            pubkey.chars().take(6).collect::<String>().to_uppercase()
         )
     } else if trimmed.contains("://") {
         format!(
@@ -1563,8 +1575,12 @@ fn build_lookup_contact(seed: &ChatDomainSeed, query: &str) -> ContactItem {
     } else {
         humanize_identifier(trimmed)
     };
-    let pubkey = if lowered.starts_with("npub") || trimmed.len() >= 32 {
-        trimmed.to_string()
+    let pubkey = if let Some(pubkey) = normalized_pubkey {
+        if lowered.starts_with("npub") {
+            lowered
+        } else {
+            pubkey
+        }
     } else {
         format!("lookup:{slug}")
     };
@@ -5863,5 +5879,47 @@ mod tests {
         assert_eq!(contact.handle, "@relaypilot");
         assert_eq!(contact.subtitle, "Imported from lookup");
         assert!(matches!(session.kind, SessionKind::Direct));
+    }
+
+    #[test]
+    fn start_lookup_conversation_reuses_existing_contact_for_0x_prefixed_hex_pubkey() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let pubkey_hex = valid_test_pubkey_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        set_contact_pubkey(app_handle, "alice-contact", &pubkey_hex);
+
+        let result = start_lookup_conversation(
+            app_handle,
+            StartLookupConversationInput {
+                circle_id: "main-circle".into(),
+                query: format!("0x{pubkey_hex}"),
+            },
+        )
+        .expect("failed to start lookup conversation from 0x-prefixed pubkey");
+
+        let session = result
+            .seed
+            .sessions
+            .iter()
+            .find(|session| session.id == result.session_id)
+            .expect("missing lookup session");
+
+        assert_eq!(session.contact_id.as_deref(), Some("alice-contact"));
+        assert_eq!(
+            result
+                .seed
+                .contacts
+                .iter()
+                .filter(|contact| contact.id == "alice-contact")
+                .count(),
+            1
+        );
+        assert!(!result
+            .seed
+            .contacts
+            .iter()
+            .any(|contact| contact.id.starts_with("lookup-")));
     }
 }

@@ -4642,11 +4642,14 @@ export function useChatShell() {
 
   function applyLocalCreateLookupContact(query: string) {
     const normalized = query.trim();
+    const normalizedPubkey = normalizeNostrPubkey(normalized);
     const existing = contacts.value.find((contact) => {
+      const contactPubkey = normalizeNostrPubkey(contact.pubkey);
       return (
         contact.id.toLowerCase() === normalized.toLowerCase() ||
         contact.handle.toLowerCase() === normalized.toLowerCase() ||
         contact.pubkey.toLowerCase() === normalized.toLowerCase() ||
+        (!!normalizedPubkey && !!contactPubkey && contactPubkey === normalizedPubkey) ||
         contact.name.toLowerCase() === normalized.toLowerCase()
       );
     });
@@ -4658,9 +4661,16 @@ export function useChatShell() {
     const slug = buildCircleSlug(normalized || "lookup");
     const inferredName = normalized.startsWith("@")
       ? normalized.slice(1)
-      : normalized.includes("://")
-        ? normalized.split("://").slice(-1)[0] ?? normalized
-        : normalized;
+      : normalizedPubkey
+        ? `remote ${normalizedPubkey.slice(0, 6)}`
+        : normalized.includes("://")
+          ? normalized.split("://").slice(-1)[0] ?? normalized
+          : normalized;
+    const canonicalLookupPubkey = normalizedPubkey
+      ? normalized.toLowerCase().startsWith("npub")
+        ? normalized.toLowerCase()
+        : normalizedPubkey
+      : "";
     const contact: ContactItem = {
       id: `lookup-${slug}-${Date.now()}`,
       name: inferredName
@@ -4670,10 +4680,7 @@ export function useChatShell() {
         .join(" ") || "Remote Contact",
       initials: buildInitials(inferredName),
       handle: normalized.startsWith("@") ? normalized.toLowerCase() : `@${slug}`,
-      pubkey:
-        normalized.startsWith("npub") || /^[a-f0-9]{32,}$/i.test(normalized)
-          ? normalized
-          : `lookup:${slug}`,
+      pubkey: canonicalLookupPubkey || `lookup:${slug}`,
       subtitle: "Imported from lookup",
       bio: `Created locally from lookup query \`${normalized}\`.`,
       online: false,

@@ -104,8 +104,9 @@ export function normalizeNostrPubkey(value?: string | null) {
     return "";
   }
 
-  if (/^[a-f0-9]{64}$/.test(normalized)) {
-    return normalized;
+  const normalizedHex = normalized.replace(/^0x/i, "");
+  if (/^[a-f0-9]{64}$/.test(normalizedHex)) {
+    return normalizedHex;
   }
 
   const decoded = bech32Decode(normalized);

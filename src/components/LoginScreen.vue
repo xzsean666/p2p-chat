@@ -113,6 +113,15 @@ const PRIVATE_PLAN_OPTIONS = [
   },
 ] as const;
 
+function hasTauriRuntime() {
+  const globalWindow = globalThis as typeof globalThis & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  };
+
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in globalWindow || "__TAURI__" in globalWindow);
+}
+
 const currentSlide = ref(0);
 const currentStep = ref(0);
 const selectedMethod = ref<LoginMethod>("quickStart");
@@ -134,6 +143,10 @@ const selectedPrivatePlanId = ref<PrivatePlanId>("family");
 const selectedPrivateBilling = ref<PrivateBillingPeriod>("yearly");
 const loginPreparationBusy = ref(false);
 const loginPreparationError = ref("");
+const isNativeDesktopRuntime = hasTauriRuntime();
+const quickStartProfileSubtitle = isNativeDesktopRuntime
+  ? "Enter your name to get started. A standard local Nostr account is created automatically and its private key can be exported later from Settings."
+  : "Enter your name to get started. This browser preview only prepares a temporary session. Launch the Tauri desktop shell to generate and export a real local Nostr private key.";
 
 const seededName = splitName(props.profile.name);
 const firstName = ref(seededName.first);
@@ -1121,10 +1134,7 @@ function submit() {
           <section class="page-section profile-section">
             <div class="page-copy centered-copy">
               <h2 class="page-title">Create Your Profile</h2>
-              <p class="page-subtitle">
-                Enter your name to get started. A standard local Nostr account is created automatically and its private
-                key can be exported later from Settings.
-              </p>
+              <p class="page-subtitle">{{ quickStartProfileSubtitle }}</p>
             </div>
 
             <button type="button" class="avatar-preview" aria-label="Select avatar" @click="openAvatarPicker">

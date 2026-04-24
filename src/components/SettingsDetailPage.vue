@@ -57,6 +57,15 @@ const emit = defineEmits<{
   (event: "forget-restorable-circle", relay: string): void;
 }>();
 
+function hasTauriRuntime() {
+  const globalWindow = globalThis as typeof globalThis & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  };
+
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in globalWindow || "__TAURI__" in globalWindow);
+}
+
 const copyFeedback = ref("");
 const authRuntimeErrorDraft = ref("");
 const authRuntimeClientUri = ref<AuthRuntimeClientUriSummary | null>(null);
@@ -65,6 +74,7 @@ const authRuntimeClientUriLoading = ref(false);
 const localAccountSecretSummary = ref<LocalAccountSecretSummary | null>(null);
 const localAccountSecretError = ref("");
 const localAccountSecretLoading = ref(false);
+const isNativeDesktopRuntime = hasTauriRuntime();
 let authRuntimeClientUriRequestSerial = 0;
 let localAccountSecretRequestSerial = 0;
 
@@ -192,6 +202,62 @@ const supportsLocalAccountSecretExport = computed(() => {
     props.authSession?.access.kind === "nsec" ||
     props.authSession?.access.kind === "hexKey"
   );
+});
+
+const authRuntimeSourceLabel = computed(() => {
+  if (!props.authRuntime) {
+    return "";
+  }
+
+  if (props.authRuntime.persistedInNativeStore) {
+    return "native store";
+  }
+
+  return isNativeDesktopRuntime ? "local fallback" : "preview session";
+});
+
+const localCredentialStatusLabel = computed(() => {
+  if (!props.authRuntime) {
+    return "";
+  }
+
+  if (props.authRuntime.credentialPersistedInNativeStore) {
+    return "native credential store";
+  }
+
+  return isNativeDesktopRuntime
+    ? "missing from native credential store"
+    : "preview session only; no generated local credential";
+});
+
+const sendStatusLabel = computed(() => {
+  if (!props.authRuntime) {
+    return "";
+  }
+
+  if (!props.authRuntime.canSendMessages) {
+    return "blocked";
+  }
+
+  return isNativeDesktopRuntime ? "available in current session" : "available in current preview session";
+});
+
+const privateKeyExportNote = computed(() => {
+  if (!props.authSession) {
+    return "";
+  }
+
+  if (!isNativeDesktopRuntime) {
+    return props.authSession.loginMethod === "quickStart"
+      ? "Get Started in this browser preview only created a temporary session placeholder. Launch the Tauri desktop shell to generate, persist, and back up a real local Nostr private key."
+      : "This preview session is not backed by a desktop native private key. Private key export only works in the Tauri desktop shell.";
+  }
+
+  return props.authSession.loginMethod === "quickStart"
+    ? props.authSession.access.kind === "localProfile"
+      ? "This legacy Quick Start session still runs as a local profile. Export the generated private key if you want to keep it."
+      : "Get Started created a standard local Nostr account on this device. Back up the private key before changing devices."
+    : "This session has a locally stored private key. Export it only if you intend to back it up.";
 });
 
 const authRuntimeSyncLabel = computed(() => {
@@ -585,7 +651,9 @@ watch(
 
       localAccountSecretSummary.value = summary;
       if (!summary) {
-        localAccountSecretError.value = "Local private key export is unavailable for this session.";
+        localAccountSecretError.value = isNativeDesktopRuntime
+          ? "Local private key export is unavailable for this session."
+          : "Local private key export is only available in the Tauri desktop shell.";
       }
     } catch (error) {
       if (requestSerial !== localAccountSecretRequestSerial) {
@@ -1158,7 +1226,7 @@ watch(
           </div>
           <div v-if="authRuntime" class="info-row">
             <strong>Auth Runtime Source</strong>
-            <p>{{ authRuntime.persistedInNativeStore ? "native store" : "local fallback" }}</p>
+            <p>{{ authRuntimeSourceLabel }}</p>
           </div>
           <div
             v-if="
@@ -1168,17 +1236,11 @@ watch(
             class="info-row"
           >
             <strong>Local Credential</strong>
-            <p>
-              {{
-                authRuntime.credentialPersistedInNativeStore
-                  ? 'native credential store'
-                  : 'missing from native credential store'
-              }}
-            </p>
+            <p>{{ localCredentialStatusLabel }}</p>
           </div>
           <div v-if="authRuntime" class="info-row">
             <strong>Send Status</strong>
-            <p>{{ authRuntime.canSendMessages ? "available in current session" : "blocked" }}</p>
+            <p>{{ sendStatusLabel }}</p>
           </div>
           <div v-if="authRuntime?.sendBlockedReason" class="info-row">
             <strong>Send Gate Reason</strong>
@@ -1264,15 +1326,7 @@ watch(
           <div v-if="supportsLocalAccountSecretExport" class="info-row auth-runtime-controls">
             <strong>Private Key Export</strong>
             <div class="auth-runtime-panel">
-              <p class="runtime-note">
-                {{
-                  authSession?.loginMethod === "quickStart"
-                    ? authSession?.access.kind === "localProfile"
-                      ? "This legacy Quick Start session still runs as a local profile. Export the generated private key if you want to keep it."
-                      : "Get Started created a standard local Nostr account on this device. Back up the private key before changing devices."
-                    : "This session has a locally stored private key. Export it only if you intend to back it up."
-                }}
-              </p>
+              <p class="runtime-note">{{ privateKeyExportNote }}</p>
               <p v-if="localAccountSecretLoading" class="runtime-note">Loading local private key...</p>
               <template v-else-if="localAccountSecretSummary">
                 <p class="runtime-note">

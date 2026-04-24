@@ -433,7 +433,8 @@ function truncateAuthRuntimeBindingEndpoint(value: string) {
 
 function normalizeHexXOnlyPublicKey(value: string) {
   const trimmed = value.trim();
-  return /^[a-f0-9]{64}$/i.test(trimmed) ? trimmed.toLowerCase() : "";
+  const normalized = trimmed.replace(/^0x/i, "");
+  return /^[a-f0-9]{64}$/i.test(normalized) ? normalized.toLowerCase() : "";
 }
 
 function normalizeRelayUrl(value: string) {

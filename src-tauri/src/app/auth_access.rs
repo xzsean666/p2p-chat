@@ -382,10 +382,7 @@ fn encode_secret_key_hex(secret_key: &SecretKey) -> String {
 }
 
 fn parse_secret_key_hex_input(value: &str, error_message: String) -> Result<SecretKey, String> {
-    let normalized = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
+    let normalized = strip_hex_prefix(value);
     SecretKey::from_str(normalized).map_err(|_| error_message)
 }
 
@@ -470,7 +467,7 @@ fn canonical_hex_xonly_public_key(value: &str) -> Result<String, String> {
 }
 
 fn decode_hex_32_bytes(value: &str) -> Result<[u8; 32], String> {
-    let trimmed = value.trim();
+    let trimmed = strip_hex_prefix(value.trim());
     if trimmed.len() != 64 {
         return Err("invalid 32-byte hex string".into());
     }
@@ -494,6 +491,13 @@ fn decode_hex_nibble(value: u8) -> Result<u8, String> {
 
 fn encode_lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn strip_hex_prefix(value: &str) -> &str {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value)
 }
 
 fn mask_value(value: &str, prefix: usize, suffix: usize) -> Option<String> {
@@ -719,6 +723,27 @@ mod tests {
             )),
         })
         .expect("bunker uri should resolve")
+        .expect("binding should be present");
+
+        assert!(matches!(binding.access_kind, LoginAccessKind::Bunker));
+        assert_eq!(binding.connection_pubkey, pubkey);
+        assert_eq!(binding.endpoint, "wss://relay.example.com");
+        assert_eq!(binding.relay_count, 2);
+        assert!(!binding.has_secret);
+        assert!(binding.requested_permissions.is_empty());
+        assert!(binding.client_name.is_none());
+    }
+
+    #[test]
+    fn resolves_bunker_auth_runtime_binding_summary_from_0x_prefixed_pubkey() {
+        let pubkey = valid_binding_pubkey_hex();
+        let binding = resolve_auth_runtime_binding(&LoginAccessInput {
+            kind: LoginAccessKind::Bunker,
+            value: Some(format!(
+                "bunker://0x{pubkey}?relay=wss://relay.example.com&relay=wss://backup.example.com"
+            )),
+        })
+        .expect("0x-prefixed bunker uri should resolve")
         .expect("binding should be present");
 
         assert!(matches!(binding.access_kind, LoginAccessKind::Bunker));
