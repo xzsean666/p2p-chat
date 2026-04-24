@@ -1,7 +1,8 @@
 use crate::app::shell_auth;
 use crate::domain::chat::{
-    ChatDomainSeed, CircleStatus, CircleType, MergeRemoteMessagesInput, MessageAuthor,
-    MessageDeliveryStatus, MessageItem, MessageSyncSource, RemoteDeliveryReceipt, SessionKind,
+    ChatDomainSeed, CircleStatus, CircleType, ContactItem, MergeRemoteMessagesInput, MessageAuthor,
+    MessageDeliveryStatus, MessageItem, MessageSyncSource, RemoteDeliveryReceipt, SessionItem,
+    SessionKind,
 };
 use crate::domain::chat_repository::{
     apply_change_set_to_seed, build_remote_delivery_receipt_change_set,
@@ -580,6 +581,10 @@ fn relay_sync_filters(
         });
     }
     if let Some(current_user_pubkey) = current_user_pubkey.as_ref() {
+        filters.push(TransportRelaySyncFilter {
+            authors: Vec::new(),
+            tagged_pubkeys: vec![current_user_pubkey.clone()],
+        });
         if !direct_contact_pubkeys.is_empty() {
             filters.push(TransportRelaySyncFilter {
                 authors: vec![current_user_pubkey.clone()],
@@ -1037,7 +1042,7 @@ fn apply_transport_chat_effects(
 }
 
 fn route_remote_message_merges(
-    seed: &ChatDomainSeed,
+    seed: &mut ChatDomainSeed,
     merge: &MergeRemoteMessagesInput,
     current_user_pubkey: Option<&str>,
 ) -> Vec<MergeRemoteMessagesInput> {
@@ -1050,6 +1055,14 @@ fn route_remote_message_merges(
         let target_session_id = existing_message_session_id(seed, &normalized_message)
             .or_else(|| {
                 resolve_remote_message_target_session(
+                    seed,
+                    &merge.session_id,
+                    &normalized_message,
+                    current_user_pubkey,
+                )
+            })
+            .or_else(|| {
+                ensure_direct_peer_message_target_session(
                     seed,
                     &merge.session_id,
                     &normalized_message,
@@ -1250,6 +1263,173 @@ fn resolve_direct_peer_message_target_session(
     } else {
         None
     }
+}
+
+fn ensure_direct_peer_message_target_session(
+    seed: &mut ChatDomainSeed,
+    fallback_session_id: &str,
+    message: &MessageItem,
+    current_user_pubkey: Option<&str>,
+) -> Option<String> {
+    if !matches!(message.author, MessageAuthor::Peer)
+        || !matches!(message.sync_source, Some(MessageSyncSource::Relay))
+    {
+        return None;
+    }
+
+    let sender_pubkey = message_sender_pubkey(message)?;
+    let current_user_pubkey = current_user_pubkey.and_then(normalize_nostr_pubkey)?;
+    let tagged_pubkeys = tagged_pubkeys_for_remote_message(message);
+    if raw_p_tag_count_for_remote_message(message) != 1
+        || tagged_pubkeys.len() != 1
+        || !tagged_pubkeys.contains(&current_user_pubkey)
+    {
+        return None;
+    }
+
+    let fallback_circle_id = seed
+        .sessions
+        .iter()
+        .find(|session| session.id == fallback_session_id)
+        .map(|session| session.circle_id.clone())?;
+    let matching_contact_ids = seed
+        .contacts
+        .iter()
+        .filter_map(|contact| {
+            normalize_nostr_pubkey(&contact.pubkey)
+                .filter(|pubkey| pubkey == &sender_pubkey)
+                .map(|_| contact.id.clone())
+        })
+        .collect::<Vec<_>>();
+    let contact_id = match matching_contact_ids.as_slice() {
+        [contact_id] => contact_id.clone(),
+        [] => {
+            let contact = build_auto_direct_contact(seed, &sender_pubkey);
+            let contact_id = contact.id.clone();
+            seed.contacts.push(contact);
+            contact_id
+        }
+        _ => return None,
+    };
+    let matching_session_indices = seed
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            session.circle_id == fallback_circle_id
+                && matches!(session.kind, SessionKind::Direct)
+                && session.contact_id.as_deref() == Some(contact_id.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    match matching_session_indices.as_slice() {
+        [index] => {
+            let session = seed.sessions.get_mut(*index)?;
+            session.archived = Some(false);
+            Some(session.id.clone())
+        }
+        [] => {
+            let contact = seed
+                .contacts
+                .iter()
+                .find(|contact| contact.id == contact_id)
+                .cloned()?;
+            let session = build_auto_direct_session(seed, &fallback_circle_id, &contact);
+            let session_id = session.id.clone();
+            seed.sessions.push(session);
+            Some(session_id)
+        }
+        _ => None,
+    }
+}
+
+fn build_auto_direct_contact(seed: &ChatDomainSeed, sender_pubkey: &str) -> ContactItem {
+    let slug = sender_pubkey
+        .chars()
+        .take(12)
+        .collect::<String>()
+        .to_lowercase();
+    let short = sender_pubkey
+        .chars()
+        .take(6)
+        .collect::<String>()
+        .to_uppercase();
+    ContactItem {
+        id: build_unique_contact_id(&format!("relay-contact-{slug}"), &seed.contacts),
+        name: format!("Remote {short}"),
+        initials: build_auto_contact_initials(sender_pubkey),
+        handle: format!("@relay-{slug}"),
+        pubkey: sender_pubkey.into(),
+        ethereum_address: None,
+        subtitle: "Imported from relay".into(),
+        bio: "Auto-created from an inbound relay direct message.".into(),
+        online: Some(false),
+        blocked: Some(false),
+    }
+}
+
+fn build_auto_direct_session(
+    seed: &ChatDomainSeed,
+    circle_id: &str,
+    contact: &ContactItem,
+) -> SessionItem {
+    let session_id = build_unique_session_id(&format!("session-{}", contact.id), &seed.sessions);
+    SessionItem {
+        id: session_id,
+        circle_id: circle_id.into(),
+        name: contact.name.clone(),
+        initials: contact.initials.clone(),
+        subtitle: "Start a conversation".into(),
+        time: "now".into(),
+        unread_count: None,
+        muted: None,
+        pinned: None,
+        draft: None,
+        kind: SessionKind::Direct,
+        category: "friends".into(),
+        members: None,
+        contact_id: Some(contact.id.clone()),
+        archived: Some(false),
+    }
+}
+
+fn build_auto_contact_initials(sender_pubkey: &str) -> String {
+    let initials = sender_pubkey
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    if initials.is_empty() {
+        "RC".into()
+    } else {
+        initials
+    }
+}
+
+fn build_unique_contact_id(base_id: &str, contacts: &[ContactItem]) -> String {
+    let mut candidate = base_id.to_string();
+    let mut suffix = 2;
+
+    while contacts.iter().any(|contact| contact.id == candidate) {
+        candidate = format!("{base_id}-{suffix}");
+        suffix += 1;
+    }
+
+    candidate
+}
+
+fn build_unique_session_id(base_id: &str, sessions: &[SessionItem]) -> String {
+    let mut candidate = base_id.to_string();
+    let mut suffix = 2;
+
+    while sessions.iter().any(|session| session.id == candidate) {
+        candidate = format!("{base_id}-{suffix}");
+        suffix += 1;
+    }
+
+    candidate
 }
 
 fn resolve_direct_self_message_target_session(
@@ -3024,6 +3204,10 @@ mod tests {
             tagged_pubkeys: Vec::new(),
         }));
         assert!(filters.contains(&TransportRelaySyncFilter {
+            authors: Vec::new(),
+            tagged_pubkeys: vec![current_user_pubkey.clone()],
+        }));
+        assert!(filters.contains(&TransportRelaySyncFilter {
             authors: vec![current_user_pubkey.clone()],
             tagged_pubkeys: vec![direct_pubkey],
         }));
@@ -3486,6 +3670,67 @@ mod tests {
     }
 
     #[test]
+    fn apply_transport_chat_effects_auto_creates_direct_session_for_unknown_sender() {
+        let sender_pubkey = valid_sender_pubkey_hex();
+        let current_user_pubkey =
+            valid_pubkey_hex("9999999999999999999999999999999999999999999999999999999999999999");
+        let mut seed = seed(CircleStatus::Open, "18 ms");
+        seed.sessions
+            .push(direct_session("session-primary", "circle-1"));
+        let mut inbound_message = inbound_relay_message(
+            "relay-event-new-direct-1",
+            &sender_pubkey,
+            "hello from a brand new relay contact",
+        );
+        inbound_message
+            .signed_nostr_event
+            .as_mut()
+            .expect("relay message should have signed event")
+            .tags = vec![vec!["p".into(), current_user_pubkey.clone()]];
+
+        let changed = apply_transport_chat_effects(
+            &mut seed,
+            &TransportChatEffects {
+                remote_message_merges: vec![MergeRemoteMessagesInput {
+                    session_id: "session-primary".into(),
+                    messages: vec![inbound_message],
+                }],
+                ..TransportChatEffects::default()
+            },
+            Some(current_user_pubkey.as_str()),
+        )
+        .expect("chat effects apply");
+
+        assert!(changed);
+        assert_eq!(seed.contacts.len(), 1);
+        let contact = seed.contacts.first().expect("missing auto-created contact");
+        assert_eq!(contact.pubkey, sender_pubkey);
+        assert_eq!(contact.subtitle, "Imported from relay");
+        let session = seed
+            .sessions
+            .iter()
+            .find(|session| {
+                session.id != "session-primary"
+                    && session.circle_id == "circle-1"
+                    && matches!(session.kind, SessionKind::Direct)
+                    && session.contact_id.as_deref() == Some(contact.id.as_str())
+            })
+            .expect("missing auto-created direct session");
+        let routed_messages = seed
+            .message_store
+            .get(&session.id)
+            .expect("auto-created direct session should receive routed message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-event-new-direct-1");
+        assert_eq!(session.subtitle, "hello from a brand new relay contact");
+        assert_eq!(session.unread_count, Some(1));
+        assert!(seed
+            .message_store
+            .get("session-primary")
+            .map_or(true, |messages| messages.is_empty()));
+    }
+
+    #[test]
     fn apply_transport_chat_effects_routes_peer_reply_and_reconciles_local_direct_receipt() {
         let peer_pubkey = valid_sender_pubkey_hex();
         let current_user_pubkey =
@@ -3619,7 +3864,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_transport_chat_effects_drops_unroutable_peer_message_across_circles() {
+    fn apply_transport_chat_effects_creates_direct_session_in_current_circle_when_contact_exists_elsewhere(
+    ) {
         let sender_pubkey = valid_sender_pubkey_hex();
         let current_user_pubkey =
             valid_pubkey_hex("9999999999999999999999999999999999999999999999999999999999999999");
@@ -3663,7 +3909,7 @@ mod tests {
         )
         .expect("chat effects apply");
 
-        assert!(!changed);
+        assert!(changed);
         assert!(seed
             .message_store
             .get("session-primary")
@@ -3672,6 +3918,22 @@ mod tests {
             .message_store
             .get("session-alice-circle-2")
             .map_or(true, |messages| messages.is_empty()));
+        let circle_1_session = seed
+            .sessions
+            .iter()
+            .find(|session| {
+                session.id != "session-primary"
+                    && session.id != "session-alice-circle-2"
+                    && session.circle_id == "circle-1"
+                    && session.contact_id.as_deref() == Some("alice-contact")
+            })
+            .expect("current circle should get a direct session for the known contact");
+        let routed_messages = seed
+            .message_store
+            .get(&circle_1_session.id)
+            .expect("newly created current-circle session should receive message");
+        assert_eq!(routed_messages.len(), 1);
+        assert_eq!(routed_messages[0].id, "relay-event-2");
     }
 
     #[test]
@@ -4586,6 +4848,168 @@ mod tests {
             .expect("missing alice direct session");
         assert_eq!(alice_session.subtitle, bob_body);
         assert_eq!(alice_session.unread_count, Some(1));
+    }
+
+    #[test]
+    fn local_signed_direct_messages_bootstrap_unknown_contact_on_first_inbound_message() {
+        const ALICE_SECRET_KEY_HEX: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        const BOB_SECRET_KEY_HEX: &str =
+            "2222222222222222222222222222222222222222222222222222222222222222";
+        let alice_pubkey = valid_pubkey_hex(ALICE_SECRET_KEY_HEX);
+        let bob_pubkey = valid_pubkey_hex(BOB_SECRET_KEY_HEX);
+        let alice_body = "Hi Bob, this is the first message before you add me.";
+        let bob_body = "Received without pre-adding. Reply path also works.";
+
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let mut alice_seed = seed(CircleStatus::Open, "18 ms");
+        alice_seed
+            .contacts
+            .push(contact("bob-contact", &bob_pubkey));
+        alice_seed.sessions.push(direct_session_with_contact(
+            "session-bob",
+            "circle-1",
+            "bob-contact",
+        ));
+        alice_seed
+            .sessions
+            .push(self_session("fallback-alice", "circle-1"));
+        save_seed_to_store(app_handle, alice_seed);
+        seed_authenticated_local_secret_runtime_with_secret_key(
+            app_handle,
+            "session-bob",
+            ALICE_SECRET_KEY_HEX,
+        );
+
+        let alice_sent_seed = chat_mutations::send_message(
+            app_handle,
+            SendMessageInput {
+                session_id: "session-bob".into(),
+                body: alice_body.into(),
+                reply_to_message_id: None,
+            },
+        )
+        .expect("alice should send a signed direct message");
+        let alice_sent_message = alice_sent_seed
+            .message_store
+            .get("session-bob")
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("alice outbound message should persist");
+        let alice_remote_id = alice_sent_message
+            .remote_id
+            .clone()
+            .expect("alice signed message should have remote id");
+        let alice_seed_after_send = load_seed_from_store(app_handle);
+
+        let mut bob_seed = seed(CircleStatus::Open, "18 ms");
+        bob_seed
+            .sessions
+            .push(self_session("fallback-bob", "circle-1"));
+        save_seed_to_store(app_handle, bob_seed);
+        seed_authenticated_local_secret_runtime_with_secret_key(
+            app_handle,
+            "fallback-bob",
+            BOB_SECRET_KEY_HEX,
+        );
+
+        let mut bob_received_seed = load_seed_from_store(app_handle);
+        let bob_changed = apply_transport_chat_effects(
+            &mut bob_received_seed,
+            &TransportChatEffects {
+                remote_message_merges: vec![MergeRemoteMessagesInput {
+                    session_id: "fallback-bob".into(),
+                    messages: vec![relay_copy_of_signed_local_message(&alice_sent_message)],
+                }],
+                ..TransportChatEffects::default()
+            },
+            Some(bob_pubkey.as_str()),
+        )
+        .expect("bob should merge alice's signed relay message");
+        assert!(bob_changed);
+        assert!(bob_received_seed
+            .message_store
+            .get("fallback-bob")
+            .map_or(true, |messages| messages.is_empty()));
+        let bob_contact = bob_received_seed
+            .contacts
+            .iter()
+            .find(|contact| contact.pubkey == alice_pubkey)
+            .cloned()
+            .expect("bob should auto-create alice contact from relay");
+        let bob_session = bob_received_seed
+            .sessions
+            .iter()
+            .find(|session| {
+                matches!(session.kind, SessionKind::Direct)
+                    && session.contact_id.as_deref() == Some(bob_contact.id.as_str())
+            })
+            .cloned()
+            .expect("bob should auto-create direct session from relay");
+        let bob_received_message = bob_received_seed
+            .message_store
+            .get(&bob_session.id)
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("bob should receive alice's routed direct message");
+        assert_eq!(bob_received_message.id, alice_remote_id);
+        assert_eq!(bob_session.subtitle, alice_body);
+        assert_eq!(bob_session.unread_count, Some(1));
+        save_seed_to_store(app_handle, bob_received_seed);
+
+        let bob_reply_seed = chat_mutations::send_message(
+            app_handle,
+            SendMessageInput {
+                session_id: bob_session.id.clone(),
+                body: bob_body.into(),
+                reply_to_message_id: Some(bob_received_message.id.clone()),
+            },
+        )
+        .expect("bob should reply from the auto-created direct session");
+        let bob_reply_message = bob_reply_seed
+            .message_store
+            .get(&bob_session.id)
+            .and_then(|messages| messages.last())
+            .cloned()
+            .expect("bob reply should persist");
+        let bob_reply_remote_id = bob_reply_message
+            .remote_id
+            .clone()
+            .expect("bob signed reply should have remote id");
+
+        save_seed_to_store(app_handle, alice_seed_after_send);
+        seed_authenticated_local_secret_runtime_with_secret_key(
+            app_handle,
+            "session-bob",
+            ALICE_SECRET_KEY_HEX,
+        );
+
+        let mut alice_received_seed = load_seed_from_store(app_handle);
+        let alice_changed = apply_transport_chat_effects(
+            &mut alice_received_seed,
+            &TransportChatEffects {
+                remote_message_merges: vec![MergeRemoteMessagesInput {
+                    session_id: "fallback-alice".into(),
+                    messages: vec![relay_copy_of_signed_local_message(&bob_reply_message)],
+                }],
+                ..TransportChatEffects::default()
+            },
+            Some(alice_pubkey.as_str()),
+        )
+        .expect("alice should merge bob's signed relay reply");
+        assert!(alice_changed);
+        let alice_messages = alice_received_seed
+            .message_store
+            .get("session-bob")
+            .expect("alice direct session should keep both messages");
+        assert_eq!(alice_messages.len(), 2);
+        assert!(alice_messages.iter().any(|message| {
+            message.remote_id.as_deref() == Some(bob_reply_remote_id.as_str())
+                && matches!(message.author, MessageAuthor::Peer)
+                && matches!(message.sync_source, Some(MessageSyncSource::Relay))
+        }));
     }
 
     #[test]

@@ -5341,6 +5341,8 @@ export function useChatShell() {
         return "wss://nos.lol";
       case "primal":
         return "wss://relay.primal.net";
+      case "nostrnet":
+        return "wss://relay.nostr.net";
       case "yabu":
         return "wss://yabu.me";
       case "nostrband":

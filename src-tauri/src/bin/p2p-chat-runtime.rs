@@ -2612,6 +2612,10 @@ mod tests {
                 tagged_pubkeys: Vec::new(),
             },
             TransportRelaySyncFilter {
+                authors: Vec::new(),
+                tagged_pubkeys: vec!["current-user".into()],
+            },
+            TransportRelaySyncFilter {
                 authors: vec!["group-author-a".into(), "group-author-b".into()],
                 tagged_pubkeys: vec!["group-author-a".into(), "group-author-b".into()],
             },
@@ -2623,6 +2627,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("relay should receive req frame");
         assert!(req_payload.contains("\"authors\":[\"direct-author\"]"));
+        assert!(req_payload.contains("\"#p\":[\"current-user\"]"));
         assert!(req_payload.contains("\"authors\":[\"group-author-a\",\"group-author-b\"]"));
         assert!(req_payload.contains("\"#p\":[\"group-author-a\",\"group-author-b\"]"));
         server_handle

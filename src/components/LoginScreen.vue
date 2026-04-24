@@ -73,6 +73,7 @@ const PUBLIC_RELAY_SHORTCUTS = {
   damus: "wss://relay.damus.io",
   nos: "wss://nos.lol",
   primal: "wss://relay.primal.net",
+  nostrnet: "wss://relay.nostr.net",
   yabu: "wss://yabu.me",
   nostrband: "wss://relay.nostr.band",
 } as const;
@@ -793,7 +794,7 @@ function selectCircleMode(mode: CircleSelectionMode) {
 
 function openCircleSheet(mode: CircleSheetMode) {
   if (mode === "custom" && !customRelay.value.trim()) {
-    customRelay.value = normalizeRelayLikeValue("damus");
+    customRelay.value = normalizeRelayLikeValue("nos");
   }
 
   circleMode.value = mode;
@@ -1275,9 +1276,10 @@ function submit() {
 
               <p class="section-footnote sheet-footnote">
                 You can enter a full URL (e.g., <code>wss://relay.example.com</code>) or use a shortcut like
-                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('0xchat')">{{ PUBLIC_RELAY_SHORTCUTS["0xchat"] }}</button>
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('nos')">{{ PUBLIC_RELAY_SHORTCUTS.nos }}</button>,
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('primal')">{{ PUBLIC_RELAY_SHORTCUTS.primal }}</button>,
                 or
-                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('damus')">{{ PUBLIC_RELAY_SHORTCUTS.damus }}</button>.
+                <button type="button" class="inline-relay-shortcut" @click="applyRelaySuggestion('nostrnet')">{{ PUBLIC_RELAY_SHORTCUTS.nostrnet }}</button>.
               </p>
             </template>
           </div>
