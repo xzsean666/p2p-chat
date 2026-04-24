@@ -100,7 +100,7 @@ pnpm android:release
 
 - `pnpm android:keystore` 默认生成 `.local/android-upload.keystore`，alias 默认是 `upload`。
 - `pnpm android:release` 首次发现 keystore 不存在时，会自动创建 `.local/android-upload.keystore`。
-- `pnpm android:release` 会把最新签名后的 APK 复制到 `release/`，同时保留版本化文件名和一个稳定的 `latest` 副本。
+- `pnpm android:release` 会把最新签名后的 APK 复制到 `release/`，同时保留版本化文件名和一个稳定的 `latest` 副本；如果 Gradle 只产出 `*-unsigned.apk`，脚本会继续用本地 keystore 自动做 `zipalign + apksigner`。
 
 最小可执行流程（Debian/Ubuntu）：
 

@@ -412,7 +412,7 @@ source "$HOME/.cargo/env"
 pnpm android:release
 ```
 
-它会在首次缺少 keystore 时自动创建 `.local/android-upload.keystore`，并把签名后的 APK 复制到 `release/`。
+它会在首次缺少 keystore 时自动创建 `.local/android-upload.keystore`，并把签名后的 APK 复制到 `release/`；如果 Gradle 只产出 `*-unsigned.apk`，包装脚本会继续用本地 keystore 自动补做 `zipalign + apksigner`。
 
 构建默认 APK：
 

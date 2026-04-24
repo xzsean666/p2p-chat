@@ -16,6 +16,7 @@ RELEASE_DIR="${ANDROID_RELEASE_DIR:-$DEFAULT_RELEASE_DIR}"
 BUILD_TARGET="${ANDROID_BUILD_TARGET:-$DEFAULT_BUILD_TARGET}"
 STORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-${TAURI_ANDROID_KEYSTORE_PASSWORD:-}}"
 KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-${TAURI_ANDROID_KEY_PASSWORD:-}}"
+TMP_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -35,6 +36,86 @@ Environment variables:
   ANDROID_RELEASE_DIR
   ANDROID_BUILD_TARGET
 EOF
+}
+
+resolve_android_sdk_root() {
+  local candidate=""
+
+  if [[ -n "${ANDROID_SDK_ROOT:-}" && -d "${ANDROID_SDK_ROOT}" ]]; then
+    candidate="${ANDROID_SDK_ROOT}"
+  elif [[ -n "${ANDROID_HOME:-}" && -d "${ANDROID_HOME}" ]]; then
+    candidate="${ANDROID_HOME}"
+  elif [[ -d "${HOME}/Android/Sdk" ]]; then
+    candidate="${HOME}/Android/Sdk"
+  fi
+
+  [[ -n "${candidate}" ]] || return 1
+
+  export ANDROID_HOME="${candidate}"
+  export ANDROID_SDK_ROOT="${candidate}"
+}
+
+find_android_build_tool() {
+  local tool_name="$1"
+  local latest=""
+  local candidate=""
+
+  if command -v "${tool_name}" >/dev/null 2>&1; then
+    command -v "${tool_name}"
+    return 0
+  fi
+
+  resolve_android_sdk_root || return 1
+  [[ -d "${ANDROID_SDK_ROOT}/build-tools" ]] || return 1
+
+  while IFS= read -r candidate; do
+    [[ -x "${candidate}" ]] || continue
+    latest="${candidate}"
+  done < <(find "${ANDROID_SDK_ROOT}/build-tools" -mindepth 2 -maxdepth 2 -type f -name "${tool_name}" | sort -V)
+
+  [[ -n "${latest}" ]] || return 1
+  printf '%s\n' "${latest}"
+}
+
+find_latest_apk() {
+  local mode="$1"
+  local find_expr=()
+
+  case "${mode}" in
+    signed)
+      find_expr=(-name '*.apk' ! -name '*unsigned.apk')
+      ;;
+    unsigned)
+      find_expr=(-name '*unsigned.apk')
+      ;;
+    *)
+      printf 'Unsupported APK search mode: %s\n' "${mode}" >&2
+      exit 1
+      ;;
+  esac
+
+  find "${PROJECT_ROOT}/src-tauri/gen/android/app/build/outputs/apk" -type f "${find_expr[@]}" -printf '%T@ %p\n' \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2-
+}
+
+sign_unsigned_apk() {
+  local unsigned_apk="$1"
+  local signed_apk="$2"
+  local zipalign_bin="$3"
+  local apksigner_bin="$4"
+  local aligned_apk="${TMP_DIR}/aligned.apk"
+
+  "${zipalign_bin}" -f -p 4 "${unsigned_apk}" "${aligned_apk}"
+  "${apksigner_bin}" sign \
+    --ks "${KEYSTORE_PATH}" \
+    --ks-key-alias "${KEY_ALIAS}" \
+    --ks-pass "pass:${STORE_PASSWORD}" \
+    --key-pass "pass:${KEY_PASSWORD}" \
+    --out "${signed_apk}" \
+    "${aligned_apk}"
+  "${apksigner_bin}" verify "${signed_apk}" >/dev/null
 }
 
 while [[ $# -gt 0 ]]; do
@@ -76,6 +157,14 @@ if ! command -v sha256sum >/dev/null 2>&1; then
   printf 'sha256sum not found in PATH\n' >&2
   exit 1
 fi
+
+cleanup() {
+  if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
+    rm -rf "${TMP_DIR}"
+  fi
+}
+
+trap cleanup EXIT
 
 APP_NAME="$(
   node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log((pkg.name || "app").replace(/[^A-Za-z0-9._-]+/g, "-"));' \
@@ -128,22 +217,41 @@ TAURI_ANDROID_KEYSTORE_PASSWORD="${STORE_PASSWORD}" \
 TAURI_ANDROID_KEY_PASSWORD="${KEY_PASSWORD}" \
   bash "${PROJECT_ROOT}/scripts/build-android-apk.sh" --apk --target "${BUILD_TARGET}"
 
-SIGNED_APK="$(
-  find "${PROJECT_ROOT}/src-tauri/gen/android/app/build/outputs/apk" -type f -name '*.apk' ! -name '*unsigned.apk' -printf '%T@ %p\n' \
-    | sort -nr \
-    | head -n 1 \
-    | cut -d' ' -f2-
-)"
-
-if [[ -z "${SIGNED_APK}" || ! -f "${SIGNED_APK}" ]]; then
-  printf 'Signed APK not found after build\n' >&2
-  exit 1
-fi
-
 mkdir -p "${RELEASE_DIR}"
 
 FINAL_APK="${RELEASE_DIR}/${APP_NAME}-v${APP_VERSION}-android-${TARGET_LABEL}-release.apk"
 LATEST_APK="${RELEASE_DIR}/${APP_NAME}-android-release.apk"
+SIGNED_APK="$(find_latest_apk signed)"
+UNSIGNED_APK="$(find_latest_apk unsigned)"
+NEEDS_POST_SIGN=0
+
+if [[ -z "${SIGNED_APK}" || ! -f "${SIGNED_APK}" ]]; then
+  NEEDS_POST_SIGN=1
+elif [[ -n "${UNSIGNED_APK}" && -f "${UNSIGNED_APK}" && "${UNSIGNED_APK}" -nt "${SIGNED_APK}" ]]; then
+  NEEDS_POST_SIGN=1
+fi
+
+if (( NEEDS_POST_SIGN == 1 )); then
+  if [[ -z "${UNSIGNED_APK}" || ! -f "${UNSIGNED_APK}" ]]; then
+    printf 'No APK artifact found after build\n' >&2
+    exit 1
+  fi
+
+  ZIPALIGN_BIN="$(find_android_build_tool zipalign || true)"
+  APKSIGNER_BIN="$(find_android_build_tool apksigner || true)"
+
+  if [[ -z "${ZIPALIGN_BIN}" || -z "${APKSIGNER_BIN}" ]]; then
+    printf 'Signed APK not found after build, and zipalign/apksigner were not found under Android SDK build-tools\n' >&2
+    exit 1
+  fi
+
+  TMP_DIR="$(mktemp -d "${RELEASE_DIR}/.android-sign.XXXXXX")"
+  SIGNED_APK="${TMP_DIR}/signed.apk"
+
+  printf 'Newest APK artifact is unsigned; signing it with local keystore:\n'
+  printf '  %s\n' "${UNSIGNED_APK}"
+  sign_unsigned_apk "${UNSIGNED_APK}" "${SIGNED_APK}" "${ZIPALIGN_BIN}" "${APKSIGNER_BIN}"
+fi
 
 cp -f "${SIGNED_APK}" "${FINAL_APK}"
 cp -f "${FINAL_APK}" "${LATEST_APK}"
