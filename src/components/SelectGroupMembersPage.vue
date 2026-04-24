@@ -32,7 +32,7 @@ const filteredContacts = computed(() => {
         return true;
       }
 
-      return [contact.name, contact.handle, contact.subtitle, contact.bio, contact.pubkey]
+      return [contact.name, contact.handle, contact.subtitle, contact.bio, contact.pubkey, contact.ethereumAddress]
         .join(" ")
         .toLowerCase()
         .includes(value);

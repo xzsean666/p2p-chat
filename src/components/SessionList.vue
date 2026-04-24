@@ -8,7 +8,7 @@ import Menu from "primevue/menu";
 import ScrollPanel from "primevue/scrollpanel";
 import type { MenuItem } from "primevue/menuitem";
 import SelfChatIcon from "./SelfChatIcon.vue";
-import emptyStateImage from "../../tmp/xchat-app-main/packages/business_modules/ox_home/assets/images/empty.png";
+import emptyStateImage from "../assets/empty-state.svg";
 import type { CircleItem, SessionAction, SessionItem } from "../types/chat";
 
 const props = defineProps<{

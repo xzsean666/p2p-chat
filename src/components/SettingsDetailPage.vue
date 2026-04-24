@@ -78,6 +78,8 @@ const isNativeDesktopRuntime = hasTauriRuntime();
 let authRuntimeClientUriRequestSerial = 0;
 let localAccountSecretRequestSerial = 0;
 
+const ethereumAddress = computed(() => localAccountSecretSummary.value?.ethereumAddress?.trim() || "");
+
 const transportMetrics = computed(() => {
   if (!props.transportSnapshot) {
     return null;
@@ -1209,6 +1211,10 @@ watch(
             <strong>Verified Pubkey</strong>
             <p>{{ authRuntime?.pubkey ?? authSession?.access.pubkey }}</p>
           </div>
+          <div v-if="ethereumAddress" class="info-row">
+            <strong>Ethereum Address</strong>
+            <p>{{ ethereumAddress }}</p>
+          </div>
           <div v-if="authSession" class="info-row">
             <strong>Authenticated At</strong>
             <p>{{ authSession.loggedInAt }}</p>
@@ -1332,6 +1338,9 @@ watch(
                 <p class="runtime-note">
                   {{ localAccountSecretSummary.pubkey }} · saved {{ localAccountSecretSummary.storedAt }}
                 </p>
+                <p v-if="localAccountSecretSummary.ethereumAddress" class="runtime-note">
+                  {{ localAccountSecretSummary.ethereumAddress }}
+                </p>
                 <div class="auth-runtime-actions">
                   <Button
                     label="Copy NSEC"
@@ -1346,6 +1355,14 @@ watch(
                     text
                     severity="secondary"
                     @click="copyValue('Hex Key', localAccountSecretSummary.hexKey)"
+                  />
+                  <Button
+                    v-if="localAccountSecretSummary.ethereumAddress"
+                    label="Copy Ethereum Address"
+                    icon="pi pi-wallet"
+                    text
+                    severity="contrast"
+                    @click="copyValue('Ethereum Address', localAccountSecretSummary.ethereumAddress)"
                   />
                 </div>
               </template>

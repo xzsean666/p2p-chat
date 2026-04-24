@@ -1930,6 +1930,7 @@ mod tests {
             initials: "C".into(),
             handle: format!("@{id}"),
             pubkey: pubkey.into(),
+            ethereum_address: None,
             subtitle: "test".into(),
             bio: "test".into(),
             online: Some(false),

@@ -73,6 +73,10 @@ function saveRemark() {
             <span class="label">Public Key</span>
             <code>{{ contact.pubkey }}</code>
           </div>
+          <div v-if="contact.ethereumAddress" class="field-row field-stack">
+            <span class="label">Ethereum Address</span>
+            <code>{{ contact.ethereumAddress }}</code>
+          </div>
           <div class="field-row field-stack">
             <span class="label">Bio</span>
             <p>{{ contact.bio || "No bio available." }}</p>

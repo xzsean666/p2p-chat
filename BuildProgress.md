@@ -1,6 +1,6 @@
 # BuildProgress
 
-更新时间: 2026-04-20
+更新时间: 2026-04-24
 
 ## 当前阶段
 
@@ -157,6 +157,7 @@
 - [x] 将 `Find People / Add Friends` 里的 invite-like 文本分流补成真实 circle 导入分支：聊天模式下输入 `invite / p2pchat / relay / http(s)` 风格链接时，会优先按 circle join 处理而不是错误创建 fake contact；若该入口来自 `New Message`，成功加入后会直接回到新 circle 的建消息页。
 - [x] 为联系人资料页补齐 `Remark` 的真实编辑与持久化：新增 `update_contact_remark` 命令链路、SQLite 持久化与前端本地 fallback，联系人备注现在可在资料页直接保存，也支持清空；联系人选择页会自动省略空备注的多余分隔符。
 - [x] 为 `New Message -> Note to Self` 增加独立确认页，并接入 overlay route/history 栈；现在会先展示当前 circle 作用域与用途，再进入自聊会话，节奏更接近原应用。
+- [x] 将 `web3-wallet` 风格的 Android 本地 keystore / release 包装体验迁入当前仓库：新增 `.local/android-upload.keystore` 生成脚本、`pnpm android:keystore`、`pnpm android:release` 与根目录 `build_apk` 入口；release APK 现在可在首次缺少 keystore 时自动创建本地签名材料，并将最终 APK 复制到 `release/`。
 
 ## 进行中
 

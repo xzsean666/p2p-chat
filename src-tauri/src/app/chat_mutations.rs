@@ -1340,6 +1340,10 @@ fn normalize_nostr_pubkey(value: &str) -> Option<String> {
         .map(|pubkey| pubkey.to_hex())
 }
 
+fn normalize_ethereum_address(value: &str) -> Option<String> {
+    auth_access::canonical_ethereum_address_from_input(value).ok()
+}
+
 fn local_message_created_at(message_id: &str) -> u64 {
     message_id
         .rsplit_once('-')
@@ -1531,6 +1535,7 @@ fn find_contact_for_lookup(seed: &ChatDomainSeed, query: &str) -> Option<Contact
     let trimmed = query.trim();
     let normalized = trimmed.to_lowercase();
     let query_pubkey = normalize_nostr_pubkey(trimmed);
+    let query_ethereum_address = normalize_ethereum_address(trimmed);
 
     seed.contacts.iter().find_map(|contact| {
         let name_matches = contact.name.trim().to_lowercase() == normalized;
@@ -1541,8 +1546,25 @@ fn find_contact_for_lookup(seed: &ChatDomainSeed, query: &str) -> Option<Contact
                 .as_ref()
                 .zip(normalize_nostr_pubkey(&contact.pubkey))
                 .is_some_and(|(query_pubkey, contact_pubkey)| query_pubkey == &contact_pubkey);
+        let contact_ethereum_address = contact
+            .ethereum_address
+            .as_deref()
+            .and_then(normalize_ethereum_address);
+        let ethereum_address_matches = contact
+            .ethereum_address
+            .as_deref()
+            .is_some_and(|address| address.eq_ignore_ascii_case(trimmed))
+            || query_ethereum_address
+                .as_ref()
+                .zip(contact_ethereum_address.as_ref())
+                .is_some_and(|(query_address, contact_address)| query_address == contact_address);
 
-        if name_matches || id_matches || handle_matches || pubkey_matches {
+        if name_matches
+            || id_matches
+            || handle_matches
+            || pubkey_matches
+            || ethereum_address_matches
+        {
             Some(contact.clone())
         } else {
             None
@@ -1554,6 +1576,7 @@ fn build_lookup_contact(seed: &ChatDomainSeed, query: &str) -> ContactItem {
     let trimmed = query.trim();
     let lowered = trimmed.to_lowercase();
     let normalized_pubkey = normalize_nostr_pubkey(trimmed);
+    let normalized_ethereum_address = normalize_ethereum_address(trimmed);
     let slug = build_circle_slug(trimmed);
     let handle = if trimmed.starts_with('@') {
         trimmed.to_lowercase()
@@ -1567,6 +1590,8 @@ fn build_lookup_contact(seed: &ChatDomainSeed, query: &str) -> ContactItem {
             "Remote {}",
             pubkey.chars().take(6).collect::<String>().to_uppercase()
         )
+    } else if let Some(address) = normalized_ethereum_address.as_ref() {
+        format!("Remote {}", address.chars().take(10).collect::<String>())
     } else if trimmed.contains("://") {
         format!(
             "Invite {}",
@@ -1595,6 +1620,7 @@ fn build_lookup_contact(seed: &ChatDomainSeed, query: &str) -> ContactItem {
         initials: build_initials(trimmed),
         handle,
         pubkey,
+        ethereum_address: normalized_ethereum_address,
         subtitle: "Imported from lookup".into(),
         bio: format!("Created locally from lookup query `{trimmed}`."),
         online: Some(false),
@@ -1768,7 +1794,7 @@ fn normalize_custom_circle_relay(value: &str) -> Option<String> {
 fn default_circle_description(circle_type: &CircleType) -> &'static str {
     match circle_type {
         CircleType::Paid => "Private relay shell created from the onboarding flow.",
-        CircleType::Custom => "Custom relay connected from a manually entered endpoint.",
+        CircleType::Custom => "Custom relay configured from a manually entered endpoint.",
         CircleType::Default | CircleType::Bitchat => {
             "Circle imported from an invite handoff and waiting for relay confirmation."
         }
@@ -2098,6 +2124,26 @@ mod tests {
             .find(|contact| contact.id == contact_id)
             .expect("missing contact");
         contact.pubkey = pubkey.into();
+        repository
+            .save_domain_seed(seed)
+            .expect("failed to save domain seed");
+    }
+
+    fn set_contact_ethereum_address(
+        app_handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        contact_id: &str,
+        ethereum_address: &str,
+    ) {
+        let repository = SqliteChatRepository::new(app_handle);
+        let mut seed = repository
+            .load_domain_seed()
+            .expect("failed to load domain seed");
+        let contact = seed
+            .contacts
+            .iter_mut()
+            .find(|contact| contact.id == contact_id)
+            .expect("missing contact");
+        contact.ethereum_address = Some(ethereum_address.into());
         repository
             .save_domain_seed(seed)
             .expect("failed to save domain seed");
@@ -5921,5 +5967,72 @@ mod tests {
             .contacts
             .iter()
             .any(|contact| contact.id.starts_with("lookup-")));
+    }
+
+    #[test]
+    fn start_lookup_conversation_reuses_existing_contact_for_ethereum_address() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+        let ethereum_address = auth_access::derive_ethereum_address_from_secret_key_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .expect("secret key should derive ethereum address");
+        set_contact_ethereum_address(app_handle, "alice-contact", &ethereum_address);
+
+        let result = start_lookup_conversation(
+            app_handle,
+            StartLookupConversationInput {
+                circle_id: "main-circle".into(),
+                query: ethereum_address.to_lowercase(),
+            },
+        )
+        .expect("failed to start lookup conversation from ethereum address");
+
+        let session = result
+            .seed
+            .sessions
+            .iter()
+            .find(|session| session.id == result.session_id)
+            .expect("missing lookup session");
+
+        assert_eq!(session.contact_id.as_deref(), Some("alice-contact"));
+    }
+
+    #[test]
+    fn start_lookup_conversation_creates_contact_from_ethereum_address_lookup() {
+        let guard = test_app();
+        let app_handle = guard.app.handle();
+
+        let result = start_lookup_conversation(
+            app_handle,
+            StartLookupConversationInput {
+                circle_id: "main-circle".into(),
+                query: "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a".into(),
+            },
+        )
+        .expect("failed to start lookup conversation from ethereum address");
+
+        let session = result
+            .seed
+            .sessions
+            .iter()
+            .find(|session| session.id == result.session_id)
+            .expect("missing lookup session");
+        let contact_id = session
+            .contact_id
+            .clone()
+            .expect("lookup session missing contact");
+        let contact = result
+            .seed
+            .contacts
+            .iter()
+            .find(|contact| contact.id == contact_id)
+            .expect("lookup contact missing");
+
+        assert_eq!(
+            contact.ethereum_address.as_deref(),
+            Some("0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A")
+        );
+        assert!(contact.pubkey.starts_with("lookup:"));
     }
 }

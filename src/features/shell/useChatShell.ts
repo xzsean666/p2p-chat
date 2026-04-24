@@ -53,7 +53,11 @@ import {
   buildUpdatedAuthRuntime,
   deriveAuthRuntimeFromAuthSession,
 } from "../../services/authRuntime";
-import { classifyChatQuery, isCircleQuery } from "../../services/chatQueryIntents";
+import {
+  classifyChatQuery,
+  isCircleQuery,
+  normalizeEthereumAddress,
+} from "../../services/chatQueryIntents";
 import {
   encodeFileMessageMeta,
   fileMessageLocalPath,
@@ -821,6 +825,35 @@ export function useChatShell() {
     return circles.value.find((circle) => circle.id === circleId)?.name ?? circleId;
   }
 
+  function activeTransportFailureNotice(snapshot: TransportSnapshot): TransportNotice | null {
+    if (!snapshot.runtimeSessions.length) {
+      return null;
+    }
+
+    const orderedSessions = [...snapshot.runtimeSessions].sort((left, right) => {
+      const leftPriority =
+        (left.circleId === snapshot.activeCircleId ? 4 : 0) +
+        (left.launchStatus === "missing" ? 3 : 0) +
+        (left.lastFailureReason ? 2 : 0) +
+        (left.lastLaunchResult === "failed" ? 1 : 0);
+      const rightPriority =
+        (right.circleId === snapshot.activeCircleId ? 4 : 0) +
+        (right.launchStatus === "missing" ? 3 : 0) +
+        (right.lastFailureReason ? 2 : 0) +
+        (right.lastLaunchResult === "failed" ? 1 : 0);
+      return rightPriority - leftPriority;
+    });
+
+    for (const session of orderedSessions) {
+      const notice = buildRuntimeSessionNotice(undefined, session);
+      if (notice) {
+        return notice;
+      }
+    }
+
+    return null;
+  }
+
   function buildRuntimeSessionNotice(
     previous: TransportRuntimeSession | undefined,
     session: TransportRuntimeSession,
@@ -855,10 +888,15 @@ export function useChatShell() {
     }
 
     if (session.lastFailureReason && previous?.lastFailureReason !== session.lastFailureReason) {
+      const relayFailure = relaySupportsTransportHeartbeat(
+        circles.value.find((circle) => circle.id === session.circleId)?.relay ?? "",
+      );
       return {
         id: `runtime-failure-${session.circleId}-${session.lastFailureAt ?? session.lastEventAt}`,
         tone: "warn",
-        title: session.lastEvent.includes("exited")
+        title: relayFailure
+          ? `${circleLabel} relay unavailable`
+          : session.lastEvent.includes("exited")
           ? `${circleLabel} runtime exited`
           : `${circleLabel} runtime needs recovery`,
         detail: session.lastFailureReason,
@@ -1705,6 +1743,7 @@ export function useChatShell() {
       suppressNotice?: boolean;
     } = {},
   ) {
+    const previousSnapshot = transportSnapshot.value;
     const input = {
       activeCircleId: activeCircleId.value || undefined,
       useTorNetwork: advancedPreferences.value.useTorNetwork,
@@ -1751,6 +1790,13 @@ export function useChatShell() {
     setTransportSnapshot(result.snapshot, {
       suppressNotice: options.suppressNotice || desktopLoadFailed,
     });
+
+    if (!options.suppressNotice && !previousSnapshot) {
+      const failureNotice = activeTransportFailureNotice(result.snapshot);
+      if (failureNotice) {
+        showTransportNotice(failureNotice);
+      }
+    }
 
     if (result.source === "tauri") {
       await refreshDomainOverview();
@@ -4643,12 +4689,17 @@ export function useChatShell() {
   function applyLocalCreateLookupContact(query: string) {
     const normalized = query.trim();
     const normalizedPubkey = normalizeNostrPubkey(normalized);
+    const normalizedEthereumAddress = normalizeEthereumAddress(normalized);
     const existing = contacts.value.find((contact) => {
       const contactPubkey = normalizeNostrPubkey(contact.pubkey);
+      const contactEthereumAddress = normalizeEthereumAddress(contact.ethereumAddress ?? "");
       return (
         contact.id.toLowerCase() === normalized.toLowerCase() ||
         contact.handle.toLowerCase() === normalized.toLowerCase() ||
         contact.pubkey.toLowerCase() === normalized.toLowerCase() ||
+        (!!normalizedEthereumAddress &&
+          !!contactEthereumAddress &&
+          contactEthereumAddress === normalizedEthereumAddress) ||
         (!!normalizedPubkey && !!contactPubkey && contactPubkey === normalizedPubkey) ||
         contact.name.toLowerCase() === normalized.toLowerCase()
       );
@@ -4663,6 +4714,8 @@ export function useChatShell() {
       ? normalized.slice(1)
       : normalizedPubkey
         ? `remote ${normalizedPubkey.slice(0, 6)}`
+        : normalizedEthereumAddress
+          ? `remote ${normalizedEthereumAddress.slice(0, 8)}`
         : normalized.includes("://")
           ? normalized.split("://").slice(-1)[0] ?? normalized
           : normalized;
@@ -4681,6 +4734,7 @@ export function useChatShell() {
       initials: buildInitials(inferredName),
       handle: normalized.startsWith("@") ? normalized.toLowerCase() : `@${slug}`,
       pubkey: canonicalLookupPubkey || `lookup:${slug}`,
+      ethereumAddress: normalizedEthereumAddress || undefined,
       subtitle: "Imported from lookup",
       bio: `Created locally from lookup query \`${normalized}\`.`,
       online: false,
@@ -5365,7 +5419,7 @@ export function useChatShell() {
         payload.mode === "private"
           ? "Private relay shell created from the onboarding flow."
           : payload.mode === "custom"
-            ? "Custom relay connected from a manually entered endpoint."
+            ? "Custom relay configured from a manually entered endpoint."
             : "Circle imported from an invite handoff and waiting for relay confirmation.",
     } as const;
 

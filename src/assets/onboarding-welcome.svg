@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" role="img" aria-labelledby="title desc">
+  <title id="title">Welcome illustration</title>
+  <desc id="desc">A soft abstract welcome card with chat bubbles and a lock.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f3f7ff" />
+      <stop offset="100%" stop-color="#dbe8fb" />
+    </linearGradient>
+    <linearGradient id="card" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#eef5ff" />
+    </linearGradient>
+  </defs>
+  <rect width="800" height="560" rx="40" fill="url(#bg)" />
+  <circle cx="118" cy="112" r="74" fill="#c7daf9" opacity="0.45" />
+  <circle cx="704" cy="442" r="110" fill="#c1d4fb" opacity="0.4" />
+  <rect x="158" y="88" width="484" height="356" rx="34" fill="url(#card)" stroke="#b8cbeb" stroke-width="3" />
+  <rect x="206" y="142" width="198" height="86" rx="24" fill="#2c6cb5" />
+  <circle cx="248" cy="184" r="20" fill="#7fc7ff" />
+  <rect x="282" y="170" width="84" height="12" rx="6" fill="#fff" opacity="0.95" />
+  <rect x="282" y="191" width="58" height="10" rx="5" fill="#cfe0ff" />
+  <rect x="396" y="248" width="202" height="92" rx="24" fill="#ffffff" stroke="#d4e0f4" stroke-width="3" />
+  <circle cx="438" cy="294" r="19" fill="#f0b36f" />
+  <rect x="472" y="280" width="92" height="12" rx="6" fill="#6f7c8f" />
+  <rect x="472" y="301" width="64" height="10" rx="5" fill="#b5bfce" />
+  <path d="M279 360c0-35 28-63 63-63s63 28 63 63v22h-126z" fill="#102c4e" />
+  <rect x="309" y="330" width="66" height="60" rx="14" fill="#163c67" />
+  <rect x="327" y="350" width="30" height="12" rx="6" fill="#7fc7ff" />
+  <path d="M324 329v-13c0-20 16-36 36-36s36 16 36 36v13" fill="none" stroke="#163c67" stroke-width="16" stroke-linecap="round" />
+</svg>

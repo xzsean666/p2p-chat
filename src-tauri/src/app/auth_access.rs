@@ -4,8 +4,9 @@ use crate::domain::chat::{
 };
 use bech32::{Bech32, Hrp};
 use nostr_connect::prelude::Keys as NostrKeys;
-use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 use std::convert::TryInto;
 use std::str::FromStr;
 use url::Url;
@@ -109,6 +110,19 @@ pub fn encode_nsec_secret_key(secret_key_hex: &str) -> Result<String, String> {
         "auth runtime secret key in native credential store is invalid".to_string(),
     )?;
     encode_nsec(&secret_key)
+}
+
+pub fn derive_ethereum_address_from_secret_key_hex(secret_key_hex: &str) -> Result<String, String> {
+    let secret_key = parse_secret_key_hex_input(
+        secret_key_hex,
+        "auth runtime secret key in native credential store is invalid".to_string(),
+    )?;
+    Ok(checksummed_ethereum_address_from_secret_key(&secret_key))
+}
+
+pub fn canonical_ethereum_address_from_input(value: &str) -> Result<String, String> {
+    let address_bytes = decode_hex_20_bytes(value)?;
+    Ok(checksummed_ethereum_address(&address_bytes))
 }
 
 pub fn resolve_auth_runtime_binding(
@@ -379,6 +393,55 @@ fn encode_nsec(secret_key: &SecretKey) -> Result<String, String> {
 
 fn encode_secret_key_hex(secret_key: &SecretKey) -> String {
     encode_lower_hex(&secret_key.secret_bytes())
+}
+
+fn checksummed_ethereum_address_from_secret_key(secret_key: &SecretKey) -> String {
+    let secp = Secp256k1::new();
+    let public_key = PublicKey::from_secret_key(&secp, secret_key);
+    let uncompressed_public_key = public_key.serialize_uncompressed();
+    let digest = Keccak256::digest(&uncompressed_public_key[1..]);
+    checksummed_ethereum_address(&digest[12..])
+}
+
+fn checksummed_ethereum_address(address_bytes: &[u8]) -> String {
+    let normalized = encode_lower_hex(address_bytes);
+    let checksum_hash = Keccak256::digest(normalized.as_bytes());
+    let mut address = String::with_capacity(42);
+    address.push_str("0x");
+
+    for (index, character) in normalized.chars().enumerate() {
+        if character.is_ascii_digit() {
+            address.push(character);
+            continue;
+        }
+
+        let nibble = if index % 2 == 0 {
+            (checksum_hash[index / 2] >> 4) & 0x0f
+        } else {
+            checksum_hash[index / 2] & 0x0f
+        };
+        address.push(if nibble >= 8 {
+            character.to_ascii_uppercase()
+        } else {
+            character
+        });
+    }
+
+    address
+}
+
+fn decode_hex_20_bytes(value: &str) -> Result<[u8; 20], String> {
+    let trimmed = strip_hex_prefix(value.trim());
+    if trimmed.len() != 40 {
+        return Err("invalid 20-byte hex string".into());
+    }
+
+    let mut bytes = [0_u8; 20];
+    for (index, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = decode_hex_nibble(chunk[0])? << 4 | decode_hex_nibble(chunk[1])?;
+    }
+
+    Ok(bytes)
 }
 
 fn parse_secret_key_hex_input(value: &str, error_message: String) -> Result<SecretKey, String> {
@@ -668,6 +731,25 @@ mod tests {
         .expect("valid secret should encode as nsec");
 
         assert!(nsec.starts_with("nsec1"));
+    }
+
+    #[test]
+    fn derives_checksumming_ethereum_address_from_valid_secret_key() {
+        let address = derive_ethereum_address_from_secret_key_hex(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .expect("valid secret should derive ethereum address");
+
+        assert_eq!(address, "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A");
+    }
+
+    #[test]
+    fn canonicalizes_ethereum_address_input() {
+        let address =
+            canonical_ethereum_address_from_input("0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a")
+                .expect("valid ethereum address should canonicalize");
+
+        assert_eq!(address, "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A");
     }
 
     #[test]

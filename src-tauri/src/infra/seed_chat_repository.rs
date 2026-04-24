@@ -444,6 +444,7 @@ fn contact(
         initials: initials.into(),
         handle: handle.into(),
         pubkey: pubkey.into(),
+        ethereum_address: None,
         subtitle: subtitle.into(),
         bio: bio.into(),
         online,

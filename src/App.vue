@@ -642,38 +642,6 @@ async function shareCircleInvite() {
 </template>
 
 <style>
-@font-face {
-  font-family: "OX Font";
-  src: url("../tmp/xchat-app-main/assets/fonts/font_regular.ttf") format("truetype");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "OX Font";
-  src: url("../tmp/xchat-app-main/assets/fonts/font_medium.ttf") format("truetype");
-  font-weight: 500;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "OX Font";
-  src: url("../tmp/xchat-app-main/assets/fonts/font_bold.ttf") format("truetype");
-  font-weight: 700;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Lato";
-  src: url("../tmp/xchat-app-main/assets/fonts/Lato-Regular.ttf") format("truetype");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-
 :root {
   --shell-page-bg:
     radial-gradient(circle at top left, rgba(219, 230, 241, 0.72), transparent 18%),
@@ -701,7 +669,7 @@ async function shareCircleInvite() {
   --shell-avatar-text: #29568c;
   --shell-shadow-soft: 0 18px 42px rgba(35, 47, 65, 0.06);
   --shell-shadow-strong: 0 28px 68px rgba(35, 47, 65, 0.14);
-  font-family: "OX Font", "Lato", "Noto Sans SC", "Segoe UI", sans-serif;
+  font-family: "Lato", "Noto Sans", "Noto Sans SC", "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;

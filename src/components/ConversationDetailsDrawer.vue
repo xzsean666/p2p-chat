@@ -76,6 +76,7 @@ const titleText = computed(() => {
           <template v-else-if="contact">
             <span>{{ contact.handle }}</span>
             <span class="pubkey">{{ contact.pubkey }}</span>
+            <span v-if="contact.ethereumAddress" class="pubkey">{{ contact.ethereumAddress }}</span>
           </template>
           <template v-else>
             <span>Notes, links and files for this circle.</span>

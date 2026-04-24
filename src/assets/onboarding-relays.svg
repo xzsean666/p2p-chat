@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" role="img" aria-labelledby="title desc">
+  <title id="title">Custom relays illustration</title>
+  <desc id="desc">Server nodes and a control panel representing custom infrastructure.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f4fbf8" />
+      <stop offset="100%" stop-color="#d8efe4" />
+    </linearGradient>
+  </defs>
+  <rect width="800" height="560" rx="40" fill="url(#bg)" />
+  <rect x="182" y="126" width="436" height="308" rx="30" fill="#ffffff" stroke="#c3dfd0" stroke-width="4" />
+  <rect x="226" y="172" width="348" height="46" rx="18" fill="#163c67" />
+  <circle cx="258" cy="195" r="9" fill="#82d0ff" />
+  <circle cx="287" cy="195" r="9" fill="#64b58b" />
+  <circle cx="316" cy="195" r="9" fill="#f0b36f" />
+  <rect x="226" y="248" width="154" height="124" rx="22" fill="#eef7f2" />
+  <rect x="420" y="248" width="154" height="124" rx="22" fill="#eef4fb" />
+  <rect x="254" y="286" width="98" height="14" rx="7" fill="#5f997b" />
+  <rect x="254" y="314" width="74" height="12" rx="6" fill="#a5c6b6" />
+  <rect x="448" y="286" width="98" height="14" rx="7" fill="#4c84bf" />
+  <rect x="448" y="314" width="74" height="12" rx="6" fill="#aac6e4" />
+  <circle cx="112" cy="278" r="54" fill="#64b58b" />
+  <circle cx="688" cy="278" r="54" fill="#2c6cb5" />
+  <path d="M166 278h44" stroke="#86ba9f" stroke-width="8" stroke-linecap="round" />
+  <path d="M590 278h44" stroke="#7ca7d6" stroke-width="8" stroke-linecap="round" />
+  <path d="M112 278c46-58 109-90 171-90" fill="none" stroke="#86ba9f" stroke-width="6" stroke-linecap="round" stroke-dasharray="10 12" />
+  <path d="M688 278c-46-58-109-90-171-90" fill="none" stroke="#7ca7d6" stroke-width="6" stroke-linecap="round" stroke-dasharray="10 12" />
+</svg>

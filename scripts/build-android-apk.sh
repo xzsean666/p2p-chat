@@ -125,6 +125,39 @@ resolve_android_sdk_root() {
   export ANDROID_SDK_ROOT="${candidate}"
 }
 
+normalize_android_signing_env() {
+  local keystore_path=""
+  local keystore_password=""
+  local key_alias=""
+  local key_password=""
+
+  keystore_path="${TAURI_ANDROID_KEYSTORE_PATH:-${TAURI_ANDROID_KEYSTORE:-${ANDROID_KEYSTORE_PATH:-${ANDROID_KEYSTORE:-}}}}"
+  keystore_password="${TAURI_ANDROID_KEYSTORE_PASSWORD:-${ANDROID_KEYSTORE_PASSWORD:-}}"
+  key_alias="${TAURI_ANDROID_KEY_ALIAS:-${ANDROID_KEY_ALIAS:-}}"
+  key_password="${TAURI_ANDROID_KEY_PASSWORD:-${ANDROID_KEY_PASSWORD:-}}"
+
+  if [[ -n "${keystore_path}" ]]; then
+    export TAURI_ANDROID_KEYSTORE_PATH="${TAURI_ANDROID_KEYSTORE_PATH:-${keystore_path}}"
+    export TAURI_ANDROID_KEYSTORE="${TAURI_ANDROID_KEYSTORE:-${keystore_path}}"
+    export ANDROID_KEYSTORE_PATH="${ANDROID_KEYSTORE_PATH:-${keystore_path}}"
+  fi
+
+  if [[ -n "${keystore_password}" ]]; then
+    export TAURI_ANDROID_KEYSTORE_PASSWORD="${TAURI_ANDROID_KEYSTORE_PASSWORD:-${keystore_password}}"
+    export ANDROID_KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-${keystore_password}}"
+  fi
+
+  if [[ -n "${key_alias}" ]]; then
+    export TAURI_ANDROID_KEY_ALIAS="${TAURI_ANDROID_KEY_ALIAS:-${key_alias}}"
+    export ANDROID_KEY_ALIAS="${ANDROID_KEY_ALIAS:-${key_alias}}"
+  fi
+
+  if [[ -n "${key_password}" ]]; then
+    export TAURI_ANDROID_KEY_PASSWORD="${TAURI_ANDROID_KEY_PASSWORD:-${key_password}}"
+    export ANDROID_KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-${key_password}}"
+  fi
+}
+
 find_sdk_tool() {
   local tool_name="$1"
   local candidate=""
@@ -276,11 +309,12 @@ verify_release_signing_configuration() {
   fi
 
   if [[ "${using_aab}" -eq 1 ]]; then
-    fail "release AAB requires signing config; provide ${ANDROID_GEN_DIR}/keystore.properties or TAURI_ANDROID_KEYSTORE_PATH/TAURI_ANDROID_KEYSTORE + TAURI_ANDROID_KEYSTORE_PASSWORD + TAURI_ANDROID_KEY_ALIAS + TAURI_ANDROID_KEY_PASSWORD"
+    fail "release AAB requires signing config; provide ${ANDROID_GEN_DIR}/keystore.properties or TAURI_ANDROID_KEYSTORE_PATH/TAURI_ANDROID_KEYSTORE + TAURI_ANDROID_KEYSTORE_PASSWORD + TAURI_ANDROID_KEY_ALIAS + TAURI_ANDROID_KEY_PASSWORD (ANDROID_KEYSTORE_PATH + ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS + ANDROID_KEY_PASSWORD are also accepted)"
   fi
 
   warn "release build has no explicit signing config; artifact may be unsuitable for distribution"
   warn "set ${ANDROID_GEN_DIR}/keystore.properties or TAURI_ANDROID_KEYSTORE_PATH/TAURI_ANDROID_KEYSTORE + TAURI_ANDROID_KEYSTORE_PASSWORD + TAURI_ANDROID_KEY_ALIAS + TAURI_ANDROID_KEY_PASSWORD"
+  warn "ANDROID_KEYSTORE_PATH + ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS + ANDROID_KEY_PASSWORD aliases are also supported"
 }
 
 print_artifacts() {
@@ -312,13 +346,21 @@ print_artifacts() {
 
 cd "${REPO_ROOT}"
 
-for arg in "$@"; do
+RAW_USER_ARGS=("$@")
+USER_ARGS=()
+
+for arg in "${RAW_USER_ARGS[@]}"; do
   case "${arg}" in
+    --)
+      continue
+      ;;
     -h|--help)
       usage
       exit 0
       ;;
   esac
+
+  USER_ARGS+=("${arg}")
 done
 
 ensure_linux_host
@@ -333,6 +375,7 @@ ensure_node_version_supported
 resolve_java_home || fail "JAVA_HOME could not be resolved automatically."
 
 resolve_android_sdk_root || fail "Android SDK not found. Set ANDROID_SDK_ROOT or ANDROID_HOME first."
+normalize_android_signing_env
 
 SDKMANAGER_BIN="$(find_sdk_tool sdkmanager || true)"
 ADB_BIN="$(find_sdk_tool adb || true)"
@@ -350,7 +393,6 @@ log "Node: $(node --version)"
 log "pnpm: $(pnpm --version)"
 log "Cargo: $(cargo --version)"
 
-USER_ARGS=("$@")
 BUILD_ARGS=(android build --ci)
 TARGETS=()
 TARGET_SPECIFIED=0

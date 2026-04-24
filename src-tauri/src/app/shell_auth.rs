@@ -556,6 +556,9 @@ pub fn load_local_account_secret_summary<R: tauri::Runtime>(
         login_method: credential.login_method,
         access_kind: credential.access_kind,
         pubkey: credential.pubkey.clone(),
+        ethereum_address: Some(auth_access::derive_ethereum_address_from_secret_key_hex(
+            &credential.secret_key_hex,
+        )?),
         nsec: auth_access::encode_nsec_secret_key(&credential.secret_key_hex)?,
         hex_key: credential.secret_key_hex,
         stored_at: credential.stored_at,

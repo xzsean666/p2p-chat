@@ -58,7 +58,7 @@ const privacyNotice = computed(() => {
 const placeholder = computed(() => {
   return props.mode === "join-circle"
     ? "Enter circle invite link"
-    : "Enter Invite Link or User ID (npub... / 0x...)";
+    : "Enter Invite Link or User ID (npub... / 0x address...)";
 });
 
 const canSubmit = computed(() => !props.submitting && keyword.value.trim().length > 0);

@@ -67,6 +67,7 @@ mod tests {
                 initials: "A".into(),
                 handle: "@alex".into(),
                 pubkey: "pubkey".into(),
+                ethereum_address: None,
                 subtitle: "friend".into(),
                 bio: "bio".into(),
                 online: Some(true),

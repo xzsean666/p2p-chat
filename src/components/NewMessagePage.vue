@@ -93,7 +93,7 @@ const contactEntries = computed<MessageListEntry[]>(() => {
       name,
       meta,
       sortText: name,
-      searchText: [contact.name, contact.handle, contact.subtitle, contact.bio, contact.pubkey]
+      searchText: [contact.name, contact.handle, contact.subtitle, contact.bio, contact.pubkey, contact.ethereumAddress]
         .join(" ")
         .toLowerCase(),
       contact,
@@ -217,7 +217,7 @@ function openInvitePage() {
           <i class="pi pi-search"></i>
           <InputText
             v-model="keyword"
-            placeholder="Search npub, 0x pubkey or username"
+            placeholder="Search npub, 0x address or username"
             @focus="searchFocused = true"
             @blur="searchFocused = false"
           />
@@ -272,13 +272,13 @@ function openInvitePage() {
 
       <section v-if="isSearchMode && !hasKeyword" class="list-section search-placeholder">
         <i class="pi pi-search"></i>
-        <p>Search by name, handle or pubkey.</p>
+        <p>Search by name, handle, address or pubkey.</p>
       </section>
 
       <section v-else-if="isSearchMode && hasKeyword && !searchResults.length" class="empty-state">
         <i class="pi pi-user-plus"></i>
         <h3>{{ searchEmptyTitle }}</h3>
-        <p>Try a different name, handle or pubkey.</p>
+        <p>Try a different name, handle, address or pubkey.</p>
       </section>
 
       <section v-for="group in visibleGroups" :key="group.key" class="list-section">

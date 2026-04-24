@@ -211,6 +211,8 @@ bash scripts/build-android-apk.sh --help
 
 - 依赖安装脚本: [install-android-build-deps.sh](/home/sean/git/p2p-chat/scripts/install-android-build-deps.sh)
 - APK/AAB 构建脚本: [build-android-apk.sh](/home/sean/git/p2p-chat/scripts/build-android-apk.sh)
+- 本地 keystore 生成脚本: [generate-android-keystore.sh](/home/sean/git/p2p-chat/scripts/generate-android-keystore.sh)
+- 一键 release APK 包装入口: [build_apk](/home/sean/git/p2p-chat/build_apk)
 - Android 构建说明: [README.md](/home/sean/git/p2p-chat/README.md#L74)
 - Android Tauri 配置: [tauri.android.conf.json](/home/sean/git/p2p-chat/src-tauri/tauri.android.conf.json)
 
@@ -221,6 +223,7 @@ bash scripts/build-android-apk.sh --help
 - `pnpm` 激活与项目 JS 依赖安装
 - `--target=aarch64,x86_64` 这类参数支持
 - release / AAB 的签名配置检查
+- 本地 `.local/android-upload.keystore` 生成与 `release/` 复制入口
 
 ### 8.2 当前结论
 
@@ -402,6 +405,14 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
 source "$HOME/.cargo/env"
 ```
+
+如果你想直接走本地 keystore + 一键 release APK：
+
+```bash
+pnpm android:release
+```
+
+它会在首次缺少 keystore 时自动创建 `.local/android-upload.keystore`，并把签名后的 APK 复制到 `release/`。
 
 构建默认 APK：
 

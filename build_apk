@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR}"
+
+DEFAULT_KEYSTORE_PATH="${PROJECT_ROOT}/.local/android-upload.keystore"
+DEFAULT_KEY_ALIAS="upload"
+DEFAULT_RELEASE_DIR="${PROJECT_ROOT}/release"
+DEFAULT_BUILD_TARGET="aarch64"
+
+KEYSTORE_PATH="${ANDROID_KEYSTORE_PATH:-${TAURI_ANDROID_KEYSTORE_PATH:-$DEFAULT_KEYSTORE_PATH}}"
+KEY_ALIAS="${ANDROID_KEY_ALIAS:-${TAURI_ANDROID_KEY_ALIAS:-$DEFAULT_KEY_ALIAS}}"
+RELEASE_DIR="${ANDROID_RELEASE_DIR:-$DEFAULT_RELEASE_DIR}"
+BUILD_TARGET="${ANDROID_BUILD_TARGET:-$DEFAULT_BUILD_TARGET}"
+STORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-${TAURI_ANDROID_KEYSTORE_PASSWORD:-}}"
+KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-${TAURI_ANDROID_KEY_PASSWORD:-}}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash ./build_apk [options]
+
+Options:
+  --target TARGET       Android build target, default: aarch64
+  --release-dir PATH    Directory to copy the final APK into
+  --help                Show this help
+
+Environment variables:
+  ANDROID_KEYSTORE_PATH
+  ANDROID_KEY_ALIAS
+  ANDROID_KEYSTORE_PASSWORD
+  ANDROID_KEY_PASSWORD
+  ANDROID_RELEASE_DIR
+  ANDROID_BUILD_TARGET
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --)
+      shift
+      ;;
+    --target)
+      BUILD_TARGET="$2"
+      shift 2
+      ;;
+    --release-dir)
+      RELEASE_DIR="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if ! command -v node >/dev/null 2>&1; then
+  printf 'node not found in PATH\n' >&2
+  exit 1
+fi
+
+if ! command -v pnpm >/dev/null 2>&1; then
+  printf 'pnpm not found in PATH\n' >&2
+  exit 1
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+  printf 'sha256sum not found in PATH\n' >&2
+  exit 1
+fi
+
+APP_NAME="$(
+  node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log((pkg.name || "app").replace(/[^A-Za-z0-9._-]+/g, "-"));' \
+    "${PROJECT_ROOT}/package.json"
+)"
+APP_VERSION="$(
+  node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log((pkg.version || "0.0.0").replace(/[^A-Za-z0-9._-]+/g, "-"));' \
+    "${PROJECT_ROOT}/package.json"
+)"
+
+if [[ -z "${STORE_PASSWORD}" ]]; then
+  read -r -s -p "Keystore password: " STORE_PASSWORD
+  printf '\n'
+fi
+
+if [[ -z "${KEY_PASSWORD}" ]]; then
+  read -r -s -p "Key password (press Enter to reuse keystore password): " KEY_PASSWORD
+  printf '\n'
+  if [[ -z "${KEY_PASSWORD}" ]]; then
+    KEY_PASSWORD="${STORE_PASSWORD}"
+  fi
+fi
+
+if [[ ! -f "${KEYSTORE_PATH}" ]]; then
+  printf 'Keystore not found. Creating: %s\n' "${KEYSTORE_PATH}"
+  ANDROID_KEYSTORE_PATH="${KEYSTORE_PATH}" \
+  ANDROID_KEY_ALIAS="${KEY_ALIAS}" \
+  ANDROID_KEYSTORE_PASSWORD="${STORE_PASSWORD}" \
+  ANDROID_KEY_PASSWORD="${KEY_PASSWORD}" \
+    bash "${PROJECT_ROOT}/scripts/generate-android-keystore.sh" --out "${KEYSTORE_PATH}" --alias "${KEY_ALIAS}"
+fi
+
+TARGET_LABEL="arm64"
+case "${BUILD_TARGET}" in
+  aarch64) TARGET_LABEL="arm64" ;;
+  armv7) TARGET_LABEL="armv7" ;;
+  i686) TARGET_LABEL="x86" ;;
+  x86_64) TARGET_LABEL="x86_64" ;;
+  *) TARGET_LABEL="${BUILD_TARGET}" ;;
+esac
+
+ANDROID_KEYSTORE_PATH="${KEYSTORE_PATH}" \
+ANDROID_KEY_ALIAS="${KEY_ALIAS}" \
+ANDROID_KEYSTORE_PASSWORD="${STORE_PASSWORD}" \
+ANDROID_KEY_PASSWORD="${KEY_PASSWORD}" \
+TAURI_ANDROID_KEYSTORE_PATH="${KEYSTORE_PATH}" \
+TAURI_ANDROID_KEYSTORE="${KEYSTORE_PATH}" \
+TAURI_ANDROID_KEY_ALIAS="${KEY_ALIAS}" \
+TAURI_ANDROID_KEYSTORE_PASSWORD="${STORE_PASSWORD}" \
+TAURI_ANDROID_KEY_PASSWORD="${KEY_PASSWORD}" \
+  bash "${PROJECT_ROOT}/scripts/build-android-apk.sh" --apk --target "${BUILD_TARGET}"
+
+SIGNED_APK="$(
+  find "${PROJECT_ROOT}/src-tauri/gen/android/app/build/outputs/apk" -type f -name '*.apk' ! -name '*unsigned.apk' -printf '%T@ %p\n' \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2-
+)"
+
+if [[ -z "${SIGNED_APK}" || ! -f "${SIGNED_APK}" ]]; then
+  printf 'Signed APK not found after build\n' >&2
+  exit 1
+fi
+
+mkdir -p "${RELEASE_DIR}"
+
+FINAL_APK="${RELEASE_DIR}/${APP_NAME}-v${APP_VERSION}-android-${TARGET_LABEL}-release.apk"
+LATEST_APK="${RELEASE_DIR}/${APP_NAME}-android-release.apk"
+
+cp -f "${SIGNED_APK}" "${FINAL_APK}"
+cp -f "${FINAL_APK}" "${LATEST_APK}"
+
+printf '\nFinal APK:\n'
+printf '  %s\n' "${FINAL_APK}"
+printf 'Latest copy:\n'
+printf '  %s\n' "${LATEST_APK}"
+printf 'SHA256:\n'
+sha256sum "${FINAL_APK}"

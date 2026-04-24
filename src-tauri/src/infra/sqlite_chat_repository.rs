@@ -63,6 +63,7 @@ impl<R: Runtime> SqliteChatRepository<R> {
               initials TEXT NOT NULL,
               handle TEXT NOT NULL,
               pubkey TEXT NOT NULL,
+              ethereum_address TEXT,
               subtitle TEXT NOT NULL,
               bio TEXT NOT NULL,
               online INTEGER,
@@ -125,6 +126,7 @@ impl<R: Runtime> SqliteChatRepository<R> {
         )
         .map_err(|error| error.to_string())?;
 
+        ensure_contact_ethereum_address_column(conn)?;
         ensure_message_delivery_status_column(conn)?;
         ensure_message_remote_id_column(conn)?;
         ensure_message_sync_source_column(conn)?;
@@ -318,7 +320,7 @@ impl<R: Runtime> SqliteChatRepository<R> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, initials, handle, pubkey, subtitle, bio, online, blocked FROM contacts ORDER BY rowid DESC",
+                    "SELECT id, name, initials, handle, pubkey, ethereum_address, subtitle, bio, online, blocked FROM contacts ORDER BY rowid DESC",
                 )
                 .map_err(|error| error.to_string())?;
 
@@ -330,10 +332,11 @@ impl<R: Runtime> SqliteChatRepository<R> {
                         initials: row.get(2)?,
                         handle: row.get(3)?,
                         pubkey: row.get(4)?,
-                        subtitle: row.get(5)?,
-                        bio: row.get(6)?,
-                        online: optional_i64_to_bool(row.get::<_, Option<i64>>(7)?),
-                        blocked: optional_i64_to_bool(row.get::<_, Option<i64>>(8)?),
+                        ethereum_address: row.get(5)?,
+                        subtitle: row.get(6)?,
+                        bio: row.get(7)?,
+                        online: optional_i64_to_bool(row.get::<_, Option<i64>>(8)?),
+                        blocked: optional_i64_to_bool(row.get::<_, Option<i64>>(9)?),
                     })
                 })
                 .map_err(|error| error.to_string())?;
@@ -745,13 +748,14 @@ fn upsert_contact(
     }
 
     tx.execute(
-        "INSERT INTO contacts (id, name, initials, handle, pubkey, subtitle, bio, online, blocked)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO contacts (id, name, initials, handle, pubkey, ethereum_address, subtitle, bio, online, blocked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            initials = excluded.initials,
            handle = excluded.handle,
            pubkey = excluded.pubkey,
+           ethereum_address = excluded.ethereum_address,
            subtitle = excluded.subtitle,
            bio = excluded.bio,
            online = excluded.online,
@@ -762,6 +766,7 @@ fn upsert_contact(
             upsert.item.initials,
             upsert.item.handle,
             upsert.item.pubkey,
+            upsert.item.ethereum_address,
             upsert.item.subtitle,
             upsert.item.bio,
             optional_bool_to_i64(upsert.item.online),
@@ -931,13 +936,14 @@ fn insert_circle(tx: &rusqlite::Transaction<'_>, circle: &CircleItem) -> Result<
 
 fn insert_contact(tx: &rusqlite::Transaction<'_>, contact: &ContactItem) -> Result<(), String> {
     tx.execute(
-        "INSERT INTO contacts (id, name, initials, handle, pubkey, subtitle, bio, online, blocked) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO contacts (id, name, initials, handle, pubkey, ethereum_address, subtitle, bio, online, blocked) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             &contact.id,
             &contact.name,
             &contact.initials,
             &contact.handle,
             &contact.pubkey,
+            &contact.ethereum_address,
             &contact.subtitle,
             &contact.bio,
             optional_bool_to_i64(contact.online),
@@ -947,6 +953,14 @@ fn insert_contact(tx: &rusqlite::Transaction<'_>, contact: &ContactItem) -> Resu
     .map_err(|error| error.to_string())?;
 
     Ok(())
+}
+
+fn ensure_contact_ethereum_address_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    match conn.execute("ALTER TABLE contacts ADD COLUMN ethereum_address TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn insert_session(tx: &rusqlite::Transaction<'_>, session: &SessionItem) -> Result<(), String> {

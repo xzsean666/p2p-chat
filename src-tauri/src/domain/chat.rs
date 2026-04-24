@@ -284,6 +284,8 @@ pub struct LocalAccountSecretSummary {
     pub login_method: LoginMethod,
     pub access_kind: LoginAccessKind,
     pub pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ethereum_address: Option<String>,
     pub nsec: String,
     pub hex_key: String,
     pub stored_at: String,
@@ -350,6 +352,8 @@ pub struct ContactItem {
     pub initials: String,
     pub handle: String,
     pub pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ethereum_address: Option<String>,
     pub subtitle: String,
     pub bio: String,
     #[serde(skip_serializing_if = "Option::is_none")]

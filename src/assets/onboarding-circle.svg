@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" role="img" aria-labelledby="title desc">
+  <title id="title">Private circles illustration</title>
+  <desc id="desc">Three conversation circles around a central private room.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8f5ff" />
+      <stop offset="100%" stop-color="#e6e0fb" />
+    </linearGradient>
+  </defs>
+  <rect width="800" height="560" rx="40" fill="url(#bg)" />
+  <circle cx="402" cy="280" r="116" fill="#ffffff" stroke="#d0c5f3" stroke-width="4" />
+  <circle cx="250" cy="204" r="76" fill="#ffd9df" opacity="0.88" />
+  <circle cx="560" cy="186" r="76" fill="#cde7ff" opacity="0.9" />
+  <circle cx="512" cy="384" r="88" fill="#d8d4fb" opacity="0.95" />
+  <rect x="339" y="214" width="124" height="124" rx="34" fill="#5b4da7" />
+  <path d="M370 266c0-18 14-32 32-32h0c18 0 32 14 32 32" fill="none" stroke="#d7d0ff" stroke-width="16" stroke-linecap="round" />
+  <rect x="378" y="264" width="46" height="42" rx="11" fill="#fff" />
+  <circle cx="273" cy="197" r="22" fill="#cb596d" />
+  <rect x="242" y="232" width="62" height="12" rx="6" fill="#8e5361" />
+  <circle cx="559" cy="178" r="22" fill="#2c6cb5" />
+  <rect x="528" y="213" width="62" height="12" rx="6" fill="#5c7fa3" />
+  <circle cx="511" cy="375" r="24" fill="#7a6ad6" />
+  <rect x="475" y="414" width="72" height="12" rx="6" fill="#8f82de" />
+  <path d="M305 231c22 17 41 24 72 31" stroke="#c58c9b" stroke-width="8" stroke-linecap="round" />
+  <path d="M516 229c-24 17-42 23-71 31" stroke="#84a9d3" stroke-width="8" stroke-linecap="round" />
+  <path d="M477 360c-16-13-25-24-39-48" stroke="#9488e1" stroke-width="8" stroke-linecap="round" />
+</svg>

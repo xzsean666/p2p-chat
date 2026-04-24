@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.p2pchat.desktop",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm runtime:build:dev && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && pnpm runtime:build:release",
     "frontendDist": "../dist"
   },
   "app": {

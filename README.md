@@ -49,6 +49,7 @@ pnpm native:test
 
 说明:
 
+- `pnpm tauri:dev` / `pnpm tauri:build` 现在会先自动编译 companion binary `p2p-chat-runtime`，确保桌面端真实 relay/runtime 链路可启动。
 - `pnpm native:test` 会同时编译 companion binary `p2p-chat-runtime`。
 - 预览模式下的本地 runtime 命令解析优先查 `PATH`，其次回退到仓库内 `src-tauri/target/debug` 或 `src-tauri/target/release` 的本地构建产物。
 
@@ -74,6 +75,32 @@ pnpm desktop:build
 ## Android APK
 
 当前 `scripts/install-android-build-deps.sh` / `scripts/build-android-apk.sh` 主要支持 **Debian / Ubuntu**（依赖安装脚本会校验系统类型）。
+
+如果你想用和 `web3-wallet` 一样的本地 keystore + 一键 release APK 流程：
+
+```bash
+# 1) 安装依赖
+pnpm android:deps
+pnpm install --frozen-lockfile
+
+# 2) 导出 Android / Rust 环境
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+source "$HOME/.cargo/env"
+
+# 3) 首次可先手动生成 keystore（也可跳过，android:release 会自动生成）
+pnpm android:keystore
+
+# 4) 构建签名后的 release APK，并复制到 release/
+pnpm android:release
+```
+
+说明:
+
+- `pnpm android:keystore` 默认生成 `.local/android-upload.keystore`，alias 默认是 `upload`。
+- `pnpm android:release` 首次发现 keystore 不存在时，会自动创建 `.local/android-upload.keystore`。
+- `pnpm android:release` 会把最新签名后的 APK 复制到 `release/`，同时保留版本化文件名和一个稳定的 `latest` 副本。
 
 最小可执行流程（Debian/Ubuntu）：
 
@@ -112,6 +139,7 @@ pnpm android:apk -- --aab --target aarch64
 - `pnpm android:apk` 会自动检查 `pnpm`、`node`、`cargo`、`rustup`、`java`、`javac`、`sdkmanager`。
 - Android SDK 路径优先读取 `ANDROID_SDK_ROOT` / `ANDROID_HOME`，否则回退到 `$HOME/Android/Sdk`。
 - 首次构建若未初始化 Android 工程，脚本会自动执行 `pnpm tauri android init --ci --skip-targets-install`。
+- `pnpm android:apk` 的 release 签名配置支持 `TAURI_ANDROID_*` 变量，也兼容 `ANDROID_KEYSTORE_PATH / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD` 这组别名。
 - 当前仓库已补齐 APK 构建链路脚本，但 Android 端聊天 runtime 仍是桌面预览架构，真实聊天能力还不能视为 Android 已完成适配。
 
 ## 主要文件

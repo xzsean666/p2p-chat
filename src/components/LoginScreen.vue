@@ -3,10 +3,10 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import InputText from "primevue/inputtext";
 import Textarea from "primevue/textarea";
-import onboardingWelcomeImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-welcome.png";
-import onboardingNostrImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-nostr.png";
-import onboardingCircleImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-circle.png";
-import onboardingRelaysImage from "../../tmp/xchat-app-main/packages/business_modules/ox_login/assets/images/material_onboarding-relays.png";
+import onboardingWelcomeImage from "../assets/onboarding-welcome.svg";
+import onboardingNostrImage from "../assets/onboarding-nostr.svg";
+import onboardingCircleImage from "../assets/onboarding-circle.svg";
+import onboardingRelaysImage from "../assets/onboarding-relays.svg";
 import { bootstrapAuthSession } from "../services/chatShell";
 import type {
   CircleItem,

@@ -129,6 +129,7 @@ export interface LocalAccountSecretSummary {
   loginMethod: LoginMethod;
   accessKind: LoginAccessKind;
   pubkey: string;
+  ethereumAddress?: string;
   nsec: string;
   hexKey: string;
   storedAt: string;
@@ -176,6 +177,7 @@ export interface ContactItem {
   initials: string;
   handle: string;
   pubkey: string;
+  ethereumAddress?: string;
   subtitle: string;
   bio: string;
   online?: boolean;

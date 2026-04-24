@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" role="img" aria-labelledby="title desc">
+  <title id="title">Open protocol illustration</title>
+  <desc id="desc">Connected nodes around a protocol card.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#eef9ff" />
+      <stop offset="100%" stop-color="#d8edff" />
+    </linearGradient>
+  </defs>
+  <rect width="800" height="560" rx="40" fill="url(#bg)" />
+  <path d="M188 279h424" stroke="#9fc3eb" stroke-width="8" stroke-linecap="round" stroke-dasharray="14 16" />
+  <path d="M400 123v314" stroke="#9fc3eb" stroke-width="8" stroke-linecap="round" stroke-dasharray="14 16" />
+  <circle cx="400" cy="280" r="120" fill="#ffffff" stroke="#b7d4f2" stroke-width="4" />
+  <rect x="316" y="216" width="168" height="128" rx="28" fill="#173c67" />
+  <circle cx="356" cy="258" r="18" fill="#7bc2ff" />
+  <rect x="388" y="245" width="62" height="10" rx="5" fill="#d2e7ff" />
+  <rect x="388" y="266" width="42" height="10" rx="5" fill="#8fb7df" />
+  <rect x="340" y="300" width="118" height="12" rx="6" fill="#7bc2ff" />
+  <circle cx="400" cy="102" r="34" fill="#2c6cb5" />
+  <circle cx="400" cy="456" r="34" fill="#2c6cb5" />
+  <circle cx="222" cy="280" r="34" fill="#2c6cb5" />
+  <circle cx="578" cy="280" r="34" fill="#2c6cb5" />
+  <circle cx="400" cy="102" r="12" fill="#ffffff" />
+  <circle cx="400" cy="456" r="12" fill="#ffffff" />
+  <circle cx="222" cy="280" r="12" fill="#ffffff" />
+  <circle cx="578" cy="280" r="12" fill="#ffffff" />
+</svg>
